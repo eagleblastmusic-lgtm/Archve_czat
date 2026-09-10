@@ -1,0 +1,122 @@
+name: Bootstrap Archive and apply consolidated audit repairs
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/bootstrap_and_fix.yml"
+      - "tools/apply_audit_repairs.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap-fix-test-commit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout target master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Preserve bootstrap assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/archive-repair-assets
+          cp tools/apply_audit_repairs.py /tmp/archive-repair-assets/apply_audit_repairs.py
+          cp .github/workflows/bootstrap_and_fix.yml /tmp/archive-repair-assets/bootstrap_and_fix.yml
+
+      - name: Copy exact audited Archive snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="98efebdb4cab21d17f46fbeae4183f7841bfd8b6"
+          SOURCE_TREE="6ed475e27a86b1153c491523b4381c73a7e78f74"
+          rm -rf /tmp/archive-source
+          git clone --no-checkout https://github.com/eagleblastmusic-lgtm/Archive.git /tmp/archive-source
+          git -C /tmp/archive-source checkout --detach "$SOURCE_SHA"
+          test "$(git -C /tmp/archive-source rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git -C /tmp/archive-source rev-parse 'HEAD^{tree}')" = "$SOURCE_TREE"
+          rsync -a --delete --exclude='.git/' /tmp/archive-source/ ./
+          mkdir -p tools .github/workflows
+          cp /tmp/archive-repair-assets/apply_audit_repairs.py tools/apply_audit_repairs.py
+          cp /tmp/archive-repair-assets/bootstrap_and_fix.yml .github/workflows/bootstrap_and_fix.yml
+
+      - name: Apply consolidated audit repairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/apply_audit_repairs.py
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile Python
+        run: python -m compileall -q .
+
+      - name: Audit-fix regression lane
+        run: python audit/regression_audit_fixes.py
+
+      - name: Core backend regression
+        run: python audit/regression_checks.py
+
+      - name: Frontend regression
+        run: node audit/regression_frontend.cjs
+
+      - name: Storyboard client regression
+        run: node audit/regression_storyboard_client.cjs
+
+      - name: Storyboard cross-tab regression
+        run: node audit/regression_storyboard_cross_tab.cjs
+
+      - name: Catalog partial frontend regression
+        run: node audit/regression_catalog_partial_frontend.cjs
+
+      - name: Feed regression
+        run: python audit/regression_feed.py
+
+      - name: Catalog bootstrap regression
+        run: python audit/regression_catalog_bootstrap.py
+
+      - name: Integration regression
+        run: python audit/regression_integration.py
+
+      - name: Storyboard package-D regression
+        run: python audit/regression_package_d.py
+
+      - name: Unit tests
+        run: python -m unittest test_suite -q
+
+      - name: Commit the exact tested tree to master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "chatgpt-audit-repair"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git status --short
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "fix: copy Archive and apply consolidated audit repairs"
+          git push origin HEAD:master
