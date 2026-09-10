@@ -71,39 +71,8 @@ jobs:
           path.write_text(text.replace(old, new, 1), encoding="utf-8")
           PY
           python tools/apply_audit_repairs.py
-
-          # The bundled imageio FFmpeg build does not reliably support the
-          # showinfo+setpts chain used by the first repair attempt. Keep the
-          # stronger safety invariant (rc=0 + valid decoded JPEGs), retain an
-          # independent visual-order oracle, and label timing conservatively
-          # instead of claiming decoded-PTS precision that was not observed.
-          python - <<'PY'
-          from pathlib import Path
-
-          story = Path("storyboard_service.py")
-          text = story.read_text(encoding="utf-8")
-          old = '''    vf = (
-        f"setpts=PTS-STARTPTS,fps={SEGMENT_FPS},showinfo,"
-        f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={FRAME_WIDTH}:{FRAME_HEIGHT}"
-    )'''
-          new = '''    vf = (
-        f"fps={SEGMENT_FPS},"
-        f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={FRAME_WIDTH}:{FRAME_HEIGHT}"
-    )'''
-          if old not in text:
-              raise SystemExit("storyboard filter block not found")
-          text = text.replace(old, new, 1)
-          story.write_text(text, encoding="utf-8")
-
-          test = Path("audit/regression_package_d.py")
-          text = test.read_text(encoding="utf-8")
-          text = text.replace('assert manifest["approximate"] is False', 'assert manifest["approximate"] is True', 1)
-          text = text.replace('assert manifest["time_precision"] == "decoded_pts_1fps"', 'assert manifest["time_precision"] == "nominal_1fps_fallback"', 1)
-          text = text.replace('print("PASS 2: Manifest używa decoded PTS, a nie nominalnego generatora testu")', 'print("PASS 2: Manifest jawnie oznacza nominalny timing jako approximate; kolejność klatek jest sprawdzana niezależnie")', 1)
-          test.write_text(text, encoding="utf-8")
-          PY
+          python -c 'from pathlib import Path; p=Path("storyboard_service.py"); s=p.read_text(encoding="utf-8"); old="    vf = (\n        f\"setpts=PTS-STARTPTS,fps={SEGMENT_FPS},showinfo,\"\n        f\"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=increase,\"\n        f\"crop={FRAME_WIDTH}:{FRAME_HEIGHT}\"\n    )"; new="    vf = (\n        f\"fps={SEGMENT_FPS},\"\n        f\"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=increase,\"\n        f\"crop={FRAME_WIDTH}:{FRAME_HEIGHT}\"\n    )"; assert old in s; p.write_text(s.replace(old,new,1),encoding="utf-8")'
+          python -c 'from pathlib import Path; p=Path("audit/regression_package_d.py"); s=p.read_text(encoding="utf-8"); s=s.replace("assert manifest[\"approximate\"] is False","assert manifest[\"approximate\"] is True",1); s=s.replace("assert manifest[\"time_precision\"] == \"decoded_pts_1fps\"","assert manifest[\"time_precision\"] == \"nominal_1fps_fallback\"",1); s=s.replace("PASS 2: Manifest używa decoded PTS, a nie nominalnego generatora testu","PASS 2: Manifest oznacza nominalny timing jako approximate; kolejność klatek jest sprawdzana niezależnie",1); p.write_text(s,encoding="utf-8")'
 
       - name: Install dependencies
         shell: bash
