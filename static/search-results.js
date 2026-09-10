@@ -2,7 +2,7 @@
  * Archivebate Video Browser - Search Results & SSE Streaming Module
  * Odpowiada za wyszukiwanie po tagu/frazie:
  * - dla strony 1: strumieniowanie w czasie rzeczywistym przez EventSource (SSE)
- * - dla strony > 1: paginowane pobieranie JSON z pamięci podręcznej API
+ * - dla strony > 1: paginowane pobieranie JSON (cache, jeśli strona była już pobrana; w przeciwnym razie źródła zdalne)
  * - dopasowane profile modelek (chips) z obsługą zakładek (tabManager)
  * - obsługa grupowania wg autora w wynikach wyszukiwania (reconcilePage)
  */
@@ -119,6 +119,7 @@
   }
 
   async function performSearch(query, page = 1) {
+    const previousPage = Number(state.currentPage) || 1;
     const generation = beginViewRequest();
     const controller = state.viewController;
     if (state.activeSearchSource) {
@@ -151,28 +152,41 @@
     if (dom.resetFilterBtn) dom.resetFilterBtn.style.display = 'flex';
     updateBackButtonUI();
     if (dom.pageJumpInput) dom.pageJumpInput.value = page;
+    if (dom.pageJumpInputTop) dom.pageJumpInputTop.value = page;
 
     const src = encodeURIComponent(state.sourceFilter || 'all');
     const af = encodeURIComponent(state.authorFilter || 'all');
     const grp = state.groupByAuthor ? '1' : '0';
 
-    // Dla kolejnych stron (page > 1) pobieramy z pamięci RAM (cache)
+    // Kolejne strony mogą wymagać realnych zapytań do źródeł, jeśli nie ma ich jeszcze w cache.
     if (page > 1) {
+      const previousVideos = Array.isArray(state.videos) ? state.videos.slice() : [];
       showSkeletons();
       state.isLoading = true;
       if (dom.paginationSection) dom.paginationSection.style.display = 'flex';
+      if (dom.paginationSectionTop) dom.paginationSectionTop.style.display = 'flex';
+      if (dom.videoCount) dom.videoCount.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Ładowanie strony ${page}...`;
+      renderPagination();
       try {
-        const data = await api().getJSON(`/api/search?q=${encodeURIComponent(query)}&page=${page}&source=${src}&author_filter=${af}&group_authors=${grp}`, { timeoutMs: 15000, signal: controller.signal });
+        const data = await api().getJSON(`/api/search?q=${encodeURIComponent(query)}&page=${page}&source=${src}&author_filter=${af}&group_authors=${grp}`, { timeoutMs: 60000, signal: controller.signal });
         if (generation !== state.viewGeneration) return;
-        state.lastPage = data.last_page || 1;
+        state.lastPage = Math.max(1, Number(data.last_page) || 1);
+        state.currentPage = Math.min(page, state.lastPage);
         state.videos = data.videos || [];
         renderVideoGrid(state.videos);
         scheduleThumbnailWarmup(state.videos);
         renderPagination();
-        if (dom.videoCount) dom.videoCount.innerText = `${state.videos.length} na stronie • Strona ${page} z ${state.lastPage} • Łącznie: ${Number(data.total_videos || 0).toLocaleString('pl-PL')} filmów • 5.5M+ w serwisach`;
+        if (dom.videoCount) dom.videoCount.innerText = `${state.videos.length} na stronie • Strona ${state.currentPage} z ${state.lastPage} • Łącznie: ${Number(data.total_videos || 0).toLocaleString('pl-PL')} filmów • 5.5M+ w serwisach`;
       } catch (e) {
         if (generation !== state.viewGeneration || e?.code === 'cancelled') return;
-        triggerToast(e?.message || 'Błąd ładowania strony wyników', 'error');
+        state.currentPage = previousPage;
+        state.videos = previousVideos;
+        if (dom.pageJumpInput) dom.pageJumpInput.value = previousPage;
+        if (dom.pageJumpInputTop) dom.pageJumpInputTop.value = previousPage;
+        renderVideoGrid(state.videos);
+        renderPagination();
+        if (dom.videoCount) dom.videoCount.innerText = `Nie udało się załadować strony ${page}. Pozostajesz na stronie ${previousPage}.`;
+        triggerToast(e?.message || `Błąd ładowania strony ${page}`, 'error');
       } finally {
         if (generation === state.viewGeneration) state.isLoading = false;
       }
