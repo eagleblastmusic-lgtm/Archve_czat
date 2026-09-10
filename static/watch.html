@@ -1,0 +1,1255 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>Odtwarzacz Wideo — Archivebate Browser</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+  <noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"></noscript>
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" media="print" onload="this.media='all'">
+  <link rel="preconnect" href="https://cdn.freefile.io">
+  <link rel="dns-prefetch" href="https://cdn.freefile.io">
+  <link rel="preconnect" href="https://cdn.camwhores.tv">
+  <link rel="dns-prefetch" href="https://cdn.camwhores.tv">
+  <link rel="stylesheet" href="/static/style.css?v=24.0">
+  <style>
+    body {
+      background: #0b0e14;
+      color: #f1f5f9;
+      font-family: 'Inter', sans-serif;
+      margin: 0;
+      padding: 0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+    .watch-header {
+      background: rgba(19, 23, 34, 0.95);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .watch-container {
+      max-width: 1320px;
+      width: 100%;
+      margin: 20px auto;
+      padding: 0 16px;
+      box-sizing: border-box;
+      flex: 1;
+    }
+
+    /* CUSTOM PLAYER WRAPPER */
+    .player-box {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 16px 48px rgba(0, 0, 0, 0.85);
+      user-select: none;
+    }
+    .player-box video#mainPlayer {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+      cursor: pointer;
+    }
+
+    .watch-loader {
+      position: absolute;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.18);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      z-index: 20;
+      pointer-events: none;
+    }
+    .watch-loader-badge {
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid rgba(255, 163, 26, 0.4);
+      padding: 12px 24px;
+      border-radius: 30px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.85);
+    }
+
+    /* CENTER PLAY OVERLAY */
+    .center-play-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 0, 0, 0.3);
+      cursor: pointer;
+      z-index: 15;
+      transition: opacity 0.2s ease;
+    }
+    .center-play-btn {
+      width: 68px;
+      height: 68px;
+      border-radius: 50%;
+      background: #ffa31a;
+      color: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 26px;
+      box-shadow: 0 8px 24px rgba(255, 163, 26, 0.5);
+      transition: transform 0.15s ease;
+    }
+    .center-play-btn:hover {
+      transform: scale(1.08);
+    }
+
+    /* CUSTOM CONTROLS BAR */
+    .custom-controls-bar {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: linear-gradient(to top, rgba(0, 0, 0, 0.95) 0%, rgba(0, 0, 0, 0.6) 65%, transparent 100%);
+      padding: 8px 16px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      z-index: 25;
+      transition: opacity 0.3s ease, visibility 0.3s ease;
+    }
+    .custom-controls-bar.idle {
+      opacity: 0;
+      visibility: hidden;
+    }
+
+    /* TIMELINE & PREVIEW TOOLTIP */
+    .timeline-container {
+      position: relative;
+      width: 100%;
+      height: 18px;
+      display: flex;
+      align-items: center;
+      cursor: pointer;
+    }
+    .timeline-track {
+      position: relative;
+      width: 100%;
+      height: 6px;
+      background: rgba(255, 255, 255, 0.25);
+      border-radius: 3px;
+      overflow: visible;
+      transition: height 0.15s ease;
+    }
+    .timeline-container:hover .timeline-track {
+      height: 9px;
+    }
+    .timeline-buffer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      background: rgba(255, 255, 255, 0.4);
+      border-radius: 3px;
+      width: 0%;
+      pointer-events: none;
+    }
+    .timeline-progress {
+      position: absolute;
+      top: 0;
+      left: 0;
+      height: 100%;
+      background: #ffa31a;
+      border-radius: 3px;
+      width: 0%;
+      pointer-events: none;
+    }
+    .timeline-thumb {
+      position: absolute;
+      top: 50%;
+      left: 0%;
+      transform: translate(-50%, -50%) scale(0);
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: #ffa31a;
+      box-shadow: 0 0 8px rgba(255, 163, 26, 0.8);
+      pointer-events: none;
+      transition: transform 0.15s ease;
+    }
+    .timeline-container:hover .timeline-thumb {
+      transform: translate(-50%, -50%) scale(1);
+    }
+
+    /* TIMELINE TOOLTIP & FRAME PREVIEW */
+    .timeline-preview-tooltip {
+      position: absolute;
+      left: 0;
+      bottom: 24px;
+      transform: translate3d(var(--timeline-preview-x, 0px), 0, 0) translateX(-50%);
+      will-change: transform;
+      background: #0f172a;
+      border: 1px solid rgba(255, 163, 26, 0.6);
+      border-radius: 8px;
+      padding: 5px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.9);
+      pointer-events: none;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      z-index: 50;
+    }
+    .preview-video-box {
+      width: 160px;
+      height: 90px;
+      background: #000;
+      border-radius: 6px;
+      overflow: hidden;
+      position: relative;
+    }
+    .preview-thumb-img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 1;
+    }
+    .preview-video-box video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+      position: absolute;
+      top: 0;
+      left: 0;
+      z-index: 2;
+      opacity: 0;
+      transition: opacity 0.15s ease;
+    }
+    .preview-video-box video.has-frame {
+      opacity: 1;
+    }
+    .preview-time-text {
+      font-size: 11px;
+      font-weight: 700;
+      color: #ffa31a;
+      letter-spacing: 0.5px;
+    }
+
+    /* CONTROLS ROW */
+    .controls-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .controls-left, .controls-right {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .ctrl-btn {
+      background: none;
+      border: none;
+      color: #fff;
+      font-size: 16px;
+      cursor: pointer;
+      padding: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 6px;
+      transition: color 0.15s ease, transform 0.15s ease;
+    }
+    .ctrl-btn:hover {
+      color: #ffa31a;
+      transform: scale(1.1);
+    }
+    .ctrl-btn.speed-btn {
+      font-size: 13px;
+      font-weight: 700;
+      background: rgba(255, 255, 255, 0.1);
+      padding: 3px 8px;
+    }
+
+    /* VOLUME */
+    .volume-box {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .volume-slider {
+      width: 70px;
+      height: 4px;
+      accent-color: #ffa31a;
+      cursor: pointer;
+      opacity: 0.85;
+      transition: opacity 0.15s ease;
+    }
+    .volume-slider:hover {
+      opacity: 1;
+    }
+
+    .time-display {
+      font-size: 13px;
+      font-weight: 500;
+      color: #cbd5e1;
+      margin-left: 6px;
+    }
+
+    /* INFO BOX */
+    .video-info-box {
+      margin-top: 20px;
+      background: #131722;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .video-info-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .model-title-text {
+      font-size: 22px;
+      font-weight: 700;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .watch-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .btn-action {
+      background: #1e2433;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #fff;
+      padding: 8px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-weight: 600;
+      font-size: 13px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      text-decoration: none;
+      transition: all 0.2s ease;
+    }
+    .btn-action:hover {
+      background: #2a3347;
+      border-color: rgba(255, 163, 26, 0.5);
+    }
+    .btn-action.active {
+      background: #ef4444;
+      border-color: #ef4444;
+      color: #fff;
+    }
+    .btn-action.primary {
+      background: #ffa31a;
+      color: #000;
+      border-color: #ffa31a;
+    }
+    .btn-action.primary:hover {
+      background: #ffb74d;
+    }
+    .tags-container {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .tag-item {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: #94a3b8;
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- HEADER -->
+  <header class="watch-header">
+    <div style="display: flex; align-items: center; gap: 16px;">
+      <a href="/" class="btn-action">
+        <i class="fa-solid fa-arrow-left"></i> Powrót do katalogu
+      </a>
+      <div style="font-weight: 700; font-size: 18px;">
+        <span style="color: #ffa31a;">ARCHIVE</span>BATE
+      </div>
+    </div>
+
+    <div class="watch-actions">
+      <a id="originalBtn" href="#" target="_blank" class="btn-action">
+        <i class="fa-solid fa-arrow-up-right-from-square"></i> Oryginał
+      </a>
+      <button id="favBtn" class="btn-action">
+        <i class="fa-regular fa-heart"></i> Do ulubionych
+      </button>
+      <a id="downloadBtn" href="#" class="btn-action primary" download style="display: none;">
+        <i class="fa-solid fa-download"></i> Pobierz MP4
+      </a>
+    </div>
+  </header>
+
+  <!-- PLAYER CONTENT -->
+  <main class="watch-container">
+    <div class="player-box" id="playerBox">
+      <video id="mainPlayer" playsinline></video>
+
+      <!-- Center Play Overlay -->
+      <div class="center-play-overlay" id="centerPlayOverlay">
+        <div class="center-play-btn"><i class="fa-solid fa-play"></i></div>
+      </div>
+
+      <!-- Poster podglądowy podczas ładowania filmu (ostry, bez rozmycia) -->
+      <img id="watchLoadingPoster" class="modal-loading-poster" alt="Podgląd wideo" style="display:none;">
+
+      <!-- Loading Spinner -->
+      <div id="playerLoader" class="watch-loader">
+        <div class="watch-loader-badge">
+          <div class="spinner" style="width: 36px; height: 36px; border: 3px solid rgba(255, 163, 26, 0.2); border-top-color: #ffa31a; border-radius: 50%; animation: spin 0.8s linear infinite;"></div>
+          <div style="font-size: 14px; font-weight: 600; color: #f1f5f9;">Ładowanie strumienia MP4 bez reklam...</div>
+        </div>
+      </div>
+
+      <!-- Custom Controls Bar -->
+      <div class="custom-controls-bar" id="customControlsBar">
+        <!-- TIMELINE CONTAINER -->
+        <div class="timeline-container" id="timelineContainer">
+          <!-- Floating Tooltip Preview -->
+          <div class="timeline-preview-tooltip" id="timelineTooltip">
+            <div class="preview-video-box" id="timelinePreviewBox">
+              <img id="timelinePreviewImg" class="preview-thumb-img" alt="Podgląd">
+              <div id="timelineSprite" class="timeline-sprite-frame"></div>
+              <div id="timelinePreviewStatus" class="timeline-preview-status">Przygotowywanie podglądu…</div>
+              <video id="timelinePreviewVideo" muted playsinline preload="metadata"></video>
+            </div>
+            <div class="preview-time-text" id="timelineTimeText">00:00</div>
+          </div>
+
+          <div class="timeline-track">
+            <div class="timeline-buffer" id="timelineBuffer"></div>
+            <div class="timeline-progress" id="timelineProgress"></div>
+            <div class="timeline-thumb" id="timelineThumb"></div>
+          </div>
+        </div>
+
+        <!-- CONTROLS ROW -->
+        <div class="controls-row">
+          <div class="controls-left">
+            <button class="ctrl-btn" id="ctrlPlayBtn" title="Odtwórz / Wstrzymaj (Spacja)"><i class="fa-solid fa-play"></i></button>
+            <button class="ctrl-btn" id="ctrlRewindBtn" title="Cofnij 10s (←)"><i class="fa-solid fa-rotate-left"></i></button>
+            <button class="ctrl-btn" id="ctrlForwardBtn" title="Do przodu 10s (→)"><i class="fa-solid fa-rotate-right"></i></button>
+            
+            <!-- Volume -->
+            <div class="volume-box">
+              <button class="ctrl-btn" id="ctrlVolumeBtn" title="Wycisz (M)"><i class="fa-solid fa-volume-high"></i></button>
+              <input type="range" class="volume-slider" id="ctrlVolumeSlider" min="0" max="1" step="0.05" value="1">
+            </div>
+
+            <span class="time-display" id="ctrlTimeDisplay">00:00 / 00:00</span>
+          </div>
+
+          <div class="controls-right">
+            <button class="ctrl-btn speed-btn" id="ctrlSpeedBtn" title="Prędkość odtwarzania">1x</button>
+            <button class="ctrl-btn" id="ctrlPipBtn" title="Obraz w obrazie"><i class="fa-solid fa-clone"></i></button>
+            <button class="ctrl-btn" id="ctrlFullscreenBtn" title="Pełny ekran (F)"><i class="fa-solid fa-expand"></i></button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- INFO BOX -->
+    <div class="video-info-box">
+      <div class="video-info-row">
+        <div class="model-title-text" id="modelTitle">
+          <i class="fa-solid fa-circle-user" style="color: #ffa31a;"></i>
+          <span id="modelNameText">Modelka</span>
+        </div>
+        <div id="videoMeta" style="color: #94a3b8; font-size: 13px; font-weight: 500;">
+          Data dodania: <span id="dateText">-</span>
+        </div>
+      </div>
+
+      <div id="descText" style="color: #cbd5e1; font-size: 14px; line-height: 1.5; display: none;"></div>
+
+      <div class="tags-container" id="tagsBox"></div>
+    </div>
+  </main>
+
+  <script src="/static/api-client.js?v=1"></script>
+  <script src="/static/performance.js?v=1"></script>
+  <script src="/static/player-core.js?v=2.2"></script>
+  <script src="/static/youtube-storyboard.js?v=3.0"></script>
+  <script>
+    let videoId = window.location.pathname.split('/').filter(Boolean).pop();
+    const durationHint = Number(new URLSearchParams(window.location.search).get('duration') || 0);
+    const playerBox = document.getElementById('playerBox');
+    const player = document.getElementById('mainPlayer');
+    const previewVideo = document.getElementById('timelinePreviewVideo');
+    const timelineSprite = document.getElementById('timelineSprite');
+    const timelinePreviewStatus = document.getElementById('timelinePreviewStatus');
+    const timelinePreviewImg = document.getElementById('timelinePreviewImg');
+    const loader = document.getElementById('playerLoader');
+    const centerPlayOverlay = document.getElementById('centerPlayOverlay');
+    const controlsBar = document.getElementById('customControlsBar');
+    
+    const timelineContainer = document.getElementById('timelineContainer');
+    const timelineTooltip = document.getElementById('timelineTooltip');
+    const timelineTimeText = document.getElementById('timelineTimeText');
+    const timelineProgress = document.getElementById('timelineProgress');
+    const timelineBuffer = document.getElementById('timelineBuffer');
+    const timelineThumb = document.getElementById('timelineThumb');
+
+    const ctrlPlayBtn = document.getElementById('ctrlPlayBtn');
+    const ctrlRewindBtn = document.getElementById('ctrlRewindBtn');
+    const ctrlForwardBtn = document.getElementById('ctrlForwardBtn');
+    const ctrlVolumeBtn = document.getElementById('ctrlVolumeBtn');
+    const ctrlVolumeSlider = document.getElementById('ctrlVolumeSlider');
+    const ctrlTimeDisplay = document.getElementById('ctrlTimeDisplay');
+    const ctrlSpeedBtn = document.getElementById('ctrlSpeedBtn');
+    const ctrlPipBtn = document.getElementById('ctrlPipBtn');
+    const ctrlFullscreenBtn = document.getElementById('ctrlFullscreenBtn');
+
+    const modelNameText = document.getElementById('modelNameText');
+    const dateText = document.getElementById('dateText');
+    const descText = document.getElementById('descText');
+    const tagsBox = document.getElementById('tagsBox');
+    const favBtn = document.getElementById('favBtn');
+    const downloadBtn = document.getElementById('downloadBtn');
+    const originalBtn = document.getElementById('originalBtn');
+
+    let currentDetails = null;
+    let isDraggingTimeline = false;
+    let idleTimeout = null;
+    let timelinePrefix = null;
+    let timelineCount = 0;
+    let spriteBoard = null;
+    let spriteAbort = null;
+
+    function formatTime(seconds) {
+      if (isNaN(seconds) || seconds < 0) seconds = 0;
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = Math.floor(seconds % 60);
+      if (h > 0) {
+        return `${h}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+      }
+      return `${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+    }
+
+    function togglePlay() {
+      if (player.paused || player.ended) {
+        player.play().catch(() => {});
+      } else {
+        player.pause();
+      }
+    }
+
+    player.addEventListener('play', () => {
+      ctrlPlayBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
+      centerPlayOverlay.style.display = 'none';
+      resetIdleTimer();
+    });
+
+    player.addEventListener('pause', () => {
+      ctrlPlayBtn.innerHTML = '<i class="fa-solid fa-play"></i>';
+      centerPlayOverlay.style.display = 'flex';
+      controlsBar.classList.remove('idle');
+      clearTimeout(idleTimeout);
+    });
+
+    centerPlayOverlay.addEventListener('click', togglePlay);
+    player.addEventListener('click', togglePlay);
+    ctrlPlayBtn.addEventListener('click', togglePlay);
+
+    // Skip 10s
+    ctrlRewindBtn.addEventListener('click', () => {
+      player.currentTime = Math.max(0, player.currentTime - 10);
+    });
+    ctrlForwardBtn.addEventListener('click', () => {
+      player.currentTime = Math.min(player.duration || 0, player.currentTime + 10);
+    });
+
+    // Time update & Progress
+    player.addEventListener('timeupdate', () => {
+      if (!isDraggingTimeline && player.duration) {
+        const percent = (player.currentTime / player.duration) * 100;
+        timelineProgress.style.width = `${percent}%`;
+        timelineThumb.style.left = `${percent}%`;
+        ctrlTimeDisplay.innerText = `${formatTime(player.currentTime)} / ${formatTime(player.duration)}`;
+      }
+    });
+
+    // Buffer update
+    player.addEventListener('progress', () => {
+      if (player.duration && player.buffered.length > 0) {
+        const bufferedEnd = player.buffered.end(player.buffered.length - 1);
+        const bufferPercent = (bufferedEnd / player.duration) * 100;
+        timelineBuffer.style.width = `${bufferPercent}%`;
+      }
+    });
+
+    // TIMELINE HOVER — max jedna aktualizacja na klatkę ekranu; sprite przesuwany po GPU.
+    let previewRaf = 0;
+    let previewClientX = 0;
+    let watchSeekDebounce = null;
+    let watchLastSeekTime = 0;
+
+    let watchSeeker = null;
+    let timelineHoverController = null;
+    function seekWatchPreviewVideo(targetTime) {
+      if (previewVideo.getAttribute('src')) watchSeeker?.request(targetTime);
+    }
+
+    function renderWatchTimelinePreview(clientX) {
+      const rect = timelineContainer.getBoundingClientRect();
+      if (!rect.width) return;
+      const rawX = clientX - rect.left;
+      const pos = Math.max(0, Math.min(1, rawX / rect.width));
+      const tooltipX = rect.width <= 168 ? rect.width / 2 : Math.max(84, Math.min(rect.width - 84, rawX));
+      const duration = Number.isFinite(player.duration) && player.duration > 0 ? player.duration : 0;
+      const targetTime = pos * duration;
+
+      timelineTooltip.style.setProperty('--timeline-preview-x', `${tooltipX}px`);
+      timelineTooltip.style.display = 'flex';
+      const timeText = formatTime(targetTime);
+      if (timelineTimeText.innerText !== timeText) timelineTimeText.innerText = timeText;
+
+      if (timelinePrefix) {
+        const idx = Math.min(timelineCount, Math.max(1, Math.round(pos * (timelineCount - 1)) + 1));
+        const src = `${timelinePrefix}${idx}.jpg`;
+        if (timelinePreviewImg.src !== new URL(src, location.href).href) timelinePreviewImg.src = src;
+        timelinePreviewImg.style.display = 'block';
+        if (timelineSprite && window.ArchivebateYouTubeStoryboard) ArchivebateYouTubeStoryboard.clearFrame(timelineSprite);
+        timelinePreviewStatus.style.display = 'none';
+        previewVideo.style.display = 'none';
+        return;
+      }
+
+      // 1. Archivebate gęsty segment: dokładna sekunda (błąd <= 1s, 0ms, 0 zapytań strumienia)
+      const segment = window.ArchivebateYouTubeStoryboard?.getSegmentFromCache?.(videoId, duration, targetTime);
+      if (segment && timelineSprite && window.ArchivebateYouTubeStoryboard) {
+        timelinePreviewImg.style.display = 'none';
+        previewVideo.style.display = 'none';
+        timelinePreviewStatus.style.display = 'none';
+        timelineTimeText.innerText = formatTime(targetTime);
+        window.ArchivebateYouTubeStoryboard.applyFrame(timelineSprite, segment, targetTime, { targetTime, duration });
+        return;
+      }
+
+      // Zgłoszenie zapotrzebowania na gęsty segment w tle
+      if (window.ArchivebateYouTubeStoryboard && videoId && duration > 0) {
+        window.ArchivebateYouTubeStoryboard.requestSegment({
+          videoId,
+          duration,
+          targetTime,
+          signal: timelineHoverController?.signal,
+          onReady: () => {
+            if (timelineTooltip.style.display !== 'none') {
+              renderWatchTimelinePreview(previewClientX);
+            }
+          }
+        });
+      }
+
+      // 2. Fallback: rzadki storyboard z informacją o przygotowywaniu dokładnego podglądu
+      if (spriteBoard && timelineSprite && window.ArchivebateYouTubeStoryboard) {
+        const res = window.ArchivebateYouTubeStoryboard.applyFrame(timelineSprite, spriteBoard, targetTime, { targetTime, duration });
+        const frameTimeStr = res?.frameTime !== undefined ? ` • klatka ≈ ${formatTime(res.frameTime)}` : '';
+        timelineTimeText.innerText = `${formatTime(targetTime)}${frameTimeStr}`;
+        timelinePreviewImg.style.display = 'none';
+        previewVideo.style.display = 'none';
+        timelinePreviewStatus.innerText = 'Przygotowywanie dokładnego podglądu...';
+        timelinePreviewStatus.style.display = 'block';
+        return;
+      }
+
+      if (timelineSprite && window.ArchivebateYouTubeStoryboard) ArchivebateYouTubeStoryboard.clearFrame(timelineSprite);
+      timelinePreviewStatus.style.display = 'none';
+
+      if (previewVideo && previewVideo.src) {
+        timelinePreviewImg.style.display = 'none';
+        previewVideo.style.display = 'block';
+        previewVideo.style.opacity = '1';
+        seekWatchPreviewVideo(targetTime);
+        return;
+      }
+
+      previewVideo.style.display = 'none';
+      const fallback = currentDetails?.thumbnail || currentDetails?.poster || '';
+      if (fallback) {
+        if (timelinePreviewImg.src !== new URL(fallback, location.href).href) timelinePreviewImg.src = fallback;
+        timelinePreviewImg.style.display = 'block';
+      }
+      timelinePreviewStatus.style.display = 'none';
+    }
+
+    function updateWatchTimelinePreview(e) {
+      previewClientX = e.clientX;
+      if (!timelineHoverController || timelineHoverController.signal.aborted) {
+        timelineHoverController = new AbortController();
+      }
+      if (previewRaf) return;
+      previewRaf = requestAnimationFrame(() => {
+        previewRaf = 0;
+        renderWatchTimelinePreview(previewClientX);
+      });
+    }
+
+    function seekFromEvent(e) {
+      const rect = timelineContainer.getBoundingClientRect();
+      const pos = rect.width ? Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)) : 0;
+      if (player.duration) {
+        player.currentTime = pos * player.duration;
+        timelineProgress.style.width = `${pos * 100}%`;
+        timelineThumb.style.left = `${pos * 100}%`;
+      }
+      updateWatchTimelinePreview(e);
+    }
+
+    timelineContainer.addEventListener('pointerenter', updateWatchTimelinePreview, { passive: true });
+    timelineContainer.addEventListener('pointermove', (e) => {
+      if (isDraggingTimeline) seekFromEvent(e);
+      else updateWatchTimelinePreview(e);
+    }, { passive: true });
+    timelineContainer.addEventListener('pointerleave', () => {
+      timelineHoverController?.abort();
+      timelineHoverController = null;
+      if (!isDraggingTimeline) {
+        timelineTooltip.style.display = 'none';
+        if (previewVideo) previewVideo.style.display = 'none';
+        if (timelineSprite && window.ArchivebateYouTubeStoryboard) {
+          ArchivebateYouTubeStoryboard.clearFrame(timelineSprite);
+        }
+        timelinePreviewStatus.style.display = 'none';
+      }
+    });
+    timelineContainer.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      isDraggingTimeline = true;
+      try { timelineContainer.setPointerCapture(e.pointerId); } catch (_) {}
+      seekFromEvent(e);
+    });
+    timelineContainer.addEventListener('pointerup', (e) => {
+      if (!isDraggingTimeline) return;
+      seekFromEvent(e);
+      isDraggingTimeline = false;
+      try { timelineContainer.releasePointerCapture(e.pointerId); } catch (_) {}
+    });
+    timelineContainer.addEventListener('pointercancel', () => {
+      isDraggingTimeline = false;
+      timelineTooltip.style.display = 'none';
+      if (previewVideo) previewVideo.style.display = 'none';
+    });
+
+    // Volume
+    ctrlVolumeSlider.addEventListener('input', (e) => {
+      player.volume = parseFloat(e.target.value);
+      player.muted = (player.volume === 0);
+      updateVolumeIcon();
+    });
+
+    ctrlVolumeBtn.addEventListener('click', () => {
+      player.muted = !player.muted;
+      updateVolumeIcon();
+    });
+
+    function updateVolumeIcon() {
+      if (player.muted || player.volume === 0) {
+        ctrlVolumeBtn.innerHTML = '<i class="fa-solid fa-volume-xmark"></i>';
+      } else if (player.volume < 0.5) {
+        ctrlVolumeBtn.innerHTML = '<i class="fa-solid fa-volume-low"></i>';
+      } else {
+        ctrlVolumeBtn.innerHTML = '<i class="fa-solid fa-volume-high"></i>';
+      }
+    }
+
+    // Speed toggle
+    const speeds = [1, 1.25, 1.5, 2, 0.75];
+    let speedIdx = 0;
+    ctrlSpeedBtn.addEventListener('click', () => {
+      speedIdx = (speedIdx + 1) % speeds.length;
+      const s = speeds[speedIdx];
+      player.playbackRate = s;
+      ctrlSpeedBtn.innerText = `${s}x`;
+    });
+
+    // PiP
+    ctrlPipBtn.addEventListener('click', async () => {
+      if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+      } else if (document.pictureInPictureEnabled) {
+        await player.requestPictureInPicture();
+      }
+    });
+
+    // Fullscreen
+    ctrlFullscreenBtn.addEventListener('click', toggleFullscreen);
+    function toggleFullscreen() {
+      if (!document.fullscreenElement) {
+        playerBox.requestFullscreen().catch(() => {});
+      } else {
+        document.exitFullscreen().catch(() => {});
+      }
+    }
+
+    // Auto-hide controls on idle
+    function resetIdleTimer() {
+      controlsBar.classList.remove('idle');
+      clearTimeout(idleTimeout);
+      if (!player.paused) {
+        idleTimeout = setTimeout(() => {
+          controlsBar.classList.add('idle');
+        }, 2500);
+      }
+    }
+    playerBox.addEventListener('mousemove', resetIdleTimer);
+    playerBox.addEventListener('mouseleave', () => {
+      if (!player.paused) controlsBar.classList.add('idle');
+    });
+
+    // Pamięć podręczna filmów w profilu autora dla odtwarzacza watch.html
+    const authorPlaylistsWatch = new Map();
+
+    async function getAuthorVideosWatch(username) {
+      if (!username || username.toLowerCase() === 'model') return null;
+      const norm = username.trim().toLowerCase();
+      let pl = authorPlaylistsWatch.get(norm);
+      if (!pl) {
+        pl = { username: username, videos: [], page: 1, hasMore: true, isLoading: false };
+        authorPlaylistsWatch.set(norm, pl);
+        if (currentDetails) pl.videos.push(currentDetails);
+      }
+
+      if (pl.videos.length <= 1 && pl.hasMore && !pl.isLoading) {
+        pl.isLoading = true;
+        try {
+          const res = await ArchivebateAPI.getJSON(`/api/model/${encodeURIComponent(username)}?page=1`, { timeoutMs: 12000 });
+          const fetched = res?.videos || [];
+          if (fetched.length > 0) {
+            const ids = new Set(pl.videos.map(v => String(v.id || v.url)));
+            for (const v of fetched) {
+              const k = String(v.id || v.url);
+              if (!ids.has(k)) { pl.videos.push(v); ids.add(k); }
+            }
+          } else {
+            pl.hasMore = false;
+          }
+        } catch (e) {
+        } finally {
+          pl.isLoading = false;
+        }
+      }
+      return pl;
+    }
+
+    function switchWatchVideo(newVideo) {
+      if (!newVideo || !newVideo.id) return;
+      videoId = newVideo.id;
+      window.history.pushState({}, '', `/watch/${newVideo.id}`);
+      initWatch();
+    }
+
+    async function playNextAuthorVideoWatch() {
+      const username = currentDetails?.username;
+      if (!username || username.toLowerCase() === 'model') return;
+      const pl = await getAuthorVideosWatch(username);
+      if (!pl || pl.videos.length === 0) return;
+      const currId = String(videoId || currentDetails?.id || '');
+      let idx = pl.videos.findIndex(v => String(v.id || '') === currId);
+      if (idx === -1) idx = 0;
+
+      if (idx < pl.videos.length - 1) {
+        switchWatchVideo(pl.videos[idx + 1]);
+        return;
+      }
+
+      if (pl.hasMore && !pl.isLoading) {
+        pl.isLoading = true;
+        try {
+          const nextPage = (pl.page || 1) + 1;
+          const res = await ArchivebateAPI.getJSON(`/api/model/${encodeURIComponent(username)}?page=${nextPage}`, { timeoutMs: 12000 });
+          const fetched = res?.videos || [];
+          pl.page = nextPage;
+          if (fetched.length === 0) {
+            pl.hasMore = false;
+          } else {
+            const ids = new Set(pl.videos.map(v => String(v.id || v.url)));
+            for (const v of fetched) {
+              const k = String(v.id || v.url);
+              if (!ids.has(k)) { pl.videos.push(v); ids.add(k); }
+            }
+            if (idx < pl.videos.length - 1) {
+              switchWatchVideo(pl.videos[idx + 1]);
+            }
+          }
+        } catch (e) {
+        } finally {
+          pl.isLoading = false;
+        }
+      }
+    }
+
+    async function playPrevAuthorVideoWatch() {
+      const username = currentDetails?.username;
+      if (!username || username.toLowerCase() === 'model') return;
+      const pl = await getAuthorVideosWatch(username);
+      if (!pl || pl.videos.length === 0) return;
+      const currId = String(videoId || currentDetails?.id || '');
+      let idx = pl.videos.findIndex(v => String(v.id || '') === currId);
+      if (idx > 0) {
+        switchWatchVideo(pl.videos[idx - 1]);
+      }
+    }
+
+    // Keyboard shortcuts
+    window.addEventListener('keydown', (e) => {
+      if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+      if (e.code === 'Space') {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.code === 'ArrowLeft') {
+        e.preventDefault();
+        player.currentTime = Math.max(0, player.currentTime - 5);
+      } else if (e.code === 'ArrowRight') {
+        e.preventDefault();
+        player.currentTime = Math.min(player.duration || 0, player.currentTime + 5);
+      } else if (e.code === 'ArrowUp') {
+        e.preventDefault();
+        playPrevAuthorVideoWatch();
+      } else if (e.code === 'ArrowDown') {
+        e.preventDefault();
+        playNextAuthorVideoWatch();
+      } else if (e.code === 'KeyF') {
+        e.preventDefault();
+        toggleFullscreen();
+      } else if (e.code === 'KeyM') {
+        e.preventDefault();
+        player.muted = !player.muted;
+        updateVolumeIcon();
+      }
+    });
+
+    let watchGeneration = 0;
+    let watchController = null;
+    let activeWatchSession = null;
+    const watchLoadingMarkup = loader.innerHTML;
+    async function initWatch(options = {}) {
+      const generation = ++watchGeneration;
+      const forceRefresh = !!options?.forceRefresh;
+      loader.innerHTML = watchLoadingMarkup;
+      loader.style.display = 'flex';
+      ArchivebatePerf.setPlaybackBusy(true);
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+      watchController?.abort();
+      timelineHoverController?.abort();
+      timelineHoverController = null;
+      spriteBoard = null;
+      activeWatchSession?.abort('switched_video');
+      watchController = new AbortController();
+      const controller = watchController;
+
+      const watchSession = activeWatchSession = (window.ArchivebatePerf?.startPlaybackSession ? window.ArchivebatePerf.startPlaybackSession({
+        id: videoId,
+        owner: 'player',
+        priority: 'high',
+        reason: options?.reason || 'watch_page'
+      }) : null);
+
+      watchSeeker?.destroy();
+      watchSeeker = ArchivebatePlayerCore.createPreviewSeeker(previewVideo, {onFrame:()=>{previewVideo.style.display="block";}});
+      spriteBoard = null;
+      if (!videoId) return;
+
+      const watchPoster = document.getElementById('watchLoadingPoster');
+      const hideWatchLoader = () => {
+        if (generation !== watchGeneration) return;
+        loader.style.display = 'none';
+        if (watchPoster) {
+          watchPoster.style.opacity = '0';
+          setTimeout(() => {
+            if (generation === watchGeneration && watchPoster.style.opacity === '0') watchPoster.style.display = 'none';
+          }, 350);
+        }
+      };
+      player.onloadedmetadata = () => {
+        if (generation !== watchGeneration) return;
+        watchSession?.markMetadata();
+      };
+      player.onloadeddata = hideWatchLoader;
+      player.oncanplay = hideWatchLoader;
+      player.ontimeupdate = () => {
+        if (generation !== watchGeneration) return;
+        if (player.currentTime > 0) hideWatchLoader();
+        if (window.ArchivebatePerf?.updatePlaybackBuffer) {
+          window.ArchivebatePerf.updatePlaybackBuffer(player, 5.0);
+        }
+      };
+      player.onprogress = () => {
+        if (generation !== watchGeneration) return;
+        if (window.ArchivebatePerf?.updatePlaybackBuffer) {
+          window.ArchivebatePerf.updatePlaybackBuffer(player, 5.0);
+        }
+      };
+      player.onplaying = () => {
+        if (generation !== watchGeneration) return;
+        hideWatchLoader();
+        watchSession?.markFirstByte();
+        if (window.ArchivebatePerf?.updatePlaybackBuffer) {
+          window.ArchivebatePerf.updatePlaybackBuffer(player, 5.0);
+        } else {
+          ArchivebatePerf.setPlaybackBusy(false);
+        }
+      };
+      player.onwaiting = player.onstalled = () => {
+        if (generation !== watchGeneration) return;
+        ArchivebatePerf.setPlaybackBusy(true);
+      };
+      player.onerror = () => {
+        if (generation !== watchGeneration) return;
+        ArchivebatePerf.setPlaybackBusy(false);
+        watchSession?.markError('watch_stream_error', 'Błąd strumienia wideo');
+        loader.style.display = 'flex';
+        loader.innerHTML = `
+          <div style="text-align: center; max-width: 480px; padding: 24px; background: rgba(0,0,0,0.85); border-radius: 12px; border: 1px solid rgba(239, 68, 68, 0.3);">
+            <i class="fa-solid fa-triangle-exclamation" style="font-size: 36px; color: #f87171; margin-bottom: 12px; display: block;"></i>
+            <div style="color: #f87171; font-weight: 700; font-size: 16px; margin-bottom: 8px;">Nie udało się załadować wideo (błąd źródła)</div>
+            <div style="color: #94a3b8; font-size: 13px; margin-bottom: 16px;">Serwer strumienia jest chwilowo niedostępny lub odrzucił połączenie.</div>
+            <button id="watchRetryPlaybackBtn" style="background: #2563eb; color: #fff; border: none; padding: 10px 20px; border-radius: 8px; font-weight: 600; cursor: pointer;">
+              <i class="fa-solid fa-rotate-right"></i> Ponów próbę
+            </button>
+          </div>
+        `;
+        const retryBtn = document.getElementById('watchRetryPlaybackBtn');
+        if (retryBtn) {
+          retryBtn.onclick = () => {
+            initWatch({ forceRefresh: true, reason: 'retry_button' });
+          };
+        }
+      };
+
+      // 1. NATYCHMIASTOWY START STRUMIENIA (równolegle, równolegle z pobieraniem metadanych)
+      const immediateStream = `/api/video/stream?id=${encodeURIComponent(videoId)}&owner=player&priority=high&reason=watch_page`;
+      const observeFirstFrame = () => {
+        ArchivebatePlayerCore.waitForPresentedFrame(player, undefined, 30000, controller.signal).then(presented => {
+          if (presented && generation === watchGeneration) watchSession?.markFirstFrame();
+        });
+      };
+      watchSession?.markConnectStart();
+      if (!forceRefresh) {
+        player.src = immediateStream;
+        player.preload = 'auto';
+        observeFirstFrame();
+        player.play().catch(() => {});
+      }
+
+      try {
+        const data = await ArchivebateAPI.getJSON(`/api/video/details?id=${encodeURIComponent(videoId)}${forceRefresh ? '&force_refresh=true' : ''}`, { timeoutMs: 12000, signal: controller.signal });
+        if (generation !== watchGeneration) return;
+        currentDetails = data;
+        watchSession?.markUrlResolved(data.proxy_stream_url || data.direct_url, !forceRefresh);
+
+
+        document.title = `${data.username || 'Wideo'} — Archivebate Player`;
+        modelNameText.innerText = data.username || 'Model';
+        dateText.innerText = data.date || 'Niedawno';
+        originalBtn.href = data.url || `https://archivebate.com/watch/${videoId}`;
+
+        if (data.description) {
+          descText.innerText = data.description;
+          descText.style.display = 'block';
+        }
+
+        if (data.keywords && data.keywords.length > 0) {
+          tagsBox.innerHTML = '';
+          data.keywords.forEach(kw => {
+            if (kw.trim()) {
+              const span = document.createElement('span');
+              span.className = 'tag-item';
+              span.innerText = kw.trim();
+              span.style.cursor = 'pointer';
+              span.title = `Szukaj filmów z tagiem #${kw.trim()}`;
+              span.addEventListener('click', () => {
+                window.location.href = `/?search=${encodeURIComponent(kw.trim())}`;
+              });
+              tagsBox.appendChild(span);
+            }
+          });
+        }
+
+        updateFavState(!!data.is_favorite);
+
+        if (data.is_private) {
+          ArchivebatePerf.setPlaybackBusy(false);
+          player.pause();
+          player.removeAttribute('src');
+          player.load();
+          loader.innerHTML = `
+            <div style="text-align: center; max-width: 540px; padding: 28px; background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 12px;">
+              <i class="fa-solid fa-lock" style="font-size: 42px; color: #f59e0b; margin-bottom: 14px; display: block;"></i>
+              <div style="font-size: 17px; font-weight: 700; color: #f87171; margin-bottom: 8px;">Film prywatny na Camwhores</div>
+              <div style="font-size: 13px; color: #94a3b8; line-height: 1.6; margin-bottom: 18px;">Autor oznaczył to nagranie jako prywatne na platformie Camwhores (dostępne wyłącznie dla użytkowników wgrywających wideo).</div>
+              ${data.url ? `<a href="${data.url}" target="_blank" rel="noreferrer" style="display: inline-flex; align-items: center; gap: 8px; padding: 10px 20px; background: #1e293b; color: #f8fafc; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: 600;"><i class="fa-solid fa-arrow-up-right-from-square"></i> Otwórz na Camwhores</a>` : ''}
+            </div>
+          `;
+          return;
+        }
+
+        // Zawsze używamy bezpiecznego lokalnego proxy strumienia MP4 bez reklam
+        const streamUrl = (data.proxy_stream_url || data.direct_url)
+          ? immediateStream + (forceRefresh ? `&retry=${generation}` : '') : '';
+        if (streamUrl) {
+          const cur = player.getAttribute('src') || player.src || '';
+          const norm = (u) => { try { return new URL(u, window.location.href).href; } catch(e) { return u; } };
+          if (!cur || norm(cur) !== norm(streamUrl)) {
+            player.src = streamUrl;
+            player.preload = 'auto';
+            observeFirstFrame();
+            player.play().catch(() => {});
+          }
+
+          // YouTube-style storyboard. Camwhores ma własne gotowe klatki;
+          // Archivebate dostaje jeden sprite JPG generowany i cache'owany przez backend.
+          let posterBg = (data.thumbnail || data.poster || '').replace('.mp4', '.jpg');
+          const isCamwhores = String(videoId).startsWith('cw_') || String(data.url || '').includes('camwhores');
+          let watchPosterSrc = posterBg;
+          if (isCamwhores && watchPosterSrc.includes('/180x135/')) {
+            watchPosterSrc = watchPosterSrc.replace(/\/180x135\/\d+\.jpg/, '/preview.jpg');
+          }
+
+          if (watchPoster && watchPosterSrc && player.readyState < 2) {
+            watchPoster.src = watchPosterSrc;
+            watchPoster.style.display = 'block';
+            watchPoster.style.opacity = '1';
+          }
+          player.poster = watchPosterSrc || '';
+
+          previewVideo.style.display = 'none';
+          previewVideo.pause();
+          previewVideo.removeAttribute('src');
+
+          if (isCamwhores && posterBg && (posterBg.includes('/180x135/') || posterBg.includes('/contents/videos_screenshots/'))) {
+            if (posterBg.includes('/180x135/')) {
+              timelinePrefix = posterBg.substring(0, posterBg.indexOf('/180x135/') + 9);
+            } else {
+              const baseFolder = posterBg.substring(0, posterBg.lastIndexOf('/') + 1);
+              timelinePrefix = `${baseFolder}180x135/`;
+            }
+            timelineCount = 15;
+            timelinePreviewImg.src = `${timelinePrefix}1.jpg`;
+            timelinePreviewImg.style.display = 'block';
+            timelinePreviewStatus.style.display = 'none';
+            ArchivebatePerf.prefetchUrls(Array.from({length:timelineCount},(_,i)=>`${timelinePrefix}${i+1}.jpg`),{concurrency:2,signal:controller.signal});
+          } else {
+            timelinePrefix = null;
+            timelineCount = 0;
+            ArchivebateYouTubeStoryboard.attach({video:player,videoId,timeline:timelineContainer,signal:controller.signal,onBoard:board=>{
+              if(generation!==watchGeneration)return;
+              spriteBoard=board;
+              previewVideo.pause();previewVideo.removeAttribute('src');previewVideo.load();
+            }});
+            timelinePreviewImg.style.display = 'none';
+            timelinePreviewStatus.style.display = 'none';
+            if (previewVideo && streamUrl) {
+              let warmedWatchTimeline = false;
+              const warmWatch = () => {
+                if (warmedWatchTimeline || spriteBoard || !previewVideo) return;
+                warmedWatchTimeline = true;
+                previewVideo.src = streamUrl;
+                previewVideo.preload = 'metadata';
+                previewVideo.muted = true;
+                previewVideo.playsInline = true;
+                previewVideo.load();
+              };
+              if (timelineContainer) {
+                timelineContainer.addEventListener('pointerenter', warmWatch, { once: true, signal: controller.signal });
+              }
+            }
+          }
+        } else {
+          ArchivebatePerf.setPlaybackBusy(false);
+          loader.style.display = 'flex';
+          loader.innerHTML = '<div style="color: #ef4444; font-weight: 600;">Nie znaleziono bezpośredniego strumienia wideo.</div>';
+        }
+
+        if (data.direct_url || data.download_url) {
+          downloadBtn.href = data.direct_url || data.download_url;
+          downloadBtn.style.display = 'inline-flex';
+        }
+
+        const recordHistory = () => ArchivebateAPI.postJSON('/api/account/history/record', {id:videoId,url:data.url,username:data.username,thumbnail:data.thumbnail,date:data.date}, {timeoutMs:5000}).catch(()=>{});
+        if (!player.paused && player.readyState >= 2) recordHistory();
+        else player.addEventListener('playing', recordHistory, {once:true,signal:controller.signal});
+
+      } catch (err) {
+        if (generation !== watchGeneration || err?.code === 'cancelled') return;
+        if (forceRefresh) player.onerror();
+      }
+    }
+
+    window.addEventListener('pagehide',()=>{watchController?.abort();watchSeeker?.destroy();});
+
+    function updateFavState(isFav) {
+      if (isFav) {
+        favBtn.classList.add('active');
+        favBtn.innerHTML = '<i class="fa-solid fa-heart"></i> W ulubionych';
+      } else {
+        favBtn.classList.remove('active');
+        favBtn.innerHTML = '<i class="fa-regular fa-heart"></i> Do ulubionych';
+      }
+    }
+
+    favBtn.addEventListener('click', async () => {
+      if (!currentDetails) return;
+      try {
+        const data = await ArchivebateAPI.postJSON('/api/account/favorites/toggle', {
+          id: videoId,
+          url: currentDetails.url,
+          username: currentDetails.username,
+          thumbnail: currentDetails.thumbnail,
+          date: currentDetails.date
+        }, { timeoutMs: 8000 });
+        updateFavState(data.is_favorite);
+      } catch (err) {
+        alert(err?.message || 'Nie udało się zmienić ulubionych.');
+      }
+    });
+
+    window.addEventListener('beforeunload', () => {
+      if (spriteAbort) spriteAbort.abort();
+    });
+
+    initWatch();
+  </script>
+</body>
+</html>

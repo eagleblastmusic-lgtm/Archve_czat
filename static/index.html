@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>Archivebate Video Browser</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+  <noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet"></noscript>
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" media="print" onload="this.media='all'">
+  <link rel="preconnect" href="https://cdn.freefile.io">
+  <link rel="dns-prefetch" href="https://cdn.freefile.io">
+  <link rel="preconnect" href="https://cdn.camwhores.tv">
+  <link rel="dns-prefetch" href="https://cdn.camwhores.tv">
+  <link rel="stylesheet" href="/static/style.css?v=26.0">
+</head>
+<body>
+
+  <!-- DESKTOP APP TABS BAR -->
+  <div class="app-tabs-bar" id="appTabsBar">
+    <div class="app-tabs-container" id="appTabsContainer"></div>
+    <button class="app-tab-new-btn" id="appTabNewBtn" title="Nowa karta (Ctrl + T)">
+      <i class="fa-solid fa-plus"></i>
+    </button>
+  </div>
+
+  <!-- NAVBAR -->
+  <header class="navbar">
+    <div class="nav-container">
+      <div class="logo" id="logoBtn">
+        <div class="logo-badge">AB</div>
+        <div class="logo-text">ARCHIVE<span>BATE</span></div>
+      </div>
+
+      <!-- NAWIGACJA ZAKŁADEK -->
+      <nav class="nav-menu">
+        <button class="nav-link active" id="navHomeBtn">
+          <i class="fa-solid fa-house"></i> Odkrywaj
+        </button>
+        <button class="nav-link" id="navFavoritesBtn">
+          <i class="fa-solid fa-heart"></i> Ulubione
+          <span class="nav-counter" id="navFavCount">0</span>
+        </button>
+        <button class="nav-link" id="navHistoryBtn">
+          <i class="fa-solid fa-clock-rotate-left"></i> Historia
+          <span class="nav-counter" id="navHistCount">0</span>
+        </button>
+        <button class="nav-link" id="navFollowingBtn">
+          <i class="fa-solid fa-user-group"></i> Obserwowane
+        </button>
+        <button class="nav-link" id="navAccountBtn">
+          <i class="fa-solid fa-circle-user"></i> Panel Konta
+        </button>
+        <button class="nav-link nav-checkpoint-btn" id="navCheckpointBtn" style="display: none;" title="Przejdź do zapisanego punktu kontrolnego">
+          <i class="fa-solid fa-location-dot"></i> Checkpoint
+        </button>
+      </nav>
+
+      <div class="search-wrapper">
+        <div class="search-input-box">
+          <i class="fa-solid fa-magnifying-glass search-icon"></i>
+          <input type="text" id="searchInput" class="search-input" placeholder="Wyszukaj po tagu (#trans, #teen), modelce lub kategorii..." autocomplete="off">
+          <button id="clearSearchBtn" class="clear-btn" title="Wyczyść"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+      </div>
+
+      <div class="user-status-card" id="userStatusCard" title="Status zalogowania">
+        <div class="status-dot" id="statusDot"></div>
+        <span class="user-email" id="userEmail">Łączenie...</span>
+        <button id="reloginBtn" class="btn-refresh" title="Synchronizuj / Ponów logowanie">
+          <i class="fa-solid fa-rotate-right"></i>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- POPULAR TAGS BAR -->
+  <section class="tags-section" id="tagsSection">
+    <div class="tags-container" id="tagsContainer">
+      <span class="tag-label"><i class="fa-solid fa-tags"></i> Tagi:</span>
+      <!-- Dynamicznie wstawiane tagi -->
+    </div>
+  </section>
+
+  <!-- MAIN CONTENT -->
+  <main class="main-container">
+
+    <!-- PANEL KONTA (WIDOK ZAKŁADKI) -->
+    <section class="account-panel-view" id="accountPanelView" style="display: none;">
+      <div class="account-card">
+        <div class="account-header">
+          <div class="account-avatar">
+            <i class="fa-solid fa-user-shield"></i>
+          </div>
+          <div class="account-info">
+            <h2 class="account-email" id="panelEmail">Brak danych konta</h2>
+            <div class="account-badges">
+              <span class="badge-account-status online"><i class="fa-solid fa-circle-check"></i> Zalogowano do Archivebate</span>
+              <span class="badge-account-sync" id="panelLastSync"><i class="fa-solid fa-clock"></i> Synchronizacja...</span>
+            </div>
+          </div>
+          <div class="account-actions">
+            <button class="btn-card primary" id="panelSyncBtn">
+              <i class="fa-solid fa-arrows-rotate"></i> Synchronizuj z Archivebate
+            </button>
+            <button class="btn-card" id="panelClearHistoryBtn">
+              <i class="fa-solid fa-trash"></i> Wyczyść historię
+            </button>
+          </div>
+        </div>
+
+        <div class="account-stats-grid">
+          <div class="stat-box" id="statBoxFavs">
+            <div class="stat-icon fav"><i class="fa-solid fa-heart"></i></div>
+            <div class="stat-details">
+              <span class="stat-number" id="statFavCount">0</span>
+              <span class="stat-title">Ulubione / Zapisane</span>
+            </div>
+            <button class="stat-action-btn" id="statBtnFavs">Przeglądaj <i class="fa-solid fa-arrow-right"></i></button>
+          </div>
+
+          <div class="stat-box" id="statBoxHist">
+            <div class="stat-icon hist"><i class="fa-solid fa-clock-rotate-left"></i></div>
+            <div class="stat-details">
+              <span class="stat-number" id="statHistCount">0</span>
+              <span class="stat-title">Obejrzane filmy (Historia)</span>
+            </div>
+            <button class="stat-action-btn" id="statBtnHist">Przeglądaj <i class="fa-solid fa-arrow-right"></i></button>
+          </div>
+
+          <div class="stat-box" id="statBoxFoll">
+            <div class="stat-icon foll"><i class="fa-solid fa-user-group"></i></div>
+            <div class="stat-details">
+              <span class="stat-number" id="statFollCount">0</span>
+              <span class="stat-title">Obserwowane kanały</span>
+            </div>
+            <button class="stat-action-btn" id="statBtnFoll">Przeglądaj <i class="fa-solid fa-arrow-right"></i></button>
+          </div>
+
+          <div class="stat-box" id="statBoxBlocked">
+            <div class="stat-icon" style="background: rgba(239, 68, 68, 0.15); color: #ef4444;"><i class="fa-solid fa-ban"></i></div>
+            <div class="stat-details">
+              <span class="stat-number" id="statBlockedCount">0</span>
+              <span class="stat-title">Zablokowane profile</span>
+              <span class="stat-sub" id="statBlockedVideosSub" style="font-size: 0.75rem; color: var(--text-muted); display: block; margin-top: 2px;">usunięto 0 filmów</span>
+            </div>
+            <button class="stat-action-btn" id="statBtnBlocked">Zarządzaj <i class="fa-solid fa-arrow-right"></i></button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- STATYSTYKI STRONY GŁÓWNEJ (VIDEO I PROFILE) -->
+    <div class="home-stats-bar" id="homeStatsBar">
+      <div class="home-stat-card" title="Łączna szacowana liczba nagrań w serwisach (Archivebate + Camwhores)">
+        <div class="stat-icon-wrap icon-videos">
+          <i class="fa-solid fa-film"></i>
+        </div>
+        <div class="stat-card-text">
+          <span class="stat-card-val" id="statGlobalVideos">5 500 000+</span>
+          <span class="stat-card-lbl">Łącznie w serwisach</span>
+        </div>
+      </div>
+
+      <div class="home-stat-card" id="homeStatCatalogCard" title="Liczba nagrań i stron dostępnych w katalogu aplikacji po uwzględnieniu usuniętych autorów">
+        <div class="stat-icon-wrap icon-page" style="background: rgba(56, 189, 248, 0.12); color: #38bdf8;">
+          <i class="fa-solid fa-database"></i>
+        </div>
+        <div class="stat-card-text">
+          <span class="stat-card-val" id="statCatalogVideos">--</span>
+          <span class="stat-card-lbl" id="statCatalogVideosLbl">W katalogu (-- stron)</span>
+        </div>
+      </div>
+
+      <div class="home-stat-card" title="Liczba rozpoznanych i staggowanych profili modelek">
+        <div class="stat-icon-wrap icon-profiles">
+          <i class="fa-solid fa-users"></i>
+        </div>
+        <div class="stat-card-text">
+          <span class="stat-card-val" id="statGlobalProfiles">1 440+</span>
+          <span class="stat-card-lbl">Zaindeksowane profile modelek</span>
+        </div>
+      </div>
+
+      <div class="home-stat-card" title="Liczba filmów załadowanych na bieżącej stronie">
+        <div class="stat-icon-wrap icon-page">
+          <i class="fa-solid fa-layer-group"></i>
+        </div>
+        <div class="stat-card-text">
+          <span class="stat-card-val" id="statPageVideos">0</span>
+          <span class="stat-card-lbl">Filmów na tej stronie</span>
+        </div>
+      </div>
+
+      <div class="home-stat-card" title="Twoje zapisane ulubione oraz obejrzane filmy">
+        <div class="stat-icon-wrap icon-library">
+          <i class="fa-solid fa-bookmark"></i>
+        </div>
+        <div class="stat-card-text">
+          <span class="stat-card-val" id="statUserLibrary">0</span>
+          <span class="stat-card-lbl">Twoja biblioteka (ulubione i historia)</span>
+        </div>
+      </div>
+
+      <div class="home-stat-card" title="Liczba zablokowanych autorów i łącznie usuniętych filmów">
+        <div class="stat-icon-wrap icon-blocked">
+          <i class="fa-solid fa-ban"></i>
+        </div>
+        <div class="stat-card-text">
+          <span class="stat-card-val" id="statBlockedInfo">0 autorów</span>
+          <span class="stat-card-lbl" id="statBlockedVideosLbl">0 filmów usuniętych łącznie</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- NAGŁÓWEK WIDOKU WIDEO -->
+    <div class="content-header" id="contentHeader">
+      <div class="view-title-wrap">
+        <h1 class="view-title" id="viewTitle">Ostatnie nagrania</h1>
+        <span class="count-badge" id="videoCount">Ładowanie...</span>
+      </div>
+      <div class="content-header-actions" style="display: flex; align-items: center; gap: 10px;">
+        <button class="btn-scan-profiles" id="quickScanBtn" title="Błyskawicznie przeskanuj i uzupełnij tagi wszystkich profili w tle">
+          <i class="fa-solid fa-bolt"></i> Baza profili: <span id="scannedModelsCount">650+</span>
+        </button>
+        <button class="btn-toggle-camwhores mode-all" id="toggleCamwhoresBtn" title="Przełącz źródło: Wszystkie / Tylko Camwhores / Tylko Archivebate">
+          <i class="fa-solid fa-layer-group" id="sourceToggleIcon"></i> Źródło: <span id="camwhoresToggleLabel">Wszystkie</span>
+        </button>
+        <button class="btn-toggle-authors mode-all" id="toggleAuthorFilterBtn" title="Filtruj autorów: Wszyscy / Tylko polubieni / Bez polubionych">
+          <i class="fa-solid fa-users" id="authorFilterIcon"></i> Autorzy: <span id="authorFilterLabel">Wszyscy</span>
+        </button>
+        <button class="btn-toggle-group mode-ungrouped" id="toggleGroupBtn" title="Grupuj filmy: 1 kafelek na autora (pokazuje ostatni film i grupuje pozostałe)">
+          <i class="fa-solid fa-boxes-stacked" id="groupToggleIcon"></i> Grupuj filmy: <span id="groupToggleLabel">Wyłączone</span>
+        </button>
+        <button class="btn-checkpoint" id="headerCheckpointBtn" style="display: none;" title="Przejdź do zapisanego punktu kontrolnego">
+          <i class="fa-solid fa-location-dot"></i> Prowadź do checkpointu
+          <span class="checkpoint-text" id="checkpointText"></span>
+        </button>
+        <button class="btn-back-nav" id="navBackBtn" style="display: none;" title="Cofnij do poprzedniego widoku">
+          <i class="fa-solid fa-arrow-left"></i> Cofnij
+        </button>
+        <button class="btn-reset-filter" id="resetFilterBtn" style="display: none;" title="Wróć do strony głównej">
+          <i class="fa-solid fa-house"></i> Strona główna
+        </button>
+      </div>
+    </div>
+
+    <!-- PROFILES MATCHED (jeśli wyszukiwano) -->
+    <div class="matched-profiles" id="matchedProfiles">
+      <div class="matched-profiles-title"><i class="fa-solid fa-user-tag"></i> Znalezione profile:</div>
+      <div class="profiles-list" id="profilesList"></div>
+    </div>
+
+    <!-- NUMERACJA STRON NAD SIATKĄ (TOP PAGINATION) -->
+    <div class="pagination-section top-pagination" id="paginationSectionTop" style="margin-top: 0; margin-bottom: 14px; padding: 4px 0;">
+      <div class="pagination-container" id="paginationContainerTop">
+        <button class="page-nav-btn" id="prevPageBtnTop" title="Poprzednia strona">
+          <i class="fa-solid fa-chevron-left"></i> Poprzednia
+        </button>
+        <div class="page-numbers-list" id="pageNumbersListTop"></div>
+        <button class="page-nav-btn" id="nextPageBtnTop" title="Następna strona">
+          Następna <i class="fa-solid fa-chevron-right"></i>
+        </button>
+        <button class="page-nav-btn last-page-btn" id="lastPageBtnTop" title="Idź do ostatniej strony">
+          Ostatnia (<span id="lastPageNumberTop">1</span>) <i class="fa-solid fa-angles-right"></i>
+        </button>
+        <div class="page-jump-box">
+          <span>Strona:</span>
+          <input type="number" id="pageJumpInputTop" min="1" max="1000" value="1">
+          <button class="page-jump-btn" id="pageJumpBtnTop">Przejdź</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- VIDEO GRID -->
+    <div class="video-grid" id="videoGrid">
+      <!-- Kafelki wideo renderowane dynamicznie -->
+    </div>
+
+    <!-- NUMERACJA STRON / WYBÓR STRONY -->
+    <div class="pagination-section" id="paginationSection">
+      <div class="pagination-container" id="paginationContainer">
+        <button class="page-nav-btn" id="prevPageBtn" title="Poprzednia strona">
+          <i class="fa-solid fa-chevron-left"></i> Poprzednia
+        </button>
+        <div class="page-numbers-list" id="pageNumbersList"></div>
+        <button class="page-nav-btn" id="nextPageBtn" title="Następna strona">
+          Następna <i class="fa-solid fa-chevron-right"></i>
+        </button>
+        <button class="page-nav-btn last-page-btn" id="lastPageBtn" title="Idź do ostatniej strony">
+          Ostatnia (<span id="lastPageNumber">1 000</span>) <i class="fa-solid fa-angles-right"></i>
+        </button>
+        <div class="page-jump-box">
+          <span>Strona:</span>
+          <input type="number" id="pageJumpInput" min="1" max="1000" value="1">
+          <button class="page-jump-btn" id="pageJumpBtn">Przejdź</button>
+        </div>
+      </div>
+      <div class="scroll-next-hint" id="scrollNextHint" style="color: var(--text-dim); font-size: 12px; margin-top: 10px; display: flex; align-items: center; justify-content: center; gap: 6px;">
+        <i class="fa-solid fa-angles-down" style="color: #ffa31a;"></i> Przewiń dalej na dole, aby przeskoczyć do kolejnej strony
+      </div>
+    </div>
+  </main>
+
+  <!-- MODAL BEZPOŚREDNIEGO ODTWARZACZA WIDEO (BEZ REKLAM) -->
+  <div class="modal-overlay" id="videoModal">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="modal-title-box">
+          <span class="badge-platform" id="modalPlatform">Chaturbate</span>
+          <span class="modal-title" id="modalModelName">Model</span>
+        </div>
+        <div style="margin-left: auto; display: flex; align-items: center; gap: 8px; margin-right: 8px;">
+          <button class="btn-card danger" id="modalBlockModelBtn" title="Zablokuj modelkę: usuń ten profil z katalogu programu i ukryj wszystkie jej nagrania">
+            <i class="fa-solid fa-ban"></i> Blokuj profil
+          </button>
+          <a class="btn-card" id="modalPopoutBtn" href="#" target="_blank" title="Otwórz w nowej karcie / oknie">
+            <i class="fa-solid fa-arrow-up-right-from-square"></i> Nowe okno
+          </a>
+          <button class="modal-close-btn" id="modalCloseBtn" title="Zamknij"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+      </div>
+
+      <div class="modal-player-wrapper" id="modalPlayerWrapper">
+        <!-- Grafika podglądowa podczas ładowania filmu -->
+        <img id="modalLoadingPoster" class="modal-loading-poster" alt="Podgląd wideo" style="display:none;">
+
+        <div class="video-loader" id="videoLoader">
+          <div class="video-loader-badge">
+            <div class="spinner"></div>
+            <span>Ładowanie wideo...</span>
+          </div>
+        </div>
+        
+        <!-- Główny odtwarzacz wideo -->
+        <video id="modalVideo" class="modal-player-video" playsinline preload="auto"></video>
+
+        <!-- Przycisk Play na środku przy pauzie -->
+        <div class="center-play-overlay" id="modalCenterPlay">
+          <div class="center-play-btn"><i class="fa-solid fa-play"></i></div>
+        </div>
+
+        <!-- Pływające strzałki nawigacji: Poprzedni / Następny film -->
+        <button class="modal-nav-arrow prev" id="modalNavPrevArrow" title="Poprzedni film na liście (←)">
+          <i class="fa-solid fa-chevron-left"></i>
+        </button>
+        <button class="modal-nav-arrow next" id="modalNavNextArrow" title="Następny film na liście (→)">
+          <i class="fa-solid fa-chevron-right"></i>
+        </button>
+
+        <!-- Własny pasek kontroli z podglądem klatki na osi czasu -->
+        <div class="custom-controls-bar" id="modalControlsBar">
+          <!-- OŚ CZASU (TIMELINE) -->
+          <div class="timeline-container" id="modalTimelineContainer">
+            <!-- Pływający podgląd klatki wideo na osi czasu -->
+            <div class="timeline-preview-tooltip" id="modalTimelineTooltip">
+              <div class="preview-video-box" id="modalTimelinePreviewBox">
+                <img id="modalTimelinePreviewImg" class="preview-thumb-img" alt="Podgląd">
+                <div id="modalTimelineSprite" class="timeline-sprite-frame"></div>
+                <div id="modalTimelinePreviewStatus" class="timeline-preview-status">Przygotowywanie podglądu…</div>
+                <video id="modalTimelinePreviewVideo" muted playsinline preload="metadata"></video>
+              </div>
+              <div class="preview-time-text" id="modalTimelineTimeText">00:00</div>
+            </div>
+
+            <div class="timeline-track">
+              <div class="timeline-buffer" id="modalTimelineBuffer"></div>
+              <div class="timeline-progress" id="modalTimelineProgress"></div>
+              <div class="timeline-thumb" id="modalTimelineThumb"></div>
+            </div>
+          </div>
+
+          <!-- PRZYCISKI ODTWARZACZA -->
+          <div class="controls-row">
+            <div class="controls-left">
+              <button class="ctrl-btn" id="modalCtrlPrevVideoBtn" title="Poprzedni film na liście (←)"><i class="fa-solid fa-backward-step"></i></button>
+              <button class="ctrl-btn" id="modalCtrlPlayBtn" title="Odtwórz / Pauza (Spacja)"><i class="fa-solid fa-play"></i></button>
+              <button class="ctrl-btn" id="modalCtrlNextVideoBtn" title="Następny film na liście (→)"><i class="fa-solid fa-forward-step"></i></button>
+              <button class="ctrl-btn" id="modalCtrlPrevAuthorBtn" title="Poprzedni film tego autora (Strzałka w górę ↑)"><i class="fa-solid fa-user-minus"></i></button>
+              <button class="ctrl-btn" id="modalCtrlNextAuthorBtn" title="Następny film tego autora (Strzałka w dół ↓)"><i class="fa-solid fa-user-plus"></i></button>
+              <button class="ctrl-btn" id="modalCtrlRewindBtn" title="Cofnij 10s (Shift + ←)"><i class="fa-solid fa-rotate-left"></i></button>
+              <button class="ctrl-btn" id="modalCtrlForwardBtn" title="Do przodu 10s (Shift + →)"><i class="fa-solid fa-rotate-right"></i></button>
+              
+              <!-- Głośność -->
+              <div class="volume-box">
+                <button class="ctrl-btn" id="modalCtrlVolumeBtn" title="Wycisz (M)"><i class="fa-solid fa-volume-high"></i></button>
+                <input type="range" class="volume-slider" id="modalCtrlVolumeSlider" min="0" max="1" step="0.05" value="1">
+              </div>
+
+              <span class="time-display" id="modalCtrlTimeDisplay">00:00 / 00:00</span>
+            </div>
+
+            <div class="controls-right">
+              <button class="ctrl-btn speed-btn" id="modalCtrlSpeedBtn" title="Prędkość odtwarzania">1x</button>
+              <button class="ctrl-btn" id="modalCtrlPipBtn" title="Obraz w obrazie"><i class="fa-solid fa-clone"></i></button>
+              <button class="ctrl-btn" id="modalCtrlFullscreenBtn" title="Pełny ekran (F)"><i class="fa-solid fa-expand"></i></button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Opcjonalny iframe zapasowy -->
+        <iframe id="modalIframe" class="modal-player-iframe" src="" allowfullscreen="true" scrolling="no" style="display:none;"></iframe>
+      </div>
+
+      <div class="modal-body">
+        <div class="modal-actions">
+          <button class="btn-card fav-btn" id="modalFavBtn">
+            <i class="fa-regular fa-heart"></i> Dodaj do ulubionych
+          </button>
+          <button class="btn-card primary" id="modalViewModelVideosBtn">
+            <i class="fa-solid fa-video"></i> Więcej filmów tej modelki
+          </button>
+          <a class="btn-card" id="modalDownloadBtn" href="#" target="_blank" download>
+            <i class="fa-solid fa-download"></i> Pobierz plik MP4
+          </a>
+          <button class="btn-card" id="modalTogglePlayerBtn">
+            <i class="fa-solid fa-arrows-rotate"></i> Tryb awaryjny (Iframe)
+          </button>
+          <a class="btn-card" id="modalOriginalBtn" href="#" target="_blank">
+            <i class="fa-solid fa-arrow-up-right-from-square"></i> Strona Archivebate
+          </a>
+        </div>
+
+        <div class="modal-keywords-box" id="modalKeywords"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST NOTIFICATIONS -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="/static/api-client.js?v=1"></script>
+  <script src="/static/performance.js?v=1"></script>
+  <script src="/static/storyboard-cache.js?v=2.1"></script>
+  <script src="/static/player-core.js?v=2.2"></script>
+  <script src="/static/youtube-storyboard.js?v=3.0"></script>
+  <script src="/static/app-context.js?v=1.0"></script>
+  <script src="/static/toast.js?v=1.0"></script>
+  <script src="/static/filters.js?v=1.0"></script>
+  <script src="/static/profile-scanner.js?v=1.0"></script>
+  <script src="/static/search-autocomplete.js?v=1.0"></script>
+  <script src="/static/checkpoints.js?v=1.0"></script>
+  <script src="/static/account.js?v=1.0"></script>
+  <script src="/static/blocked-models.js?v=1.0"></script>
+  <script src="/static/pagination.js?v=1.0"></script>
+  <script src="/static/favorites.js?v=1.0"></script>
+  <script src="/static/tags.js?v=1.0"></script>
+  <script src="/static/home-stats.js?v=1.0"></script>
+  <script src="/static/video-prefetch.js?v=1.0"></script>
+  <script src="/static/video-card.js?v=1.0"></script>
+  <script src="/static/video-grid.js?v=1.0"></script>
+  <script src="/static/video-views.js?v=1.0"></script>
+  <script src="/static/search-results.js?v=1.0"></script>
+  <script src="/static/video-modal.js?v=1.0"></script>
+  <script src="/static/modal-player-controls.js?v=1.0"></script>
+  <script src="/static/app-events.js?v=1.0"></script>
+  <script src="/static/app.js?v=35.0"></script>
+</body>
+</html>

@@ -1,0 +1,60 @@
+{
+  "note": "Observed behavior of the audited version; timings are local synthetic measurements.",
+  "results": {
+    "partial_fresh_cache": {
+      "cached_items": 24,
+      "blocking_fetches": 1,
+      "reported_state": "network"
+    },
+    "full_fresh_cache_after_grouping": {
+      "blocking_topups": 1,
+      "reported_state": "fresh"
+    },
+    "dedup_identity": {
+      "same_author_date_distinct_ids_remaining": 1,
+      "same_author_duration_distinct_ids_remaining": 1
+    },
+    "dedup_synthetic_timing": [
+      {
+        "items": 280,
+        "pair_comparisons": 39060,
+        "milliseconds": [
+          125.32,
+          110.19,
+          107.25
+        ]
+      },
+      {
+        "items": 1000,
+        "pair_comparisons": 499500,
+        "milliseconds": [
+          1417.3,
+          1349.71,
+          1386.24
+        ]
+      }
+    ],
+    "pagination_fixed_source_offsets": {
+      "first_batch_items": 720,
+      "first_displayed_items": 280,
+      "first_batch_remainder_absent_from_next_batch": 440
+    },
+    "range_206_current_dependencies": {
+      "status": 206,
+      "content_encoding": null,
+      "content_range": "bytes 0-4095/8192",
+      "bytes": 4096
+    },
+    "range_416_forwarding": {
+      "status": 502,
+      "content_range": null
+    },
+    "thumbnail_failure": {
+      "status": 200,
+      "type": "image/gif",
+      "bytes": 43
+    },
+    "static_cache": "no-cache, no-store, must-revalidate",
+    "ready_storyboard_details_resolution_calls": 1
+  }
+}

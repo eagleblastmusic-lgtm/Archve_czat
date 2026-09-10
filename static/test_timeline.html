@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Test Timeline Preview</title>
+  <style>
+    body { background: #111; color: #fff; font-family: sans-serif; padding: 20px; }
+    .player-wrap { position: relative; width: 640px; }
+    .progress-bar-wrap {
+      position: relative; width: 100%; height: 20px; background: #333; cursor: pointer; margin-top: 10px;
+    }
+    .progress-filled { height: 100%; width: 0%; background: #ffa31a; }
+    .tooltip {
+      position: absolute; bottom: 25px; transform: translateX(-50%);
+      background: #222; border: 1px solid #ffa31a; border-radius: 6px; padding: 4px;
+      display: none; flex-direction: column; align-items: center;
+    }
+    .thumb-wrap { width: 160px; height: 90px; background: #000; }
+    .thumb-wrap video { width: 100%; height: 100%; object-fit: contain; }
+  </style>
+</head>
+<body>
+  <div class="player-wrap">
+    <video id="mainVid" width="640" controls src="/api/video/stream?url=https%3A//cdn.freefile.io/thumbnails/2026/09/02/1b45f108-a36d-44ea-832e-d66e049bc5a3.mp4"></video>
+    
+    <div class="progress-bar-wrap" id="progressWrap">
+      <div class="progress-filled" id="progressFilled"></div>
+      
+      <div class="tooltip" id="tooltip">
+        <div class="thumb-wrap">
+          <video id="previewVid" muted playsinline preload="auto" src="/api/video/stream?url=https%3A//cdn.freefile.io/thumbnails/2026/09/02/1b45f108-a36d-44ea-832e-d66e049bc5a3.mp4"></video>
+        </div>
+        <div id="tooltipTime" style="font-size: 11px; margin-top: 2px;">00:00</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const mainVid = document.getElementById('mainVid');
+    const previewVid = document.getElementById('previewVid');
+    const progressWrap = document.getElementById('progressWrap');
+    const progressFilled = document.getElementById('progressFilled');
+    const tooltip = document.getElementById('tooltip');
+    const tooltipTime = document.getElementById('tooltipTime');
+
+    mainVid.addEventListener('timeupdate', () => {
+      if (mainVid.duration) {
+        progressFilled.style.width = (mainVid.currentTime / mainVid.duration * 100) + '%';
+      }
+    });
+
+    let seekTimeout = null;
+    progressWrap.addEventListener('mousemove', (e) => {
+      const rect = progressWrap.getBoundingClientRect();
+      const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      tooltip.style.left = (pos * 100) + '%';
+      tooltip.style.display = 'flex';
+
+      const duration = mainVid.duration || 60;
+      const targetTime = pos * duration;
+
+      const mins = Math.floor(targetTime / 60);
+      const secs = Math.floor(targetTime % 60);
+      tooltipTime.innerText = `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+
+      if (!seekTimeout) {
+        seekTimeout = setTimeout(() => {
+          previewVid.currentTime = targetTime;
+          seekTimeout = null;
+        }, 50);
+      }
+    });
+
+    progressWrap.addEventListener('mouseleave', () => {
+      tooltip.style.display = 'none';
+    });
+
+    progressWrap.addEventListener('click', (e) => {
+      const rect = progressWrap.getBoundingClientRect();
+      const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      if (mainVid.duration) {
+        mainVid.currentTime = pos * mainVid.duration;
+      }
+    });
+  </script>
+</body>
+</html>

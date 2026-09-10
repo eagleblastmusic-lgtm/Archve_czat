@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="referrer" content="no-referrer">
+  <title>Test Images</title>
+</head>
+<body style="background: #111; color: #fff; font-family: sans-serif; padding: 20px;">
+  <h2>Test Direct vs Proxy Image</h2>
+  
+  <div style="display: flex; gap: 20px;">
+    <div>
+      <h3>1. Direct URL</h3>
+      <img src="https://cdn.freefile.io/thumbnails/2026/09/02/1b45f108-a36d-44ea-832e-d66e049bc5a3.jpg" width="300" style="border: 2px solid green;">
+    </div>
+    
+    <div>
+      <h3>2. Proxy URL</h3>
+      <img src="/api/thumb?url=https%3A//cdn.freefile.io/thumbnails/2026/09/02/1b45f108-a36d-44ea-832e-d66e049bc5a3.jpg" width="300" style="border: 2px solid blue;">
+    </div>
+
+    <div>
+      <h3>3. Video Hover Preview</h3>
+      <div id="videoWrap" style="position: relative; width: 300px; height: 169px; background: #222; cursor: pointer;">
+        <img id="testImg" src="/api/thumb?url=https%3A//cdn.freefile.io/thumbnails/2026/09/02/1b45f108-a36d-44ea-832e-d66e049bc5a3.jpg" style="width: 100%; height: 100%; object-fit: cover;">
+        <video id="testVid" src="/api/video/stream?url=https%3A//cdn.freefile.io/thumbnails/2026/09/02/1b45f108-a36d-44ea-832e-d66e049bc5a3.mp4" muted loop playsinline style="display: none; position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;"></video>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const wrap = document.getElementById('videoWrap');
+    const vid = document.getElementById('testVid');
+    const img = document.getElementById('testImg');
+
+    wrap.addEventListener('mouseenter', () => {
+      vid.style.display = 'block';
+      vid.play().catch(e => console.error(e));
+    });
+    wrap.addEventListener('mouseleave', () => {
+      vid.pause();
+      vid.currentTime = 0;
+      vid.style.display = 'none';
+    });
+  </script>
+</body>
+</html>

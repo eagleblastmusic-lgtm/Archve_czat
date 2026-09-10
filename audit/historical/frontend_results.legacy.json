@@ -1,0 +1,14 @@
+{
+  "render_race": {
+    "new_items": 1,
+    "obsolete_items_appended": 32
+  },
+  "prefetch_body_completion": {
+    "fetches": 12,
+    "bodies_awaited": 0
+  },
+  "json_timeout_after_headers": {
+    "timer_cleared": true,
+    "body_still_pending": true
+  }
+}
