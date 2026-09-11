@@ -17,7 +17,10 @@ from scraper import parse_date_to_sort_seconds
 
 PAGE_SIZE = 280
 DEFAULT_CATALOG_DB = DATA_DIR / "catalog.db"
-MAX_PAGES_PER_SOURCE = {"archivebate": 1000, "camwhores": 500}
+# Emergency safety ceilings only. Normal completion is determined by a verified empty page,
+# not by reaching an arbitrary catalog-size limit. These values are intentionally far above
+# the old 1000/500 caps so large source catalogs can be indexed to their real end.
+MAX_PAGES_PER_SOURCE = {"archivebate": 1_000_000, "camwhores": 100_000}
 
 
 def canonical_identity_key(video: Dict[str, Any]) -> str:
@@ -641,52 +644,129 @@ class CatalogService:
                 imported_total = len(all_items)
             return imported_total
 
+    @staticmethod
+    def _is_recoverable_page_limit_error(error_value: Any) -> bool:
+        """Recognize revisions failed only because the pre-resume 1000-page cap was hit."""
+        if not error_value:
+            return False
+        decoded = error_value
+        if isinstance(error_value, str):
+            try:
+                decoded = json.loads(error_value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return error_value.startswith("page_limit_exceeded:")
+        if isinstance(decoded, dict) and decoded:
+            return all(str(value).startswith("page_limit_exceeded:") for value in decoded.values())
+        return False
+
+    def get_resumable_revision(self) -> Optional[int]:
+        """Return the newest durable unfinished revision that can safely continue after restart.
+
+        A revision created only by raw-cache import has no source_runs and is therefore not treated
+        as resumable; the normal bootstrap path can seed a fresh revision from those cache files.
+        Legacy revisions failed solely by the old 1000-page guard are explicitly recoverable.
+        """
+        with self._lock:
+            conn = self._get_conn()
+            rows = conn.execute(
+                """
+                SELECT r.revision, r.failed, r.error
+                FROM revisions r
+                WHERE r.complete = 0
+                  AND EXISTS (SELECT 1 FROM source_runs s WHERE s.revision = r.revision)
+                ORDER BY r.revision DESC
+                """
+            ).fetchall()
+            for row in rows:
+                if not bool(row["failed"]) or self._is_recoverable_page_limit_error(row["error"]):
+                    return int(row["revision"])
+        return None
+
     def build_revision_background(
         self,
         fetchers: Dict[str, Callable[[int], List[Dict[str, Any]]]],
         force: bool = False,
         enrich_fn: Optional[Callable] = None,
     ) -> int:
-        """Starts background indexing of a new revision, yielding to active playback."""
+        """Start or resume durable background indexing, yielding to active playback.
+
+        Non-forced startup first resumes the newest unfinished revision from source_runs. This makes
+        cursor progress durable across process/PC restarts instead of depending on the six-hour raw
+        cache window. A completed active revision is reused only when there is nothing to resume.
+        """
         with self._lock:
             if self._indexing_thread and self._indexing_thread.is_alive():
                 return self._indexing_progress.get("revision", 0)
 
             active = self.get_active_revision()
-            if not force and active is not None and self.is_revision_complete(active):
+            resumable = None if force else self.get_resumable_revision()
+            if resumable is None and not force and active is not None and self.is_revision_complete(active):
                 return active
 
-            next_rev = self.get_latest_revision_number() + 1
             now = time.time()
             conn = self._get_conn()
-            conn.execute(
-                "INSERT OR REPLACE INTO revisions(revision, created_at, updated_at, complete, failed, video_count, error) VALUES(?, ?, ?, 0, 0, 0, NULL)",
-                (next_rev, now, now),
-            )
-            for src in fetchers:
-                conn.execute(
-                    "INSERT OR REPLACE INTO source_runs(revision, source, cursor, pages_scanned, items_found, complete, failed, error, updated_at) VALUES(?, ?, 1, 0, 0, 0, 0, NULL, ?)",
-                    (next_rev, src, now),
-                )
+            resumed = resumable is not None
 
-            # Przy pierwszym uruchomieniu wykorzystaj świeże, surowe strony,
-            # które już są na dysku. Nowa rewizja pozostaje nieopublikowana,
-            # więc stare dane są bezpieczne, a worker zaczyna od pierwszej
-            # nieznanej strony zamiast pobierać cały katalog od zera.
-            if not force:
-                for src in fetchers:
-                    seeded, next_cursor, pages_scanned, source_complete = self._read_cached_source_pages(src)
-                    if seeded:
-                        self.import_items(seeded, revision=next_rev, complete=False, source=src)
+            if resumed:
+                next_rev = int(resumable)
+                rev_row = conn.execute(
+                    "SELECT failed, error FROM revisions WHERE revision = ?",
+                    (next_rev,),
+                ).fetchone()
+                if rev_row and bool(rev_row["failed"]):
+                    if not self._is_recoverable_page_limit_error(rev_row["error"]):
+                        raise RuntimeError(f"Revision {next_rev} is failed and not resumable")
                     conn.execute(
-                        "UPDATE source_runs SET cursor = ?, pages_scanned = ?, items_found = ?, complete = ?, updated_at = ? WHERE revision = ? AND source = ?",
-                        (next_cursor, pages_scanned, len(seeded), int(source_complete), time.time(), next_rev, src),
+                        "UPDATE revisions SET failed = 0, error = NULL, updated_at = ? WHERE revision = ?",
+                        (now, next_rev),
                     )
+
+                # Retry any source that was interrupted mid-page. Completed sources stay completed.
+                conn.execute(
+                    "UPDATE source_runs SET failed = 0, error = NULL, updated_at = ? "
+                    "WHERE revision = ? AND complete = 0",
+                    (now, next_rev),
+                )
+                for src in fetchers:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO source_runs("
+                        "revision, source, cursor, pages_scanned, items_found, complete, failed, error, updated_at"
+                        ") VALUES(?, ?, 1, 0, 0, 0, 0, NULL, ?)",
+                        (next_rev, src, now),
+                    )
+            else:
+                next_rev = self.get_latest_revision_number() + 1
+                conn.execute(
+                    "INSERT OR REPLACE INTO revisions(revision, created_at, updated_at, complete, failed, video_count, error) "
+                    "VALUES(?, ?, ?, 0, 0, 0, NULL)",
+                    (next_rev, now, now),
+                )
+                for src in fetchers:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO source_runs("
+                        "revision, source, cursor, pages_scanned, items_found, complete, failed, error, updated_at"
+                        ") VALUES(?, ?, 1, 0, 0, 0, 0, NULL, ?)",
+                        (next_rev, src, now),
+                    )
+
+                # On a genuinely new revision only, seed contiguous fresh raw pages so the initial
+                # bootstrap can skip network work already persisted on disk.
+                if not force:
+                    for src in fetchers:
+                        seeded, next_cursor, pages_scanned, source_complete = self._read_cached_source_pages(src)
+                        if seeded:
+                            self.import_items(seeded, revision=next_rev, complete=False, source=src)
+                        conn.execute(
+                            "UPDATE source_runs SET cursor = ?, pages_scanned = ?, items_found = ?, complete = ?, updated_at = ? "
+                            "WHERE revision = ? AND source = ?",
+                            (next_cursor, pages_scanned, len(seeded), int(source_complete), time.time(), next_rev, src),
+                        )
 
             self._indexing_stop.clear()
             self._indexing_progress = {
                 "is_indexing": True,
                 "revision": next_rev,
+                "resumed": resumed,
                 "source_progress": {s: {"cursor": 1, "items": 0, "complete": False} for s in fetchers},
                 "error": None,
             }
@@ -711,7 +791,11 @@ class CatalogService:
                         self._indexing_progress["is_indexing"] = False
                         self._indexing_progress["error"] = str(exc)
 
-            self._indexing_thread = threading.Thread(target=worker, name=f"catalog-indexer-rev{next_rev}", daemon=True)
+            self._indexing_thread = threading.Thread(
+                target=worker,
+                name=f"catalog-indexer-rev{next_rev}",
+                daemon=True,
+            )
             self._indexing_thread.start()
             return next_rev
 
@@ -755,8 +839,8 @@ class CatalogService:
 
             for source in active_sources:
                 page = cursors[source]
-                if page > max_pages.get(source, 1000):
-                    error = f"page_limit_exceeded:{max_pages.get(source, 1000)}"
+                if page > max_pages.get(source, 1_000_000):
+                    error = f"page_safety_limit_exceeded:{max_pages.get(source, 1_000_000)}"
                     errors[source] = error
                     with self._lock:
                         conn = self._get_conn()
@@ -847,7 +931,7 @@ class CatalogService:
         page = 1
         collected: List[Dict[str, Any]] = []
         pages_scanned = 0
-        while page <= 1000:
+        while page <= MAX_PAGES_PER_SOURCE.get(source, 1_000_000):
             path = cache_dir / f"raw_v1_{source}_{page}.json"
             data, _ = read_json_cache(str(path))
             if not isinstance(data, dict) or not isinstance(data.get("items"), list):

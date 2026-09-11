@@ -727,8 +727,10 @@ def _catalog_indexing_is_running(service) -> bool:
 
 
 def _ensure_catalog_indexing(service) -> None:
-    """Schedule indexing and tie retry state to the actual inner worker outcome."""
-    if _published_catalog_revision(service) is not None:
+    """Schedule indexing and resume a durable unfinished revision when one exists."""
+    published = _published_catalog_revision(service)
+    resumable = service.get_resumable_revision() if hasattr(service, "get_resumable_revision") else None
+    if published is not None and resumable is None:
         return
     service_key = id(service)
     with _catalog_bootstrap_lock:
@@ -744,11 +746,10 @@ def _ensure_catalog_indexing(service) -> None:
         revision = None
         try:
             service.import_cached_raw_pages()
-            if _published_catalog_revision(service) is None:
-                revision = service.build_revision_background(_catalog_fetchers(), force=False)
-                inner = getattr(service, "_indexing_thread", None)
-                if inner and inner is not threading.current_thread():
-                    inner.join()
+            revision = service.build_revision_background(_catalog_fetchers(), force=False)
+            inner = getattr(service, "_indexing_thread", None)
+            if inner and inner is not threading.current_thread():
+                inner.join()
             stats = service.get_revision_stats(revision) if revision else {}
             with _catalog_bootstrap_lock:
                 if stats.get("complete") and not stats.get("failed"):
