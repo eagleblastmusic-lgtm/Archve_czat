@@ -23,6 +23,7 @@ DEFAULT_CATALOG_DB = DATA_DIR / "catalog.db"
 MAX_PAGES_PER_SOURCE = {"archivebate": 1_000_000, "camwhores": 100_000}
 CAMWHORES_EMPTY_END_THRESHOLD = 5
 ARCHIVEBATE_EMPTY_END_THRESHOLD = 5
+TRANSIENT_SOURCE_RETRY_DELAYS = (2.0, 8.0)
 
 
 def canonical_identity_key(video: Dict[str, Any]) -> str:
@@ -866,6 +867,46 @@ class CatalogService:
             return all(recoverable(value) for value in decoded.values())
         return recoverable(decoded)
 
+    @classmethod
+    def _is_recoverable_source_error(cls, error_value: Any) -> bool:
+        """Return True for durable source failures that are safe to retry from the same cursor."""
+        if cls._is_recoverable_page_limit_error(error_value):
+            return True
+        if not error_value:
+            return False
+        decoded = error_value
+        if isinstance(error_value, str):
+            try:
+                decoded = json.loads(error_value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = error_value
+
+        def recoverable(value: Any) -> bool:
+            text = str(value or "").lower()
+            transient_fragments = (
+                "source did not return a successful response",
+                "read timed out",
+                "readtimeout",
+                "connecttimeout",
+                "connectionerror",
+                "max retries exceeded",
+                "remotedisconnected",
+                "connection reset",
+                "temporarily unavailable",
+                "too many requests",
+            )
+            if any(fragment in text for fragment in transient_fragments):
+                return True
+            if re.search(r"\b429\b", text):
+                return True
+            return bool(re.search(r"\b5\d\d\b", text)) and any(
+                token in text for token in ("http", "server", "response", "status")
+            )
+
+        if isinstance(decoded, dict) and decoded:
+            return all(recoverable(value) for value in decoded.values())
+        return recoverable(decoded)
+
     def _reopen_legacy_archivebate_cap_revision(self) -> Optional[int]:
         """Reopen the active revision falsely completed by the old scraper page-1000 guard.
 
@@ -1000,7 +1041,7 @@ class CatalogService:
                 (completed_floor,),
             ).fetchall()
             for row in rows:
-                if not bool(row["failed"]) or self._is_recoverable_page_limit_error(row["error"]):
+                if not bool(row["failed"]) or self._is_recoverable_source_error(row["error"]):
                     return int(row["revision"])
         return None
 
@@ -1040,7 +1081,7 @@ class CatalogService:
                     (next_rev,),
                 ).fetchone()
                 if rev_row and bool(rev_row["failed"]):
-                    if not self._is_recoverable_page_limit_error(rev_row["error"]):
+                    if not self._is_recoverable_source_error(rev_row["error"]):
                         raise RuntimeError(f"Revision {next_rev} is failed and not resumable")
                     conn.execute(
                         "UPDATE revisions SET failed = 0, error = NULL, updated_at = ? WHERE revision = ?",
@@ -1148,6 +1189,7 @@ class CatalogService:
         last_signatures: Dict[str, Optional[str]] = {s: None for s in sources}
         repeated_signatures: Dict[str, int] = {s: 0 for s in sources}
         consecutive_empty_pages: Dict[str, int] = {s: 0 for s in sources}
+        transient_retry_counts: Dict[str, int] = {s: 0 for s in sources}
 
         # Safety bound protects resources, but reaching it is truncation, not a verified source end.
         max_pages = MAX_PAGES_PER_SOURCE
@@ -1243,15 +1285,46 @@ class CatalogService:
                             }
                         continue
 
-                    # Other errors remain real source failures and must not be confused with EOF.
-                    errors[source] = str(fetch_error)
+                    error_text = str(fetch_error)
+                    if self._is_recoverable_source_error(error_text):
+                        retry_count = transient_retry_counts[source]
+                        if retry_count < len(TRANSIENT_SOURCE_RETRY_DELAYS):
+                            delay = float(TRANSIENT_SOURCE_RETRY_DELAYS[retry_count])
+                            transient_retry_counts[source] = retry_count + 1
+                            with self._lock:
+                                conn = self._get_conn()
+                                conn.execute(
+                                    "UPDATE source_runs SET failed = 0, complete = 0, error = ?, "
+                                    "end_reason = 'transient_retry_pending', updated_at = ? "
+                                    "WHERE revision = ? AND source = ?",
+                                    (error_text, time.time(), revision, source),
+                                )
+                                self._indexing_progress["source_progress"][source] = {
+                                    "cursor": page,
+                                    "items": source_counts[source],
+                                    "complete": False,
+                                    "retrying": True,
+                                    "retry_count": transient_retry_counts[source],
+                                    "retry_delay": delay,
+                                    "error": error_text,
+                                }
+                            if self._indexing_stop.wait(delay):
+                                break
+                            continue
+
+                    # Non-transient errors, or transient errors exhausted in this process, are
+                    # persisted as failed. Recoverable transient failures can still resume from
+                    # the same durable cursor on the next application start.
+                    errors[source] = error_text
                     with self._lock:
                         conn = self._get_conn()
                         conn.execute(
                             "UPDATE source_runs SET failed = 1, complete = 0, error = ?, updated_at = ? WHERE revision = ? AND source = ?",
-                            (str(fetch_error), time.time(), revision, source),
+                            (error_text, time.time(), revision, source),
                         )
                     continue
+
+                transient_retry_counts[source] = 0
 
                 if not batch:
                     # Archivebate page 1001 is a known upstream visibility boundary. It is probed
@@ -1390,7 +1463,8 @@ class CatalogService:
                     }
                     conn = self._get_conn()
                     conn.execute(
-                        "UPDATE source_runs SET cursor = ?, pages_scanned = pages_scanned + 1, items_found = items_found + ?, updated_at = ? WHERE revision = ? AND source = ?",
+                        "UPDATE source_runs SET cursor = ?, pages_scanned = pages_scanned + 1, items_found = items_found + ?, "
+                        "failed = 0, error = NULL, end_reason = NULL, updated_at = ? WHERE revision = ? AND source = ?",
                         (cursors[source], len(batch), time.time(), revision, source),
                     )
 
