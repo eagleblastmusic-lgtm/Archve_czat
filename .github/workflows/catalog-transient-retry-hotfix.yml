@@ -31,6 +31,17 @@ jobs:
           pip install -r requirements.txt
       - name: Apply guarded fix
         run: python tools/apply_transient_catalog_retry_fix.py
+      - name: Fix generated regression import path
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('audit/regression_catalog_transient_resume.py')
+          text = p.read_text(encoding='utf-8')
+          marker = 'import json\nimport tempfile\nfrom pathlib import Path\n\nfrom catalog_service import CatalogService\n'
+          replacement = 'import json\nimport sys\nimport tempfile\nfrom pathlib import Path\n\nsys.path.insert(0, str(Path(__file__).resolve().parents[1]))\n\nfrom catalog_service import CatalogService\n'
+          assert text.count(marker) == 1
+          p.write_text(text.replace(marker, replacement, 1), encoding='utf-8')
+          PY
       - name: Compile Python
         run: python -m compileall -q .
       - name: Transient resume regression
