@@ -1,6 +1,9 @@
 """Regression for durable Archivebate model discovery + deep-profile merge."""
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from catalog_service import CatalogService
 from deep_archivebate import DeepArchivebateService
