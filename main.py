@@ -121,10 +121,22 @@ async def lifespan(app: FastAPI):
                 _ensure_catalog_indexing(catalog_service)
             except Exception as exc:
                 print(f"[Catalog] Błąd bootstrapu indeksu: {exc}")
+            # Deep Archivebate runs independently from the shallow home-feed index.
+            # It discovers profiles and walks their historical pages with durable checkpoints.
+            try:
+                from deep_archivebate import deep_archivebate_service
+                deep_archivebate_service.start(scraper)
+            except Exception as exc:
+                print(f"[Deep Archivebate] Błąd startu: {exc}")
         except Exception as e:
             print(f"[Archivebate Browser] Błąd inicjalizacji: {e}")
     threading.Thread(target=background_startup, daemon=True).start()
     yield
+    try:
+        from deep_archivebate import deep_archivebate_service
+        deep_archivebate_service.stop(wait=False)
+    except Exception:
+        pass
     print("[Archivebate Browser] Zamykanie aplikacji.")
 
 app = FastAPI(title="Archivebate Video Browser", lifespan=lifespan)
@@ -488,6 +500,26 @@ def get_thumbnail_proxy(url: str = Query(...)):
             return Response(status_code=502,headers={"Cache-Control":"no-store"})
         finally:
             if res is not None: res.close()
+
+@app.get("/api/deep-archivebate/status")
+def get_deep_archivebate_status():
+    from deep_archivebate import deep_archivebate_service
+    return deep_archivebate_service.status()
+
+
+@app.post("/api/deep-archivebate/start")
+def start_deep_archivebate():
+    from deep_archivebate import deep_archivebate_service
+    started = deep_archivebate_service.start(scraper)
+    return {"started": started, **deep_archivebate_service.status()}
+
+
+@app.post("/api/deep-archivebate/stop")
+def stop_deep_archivebate():
+    from deep_archivebate import deep_archivebate_service
+    deep_archivebate_service.stop(wait=False)
+    return {"stopped": True, **deep_archivebate_service.status()}
+
 
 @app.get("/api/status")
 async def get_status():
