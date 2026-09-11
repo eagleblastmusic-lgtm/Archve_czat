@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - tools/apply_sparse_boundary_followup.py
+      - tools/update_sparse_resume_regression.py
       - .github/workflows/sparse-boundary-followup.yml
 
 permissions:
@@ -28,6 +29,8 @@ jobs:
           pip install -r requirements.txt
       - name: Apply guarded follow-up
         run: python tools/apply_sparse_boundary_followup.py
+      - name: Align durable resume regression
+        run: python tools/update_sparse_resume_regression.py
       - name: Compile Python
         run: python -m compileall -q .
       - name: Latest-only migration scope regression
@@ -54,7 +57,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add catalog_service.py audit/regression_archivebate_sparse_pagination.py audit/regression_latest_sparse_migration_scope.py
+          git add catalog_service.py audit/regression_archivebate_sparse_pagination.py audit/regression_latest_sparse_migration_scope.py audit/regression_catalog_resume.py
           git diff --cached --quiet && exit 0
           git commit -m "fix: make sparse pagination migration latest-only"
           git push origin HEAD:master
