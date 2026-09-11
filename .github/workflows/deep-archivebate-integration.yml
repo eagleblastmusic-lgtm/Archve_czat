@@ -4,6 +4,8 @@ on:
   push:
     branches: [master]
     paths:
+      - deep_archivebate.py
+      - audit/regression_deep_archivebate.py
       - tools/apply_deep_archivebate_integration.py
       - .github/workflows/deep-archivebate-integration.yml
 
