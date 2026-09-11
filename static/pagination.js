@@ -26,7 +26,11 @@
     const parsed = Number.parseInt(newPage, 10);
     if (!Number.isFinite(parsed)) return;
     const target = Math.min(maxP, Math.max(1, parsed));
-    state.currentPage = target;
+
+    // Nie zatwierdzaj currentPage przed uruchomieniem loadera. Loader musi
+    // zobaczyć poprzednią stronę, aby odróżnić prawdziwą nawigację od
+    // odświeżenia tej samej strony i poprawnie wymienić siatkę zamiast
+    // dopisywać nową stronę pod istniejącymi kartami.
     if (global.scrollTo) global.scrollTo({ top: 0, behavior: 'smooth' });
 
     if (state.mode === 'home' && typeof loadHomeVideos === 'function') {
