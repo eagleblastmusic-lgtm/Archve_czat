@@ -108,7 +108,6 @@ text = replace_once(
     "query_page read guard",
 )
 
-# Close the reader associated with the current thread as well as the writer.
 text = replace_once(
     text,
     "    def close(self):\n        with self._lock:\n            if self._conn:\n                try:\n                    self._conn.close()\n                except Exception:\n                    pass\n                self._conn = None\n",
@@ -118,13 +117,16 @@ text = replace_once(
 
 path.write_text(text, encoding="utf-8")
 
-# Regression: a file-backed read must stay responsive while another thread owns
-# the application's writer lock. Old code waits for this lock and takes ~2s.
 reg = Path("audit/regression_catalog_read_concurrency.py")
-reg.write_text(r'''import tempfile
+reg.write_text(r'''import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from catalog_service import CatalogService
 
@@ -172,7 +174,6 @@ with tempfile.TemporaryDirectory() as td:
 print("PASS: file-backed catalog reads do not wait behind the indexer writer lock")
 ''', encoding="utf-8")
 
-# Keep the concurrency regression in the normal CI lane.
 ci = Path(".github/workflows/ci.yml")
 ci_text = ci.read_text(encoding="utf-8")
 needle = "      - name: Catalog bootstrap regression\n        run: python audit/regression_catalog_bootstrap.py\n"
