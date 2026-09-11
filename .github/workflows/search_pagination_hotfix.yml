@@ -23,6 +23,18 @@ jobs:
           node-version: '22'
       - name: Apply focused search fix
         run: python tools/apply_search_pagination_fix.py
+      - name: Normalize regression import path
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('audit/regression_search_pagination.py')
+          text = p.read_text(encoding='utf-8')
+          anchor = "from unittest.mock import patch\n\nfrom scraper import ArchivebateScraper\n"
+          replacement = "from pathlib import Path\nimport sys\nfrom unittest.mock import patch\n\nROOT = Path(__file__).resolve().parents[1]\nsys.path.insert(0, str(ROOT))\n\nfrom scraper import ArchivebateScraper\n"
+          if anchor not in text:
+              raise SystemExit('regression import anchor missing')
+          p.write_text(text.replace(anchor, replacement, 1), encoding='utf-8')
+          PY
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
