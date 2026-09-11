@@ -49,9 +49,12 @@ with tempfile.TemporaryDirectory() as tmp:
     assert restarted._indexing_progress.get("resumed") is True
     assert restarted._indexing_progress.get("legacy_cursor_repaired") is True
     wait(restarted)
-    assert calls == [1001], calls
+    assert calls == [1001, 1001, 1001, 1001], calls
     stats = restarted.get_revision_stats(21)
     assert stats["complete"] is True and stats["failed"] is False, stats
+    page = restarted.query_page(revision=21)
+    assert page["catalog_limited"] is True, page
+    assert page["limited_sources"]["archivebate"] == "source_page_limit:empty:1001", page
     restarted.close()
 
 

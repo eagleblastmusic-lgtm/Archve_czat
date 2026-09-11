@@ -126,4 +126,70 @@ home_stats = (Path(__file__).resolve().parents[1] / "static" / "home-stats.js").
 assert "Gotowe do limitu źródła" in home_stats
 assert "data.catalog_limited" in home_stats
 
-print("PASS: Archivebate page-1001 5xx is retried, qualified as a visible source limit, and transient 5xx still recovers")
+
+# The same upstream page-1001 boundary can answer HTTP 200 with no cards. It must be retried,
+# then classified as limited rather than as a clean end of the service's history.
+with tempfile.TemporaryDirectory() as tmp:
+    db = Path(tmp) / "catalog.db"
+    service = catalog.CatalogService(db)
+    service.import_items(
+        [{"id": "seed-empty", "username": "seed", "source": "archivebate"}],
+        revision=7,
+        complete=False,
+        source="archivebate",
+    )
+    with service._lock:
+        conn = service._get_conn()
+        conn.execute(
+            "INSERT INTO source_runs(revision, source, cursor, pages_scanned, items_found, complete, failed, error, end_reason, updated_at) "
+            "VALUES(7, 'archivebate', 1001, 1000, 36000, 0, 0, NULL, NULL, ?)",
+            (time.time(),),
+        )
+    calls = []
+
+    def empty_boundary(page):
+        calls.append(page)
+        assert page == 1001, page
+        return []
+
+    rev = service.build_revision_background({"archivebate": empty_boundary}, force=False)
+    assert rev == 7, rev
+    wait(service)
+    assert calls == [1001, 1001, 1001, 1001], calls
+    result = service.query_page(revision=7)
+    assert result["catalog_complete"] is True, result
+    assert result["catalog_limited"] is True, result
+    assert result["limited_sources"]["archivebate"] == "source_page_limit:empty:1001", result
+    progress = service._indexing_progress["source_progress"]["archivebate"]
+    assert progress["limited"] is True and progress["limit_page"] == 1000, progress
+    service.close()
+
+
+# Existing databases that already stored the exact page-1001 empty-page shape are migrated
+# in place, without re-indexing pages 1..1000.
+with tempfile.TemporaryDirectory() as tmp:
+    db = Path(tmp) / "catalog.db"
+    service = catalog.CatalogService(db)
+    service.import_items(
+        [{"id": "legacy-empty", "username": "legacy", "source": "archivebate"}],
+        revision=21,
+        complete=True,
+        source="archivebate",
+    )
+    with service._lock:
+        conn = service._get_conn()
+        conn.execute(
+            "INSERT INTO source_runs(revision, source, cursor, pages_scanned, items_found, complete, failed, error, end_reason, updated_at) "
+            "VALUES(21, 'archivebate', 1001, 1000, 36000, 1, 0, NULL, 'empty_page', ?)",
+            (time.time(),),
+        )
+    service.close()
+
+    migrated = catalog.CatalogService(db)
+    result = migrated.query_page(revision=21)
+    assert result["catalog_complete"] is True, result
+    assert result["catalog_limited"] is True, result
+    assert result["limited_sources"]["archivebate"] == "source_page_limit:empty:1001", result
+    migrated.close()
+
+print("PASS: Archivebate page-1001 5xx/empty boundary is retried, classified as limited, and legacy empty-page state migrates in place")

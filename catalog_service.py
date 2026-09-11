@@ -242,6 +242,22 @@ class CatalogService:
                 source_columns = {row["name"] for row in conn.execute("PRAGMA table_info(source_runs)")}
                 if "end_reason" not in source_columns:
                     conn.execute("ALTER TABLE source_runs ADD COLUMN end_reason TEXT")
+                # Archivebate has an upstream pagination boundary at page 1001. Depending on the
+                # request, that boundary has been observed as either HTTP 5xx or HTTP 200 with no
+                # video cards. Older builds persisted the latter as a clean EOF. Reclassify only
+                # the exact known 1000-page shape so normal empty-page endings are untouched.
+                conn.execute(
+                    """
+                    UPDATE source_runs
+                    SET end_reason = 'source_page_limit:empty:1001'
+                    WHERE source = 'archivebate'
+                      AND cursor = 1001
+                      AND pages_scanned = 1000
+                      AND complete = 1
+                      AND failed = 0
+                      AND end_reason = 'empty_page'
+                    """
+                )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -462,7 +478,8 @@ class CatalogService:
 
             limited_rows = conn.execute(
                 "SELECT source, end_reason FROM source_runs "
-                "WHERE revision = ? AND end_reason LIKE 'source_http_limit:%'",
+                "WHERE revision = ? AND (end_reason LIKE 'source_http_limit:%' "
+                "OR end_reason LIKE 'source_page_limit:%')",
                 (rev,),
             ).fetchall()
             limited_sources = {
@@ -1033,6 +1050,12 @@ class CatalogService:
                         batch = fetchers[source](page)
                         if not isinstance(batch, list):
                             raise RuntimeError(f"Source {source} returned non-list on page {page}")
+                        # Archivebate's page-1001 boundary is inconsistent: it can be 5xx or a
+                        # successful but empty document. Probe an empty post-1000 page repeatedly
+                        # before classifying it, so one transient empty response cannot stop the crawl.
+                        if source == "archivebate" and page == 1001 and not batch and attempt < 4:
+                            time.sleep(0.35 * attempt)
+                            continue
                         fetch_error = None
                         break
                     except Exception as exc:
@@ -1082,21 +1105,28 @@ class CatalogService:
                     continue
 
                 if not batch:
-                    # Verified clean end of pagination returned by the remote source.
                     ended.add(source)
+                    # Archivebate page 1001 is an upstream visibility boundary, not proof that the
+                    # service has no older videos. Preserve that distinction even when the server
+                    # answers HTTP 200 with an empty page instead of 5xx.
+                    is_archivebate_limit = source == "archivebate" and page == 1001
+                    reason = f"source_page_limit:empty:{page}" if is_archivebate_limit else "empty_page"
                     with self._lock:
                         conn = self._get_conn()
                         conn.execute(
-                            "UPDATE source_runs SET complete = 1, end_reason = 'empty_page', updated_at = ? "
+                            "UPDATE source_runs SET complete = 1, failed = 0, error = NULL, end_reason = ?, updated_at = ? "
                             "WHERE revision = ? AND source = ?",
-                            (time.time(), revision, source),
+                            (reason, time.time(), revision, source),
                         )
-                        self._indexing_progress["source_progress"][source] = {
+                        progress = {
                             "cursor": page,
                             "items": source_counts[source],
                             "complete": True,
-                            "end_reason": "empty_page",
+                            "end_reason": reason,
                         }
+                        if is_archivebate_limit:
+                            progress.update({"limited": True, "limit_page": page - 1})
+                        self._indexing_progress["source_progress"][source] = progress
                     continue
 
                 # Some sites clamp out-of-range page numbers and return the same last page forever.

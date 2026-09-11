@@ -92,8 +92,11 @@ with tempfile.TemporaryDirectory() as tmp:
     assert rev == 9
     wait(restarted)
     stats = restarted.get_revision_stats(9)
-    assert calls == [1001], calls
+    assert calls == [1001, 1001, 1001, 1001], calls
     assert stats["complete"] is True and stats["failed"] is False, stats
+    page = restarted.query_page(revision=9)
+    assert page["catalog_limited"] is True, page
+    assert page["limited_sources"]["archivebate"] == "source_page_limit:empty:1001", page
     restarted.close()
 
 print("PASS: durable catalog resumes persisted cursors beyond page 1000 and recovers the legacy cap")
