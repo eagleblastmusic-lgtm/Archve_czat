@@ -22,29 +22,39 @@
   }
 
   function changePage(newPage) {
-    state.currentPage = newPage;
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    const maxP = Math.max(1, Number(state.lastPage) || 1);
+    const parsed = Number.parseInt(newPage, 10);
+    if (!Number.isFinite(parsed)) return;
+    const target = Math.min(maxP, Math.max(1, parsed));
+    state.currentPage = target;
+    if (global.scrollTo) global.scrollTo({ top: 0, behavior: 'smooth' });
 
-    if (state.mode === 'home') {
-      loadHomeVideos(newPage);
-    } else if (state.mode === 'search') {
-      performSearch(state.currentQuery, newPage);
-    } else if (state.mode === 'model') {
-      loadModelVideos(state.currentModel, newPage);
-    } else if (state.mode === 'favorites') {
-      loadFavorites(newPage);
-    } else if (state.mode === 'history') {
-      loadHistory(newPage);
-    } else if (state.mode === 'following') {
-      loadFollowing(newPage);
+    if (state.mode === 'home' && typeof loadHomeVideos === 'function') {
+      loadHomeVideos(target);
+    } else if (state.mode === 'search' && typeof performSearch === 'function') {
+      performSearch(state.currentQuery, target);
+    } else if (state.mode === 'model' && typeof loadModelVideos === 'function') {
+      loadModelVideos(state.currentModel, target);
+    } else if (state.mode === 'favorites' && typeof loadFavorites === 'function') {
+      loadFavorites(target);
+    } else if (state.mode === 'history' && typeof loadHistory === 'function') {
+      loadHistory(target);
+    } else if (state.mode === 'following' && typeof loadFollowing === 'function') {
+      loadFollowing(target);
     }
   }
 
   function render() {
-    const current = state.currentPage;
-    const maxP = state.lastPage || 1;
+    const current = Math.max(1, Number(state.currentPage) || 1);
+    const maxP = Math.max(1, Number(state.lastPage) || 1);
 
-    function renderControls(prevBtn, nextBtn, lastBtn, lastNum, jumpInput, listEl) {
+    function handleJump(inputEl) {
+      if (!inputEl) return;
+      const value = Number.parseInt(inputEl.value, 10);
+      if (Number.isFinite(value)) changePage(value);
+    }
+
+    function renderControls(prevBtn, nextBtn, lastBtn, lastNum, jumpInput, jumpBtn, listEl) {
       if (prevBtn) {
         prevBtn.disabled = current <= 1;
         prevBtn.onclick = () => { if (current > 1) changePage(current - 1); };
@@ -61,6 +71,12 @@
       if (jumpInput) {
         jumpInput.max = maxP;
         jumpInput.value = current;
+        jumpInput.onkeydown = (event) => {
+          if (event.key === 'Enter') handleJump(jumpInput);
+        };
+      }
+      if (jumpBtn) {
+        jumpBtn.onclick = () => handleJump(jumpInput);
       }
       if (!listEl) return;
       listEl.innerHTML = '';
@@ -96,24 +112,22 @@
       btn.className = 'page-num-btn';
       if (pageNumber === current) btn.classList.add('active');
       btn.innerText = pageNumber.toLocaleString('pl-PL');
-      btn.addEventListener('click', () => changePage(pageNumber));
+      btn.onclick = () => changePage(pageNumber);
       listEl.appendChild(btn);
     }
 
-    if (dom.paginationSection) {
-      dom.paginationSection.style.display = 'flex';
-    }
-    renderControls(dom.prevPageBtn, dom.nextPageBtn, dom.lastPageBtn, dom.lastPageNumber, dom.pageJumpInput, dom.pageNumbersList);
+    if (dom.paginationSection) dom.paginationSection.style.display = 'flex';
+    renderControls(
+      dom.prevPageBtn, dom.nextPageBtn, dom.lastPageBtn, dom.lastPageNumber,
+      dom.pageJumpInput, dom.pageJumpBtn, dom.pageNumbersList
+    );
 
-    if (dom.paginationSectionTop) {
-      dom.paginationSectionTop.style.display = 'flex';
-    }
-    renderControls(dom.prevPageBtnTop, dom.nextPageBtnTop, dom.lastPageBtnTop, dom.lastPageNumberTop, dom.pageJumpInputTop, dom.pageNumbersListTop);
+    if (dom.paginationSectionTop) dom.paginationSectionTop.style.display = 'flex';
+    renderControls(
+      dom.prevPageBtnTop, dom.nextPageBtnTop, dom.lastPageBtnTop, dom.lastPageNumberTop,
+      dom.pageJumpInputTop, dom.pageJumpBtnTop, dom.pageNumbersListTop
+    );
   }
 
-  global.ArchivebatePagination = {
-    init,
-    changePage,
-    render
-  };
+  global.ArchivebatePagination = { init, changePage, render };
 })(typeof window !== 'undefined' ? window : globalThis);

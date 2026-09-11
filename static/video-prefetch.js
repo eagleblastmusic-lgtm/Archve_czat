@@ -60,12 +60,15 @@
 
   function armLazyThumbnail(img) {
     if (!img || !img.dataset.src) return;
-    if (lazyThumbObserver) {
-      lazyThumbObserver.observe(img);
-    } else {
-      img.src = img.dataset.src;
-      delete img.dataset.src;
-    }
+    const src = img.dataset.src;
+    // Ustaw src od razu, ale pozostaw loading=lazy. Przeglądarka sama decyduje,
+    // kiedy rozpocząć transfer; miniatura nie zależy już wyłącznie od
+    // IntersectionObserver, który w długiej siatce potrafił zostawić dalsze
+    // kafelki bez obrazu.
+    img.loading = 'lazy';
+    img.src = src;
+    delete img.dataset.src;
+    if (lazyThumbObserver) lazyThumbObserver.unobserve(img);
   }
 
   const videoDetailsInflight = new Map();

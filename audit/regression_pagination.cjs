@@ -137,3 +137,55 @@ function makeButton() {
   console.error(err);
   process.exitCode = 1;
 });
+
+
+// 4) Top paginator owns its handlers exactly once, including jump/last.
+{
+  function btn() { return { disabled: false, onclick: null, onkeydown: null }; }
+  const state = { mode: 'home', currentPage: 1, lastPage: 5 };
+  const topNext = btn();
+  const topPrev = btn();
+  const topLast = btn();
+  const topJump = btn();
+  const topInput = { value: 1, max: 1, onkeydown: null };
+  const dom = {
+    paginationSection: null,
+    paginationSectionTop: { style: {} },
+    prevPageBtnTop: topPrev,
+    nextPageBtnTop: topNext,
+    lastPageBtnTop: topLast,
+    lastPageNumberTop: { innerText: '' },
+    pageJumpInputTop: topInput,
+    pageJumpBtnTop: topJump,
+    pageNumbersListTop: null
+  };
+  const calls = [];
+  const window = { ArchivebateAppContext: { state, dom }, scrollTo() {} };
+  const ctx = { window, globalThis: window, console, document: { createElement() { throw new Error('not needed'); } } };
+  vm.createContext(ctx);
+  vm.runInContext(fs.readFileSync('static/pagination.js', 'utf8'), ctx);
+  window.ArchivebatePagination.init({
+    loadHomeVideos: page => calls.push(page), performSearch() {}, loadModelVideos() {},
+    loadFavorites() {}, loadHistory() {}, loadFollowing() {}
+  });
+  window.ArchivebatePagination.render();
+  topNext.onclick();
+  assert.equal(state.currentPage, 2);
+  assert.deepEqual(calls, [2], 'one top Next click must trigger exactly one navigation');
+
+  state.currentPage = 2;
+  window.ArchivebatePagination.render();
+  topInput.value = '4';
+  topJump.onclick();
+  assert.equal(state.currentPage, 4);
+  assert.deepEqual(calls, [2, 4]);
+
+  state.currentPage = 4;
+  window.ArchivebatePagination.render();
+  topLast.onclick();
+  assert.equal(state.currentPage, 5);
+  assert.deepEqual(calls, [2, 4, 5]);
+
+  const eventsSource = fs.readFileSync('static/app-events.js', 'utf8');
+  assert.doesNotMatch(eventsSource, /nextPageBtnTop\.addEventListener/, 'top paginator must not have a second event owner');
+}

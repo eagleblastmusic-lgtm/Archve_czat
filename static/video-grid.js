@@ -200,11 +200,9 @@
       cursor = end;
 
       if (cursor < displayVideos.length) {
-        if ('requestIdleCallback' in global) {
-          global.requestIdleCallback(appendNextChunk, { timeout: 250 });
-        } else {
-          setTimeout(appendNextChunk, 16);
-        }
+        // Gwarantowany kolejny tick zamiast requestIdleCallback: przy ciężkim
+        // ładowaniu miniatur idle callback potrafił zbyt długo nie dostać czasu.
+        setTimeout(appendNextChunk, 0);
       } else {
         updateCheckpointUIFn();
         checkAndHighlightCheckpointFn();
@@ -212,11 +210,7 @@
     };
 
     if (cursor < displayVideos.length) {
-      if ('requestIdleCallback' in global) {
-        global.requestIdleCallback(appendNextChunk, { timeout: 200 });
-      } else {
-        setTimeout(appendNextChunk, 16);
-      }
+      setTimeout(appendNextChunk, 0);
     }
   }
 

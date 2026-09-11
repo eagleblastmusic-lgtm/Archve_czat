@@ -319,45 +319,9 @@
     if (dom.resetFilterBtn) dom.resetFilterBtn.addEventListener('click', resetToHome);
     if (dom.logoBtn) dom.logoBtn.addEventListener('click', resetToHome);
 
-    // Paginacja
-    const handlePrev = () => {
-      if (state.currentPage > 1) {
-        changePage(state.currentPage - 1);
-      }
-    };
-    const handleNext = () => {
-      if (state.currentPage < state.lastPage) {
-        changePage(state.currentPage + 1);
-      }
-    };
-    const handleJump = (inputEl) => {
-      if (inputEl) {
-        const pageVal = parseInt(inputEl.value, 10);
-        if (pageVal >= 1) {
-          changePage(pageVal);
-        }
-      }
-    };
-
-    if (dom.prevPageBtn) dom.prevPageBtn.addEventListener('click', handlePrev);
-    if (dom.prevPageBtnTop) dom.prevPageBtnTop.addEventListener('click', handlePrev);
-
-    if (dom.nextPageBtn) dom.nextPageBtn.addEventListener('click', handleNext);
-    if (dom.nextPageBtnTop) dom.nextPageBtnTop.addEventListener('click', handleNext);
-
-    if (dom.pageJumpBtn) dom.pageJumpBtn.addEventListener('click', () => handleJump(dom.pageJumpInput));
-    if (dom.pageJumpBtnTop) dom.pageJumpBtnTop.addEventListener('click', () => handleJump(dom.pageJumpInputTop));
-
-    if (dom.pageJumpInput) {
-      dom.pageJumpInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') handleJump(dom.pageJumpInput);
-      });
-    }
-    if (dom.pageJumpInputTop) {
-      dom.pageJumpInputTop.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') handleJump(dom.pageJumpInputTop);
-      });
-    }
+    // Paginacją zarządza wyłącznie ArchivebatePagination. Nie dokładamy tu
+    // drugiego zestawu listenerów, bo jedno kliknięcie nie może uruchamiać
+    // dwóch równoległych zmian strony.
 
     // Modal events
     if (dom.modalCloseBtn) dom.modalCloseBtn.addEventListener('click', closeModal);

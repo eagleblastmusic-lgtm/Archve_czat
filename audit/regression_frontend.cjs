@@ -135,3 +135,22 @@ ctx.renderVideoGrid([{id:'new'}]);scheduled.forEach(cb=>cb());assert.deepEqual(c
 
   console.log('PASS: obsolete render, full-body transfer limit, body timeout, cancellation, pakiet A zero-flash reconcile');
 })().catch(e=>{console.error(e);process.exitCode=1});
+
+
+// Runtime UI ownership / long-page loading regressions.
+{
+  const homeStatsSource = fs.readFileSync('static/home-stats.js', 'utf8');
+  assert.doesNotMatch(homeStatsSource, /!hasFeedCounters/, 'global catalog card must not freeze behind feed counters');
+  assert.match(homeStatsSource, /catalog_complete === false/, 'partial catalog must schedule live stats polling');
+
+  const viewsSource = fs.readFileSync('static/video-views.js', 'utf8');
+  assert.doesNotMatch(viewsSource, /statCatalogVideos\.innerText = totalVids/, 'feed snapshot must not overwrite global catalog card');
+
+  const prefetchSource = fs.readFileSync('static/video-prefetch.js', 'utf8');
+  assert.match(prefetchSource, /img\.loading = 'lazy'/, 'lazy thumbnails must use native browser loading');
+  assert.match(prefetchSource, /img\.src = src/, 'lazy thumbnail must always receive a real src');
+
+  const gridSource = fs.readFileSync('static/video-grid.js', 'utf8');
+  assert.doesNotMatch(gridSource, /requestIdleCallback\(appendNextChunk/, 'long-grid completion must not depend on idle callbacks');
+  assert.match(gridSource, /setTimeout\(appendNextChunk, 0\)/, 'long-grid chunks must have a deterministic scheduler');
+}

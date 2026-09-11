@@ -303,8 +303,6 @@
           }
         }
         if (dom.statPageVideos) dom.statPageVideos.innerText = state.videos.length;
-        if (dom.statCatalogVideos) dom.statCatalogVideos.innerText = totalVids.toLocaleString('pl-PL');
-        if (dom.statCatalogVideosLbl) dom.statCatalogVideosLbl.innerText = isComplete ? `W katalogu (${pageCount.toLocaleString('pl-PL')} stron)` : 'Indeksowanie…';
         renderPagination();
       };
 
