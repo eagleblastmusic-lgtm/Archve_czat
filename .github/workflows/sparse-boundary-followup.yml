@@ -1,0 +1,60 @@
+name: Sparse boundary follow-up
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - tools/apply_sparse_boundary_followup.py
+      - .github/workflows/sparse-boundary-followup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Apply guarded follow-up
+        run: python tools/apply_sparse_boundary_followup.py
+      - name: Compile Python
+        run: python -m compileall -q .
+      - name: Latest-only migration scope regression
+        run: python audit/regression_latest_sparse_migration_scope.py
+      - name: Archivebate sparse pagination regression
+        run: python audit/regression_archivebate_sparse_pagination.py
+      - name: Camwhores sparse pagination regression
+        run: python audit/regression_camwhores_sparse_pagination.py
+      - name: Catalog monotonicity regression
+        run: python audit/regression_catalog_revision_monotonicity.py
+      - name: Durable resume regression
+        run: python audit/regression_catalog_resume.py
+      - name: Legacy resume cursor regression
+        run: python audit/regression_legacy_resume_cursor.py
+      - name: Archivebate true-end regression
+        run: python audit/regression_archivebate_true_end.py
+      - name: Archivebate source-limit regression
+        run: python audit/regression_archivebate_source_limit.py
+      - name: Integration regression
+        run: python audit/regression_integration.py
+      - name: Diff check
+        run: git diff --check
+      - name: Commit qualified follow-up
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add catalog_service.py audit/regression_archivebate_sparse_pagination.py audit/regression_latest_sparse_migration_scope.py
+          git diff --cached --quiet && exit 0
+          git commit -m "fix: make sparse pagination migration latest-only"
+          git push origin HEAD:master
