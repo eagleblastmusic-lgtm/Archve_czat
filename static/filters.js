@@ -111,6 +111,9 @@
         updateCamwhoresToggleUI();
         if (state.mode === 'home') {
           triggerLoadHomeVideos(1);
+        } else if (state.mode === 'search') {
+          if (_deps.performSearch) _deps.performSearch(state.currentQuery, 1);
+          else if (typeof global.performSearch === 'function') global.performSearch(state.currentQuery, 1);
         }
       });
     }
@@ -181,6 +184,9 @@
         updateAuthorFilterUI();
         if (state.mode === 'home') {
           triggerLoadHomeVideos(1);
+        } else if (state.mode === 'search') {
+          if (_deps.performSearch) _deps.performSearch(state.currentQuery, 1);
+          else if (typeof global.performSearch === 'function') global.performSearch(state.currentQuery, 1);
         }
       });
     }

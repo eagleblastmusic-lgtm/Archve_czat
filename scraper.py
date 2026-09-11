@@ -736,6 +736,8 @@ class ArchivebateScraper:
         if not clean_q:
             return {"query": query, "page": 1, "last_page": 1, "total_profiles": 0, "total_videos": 0, "profiles": [], "videos": []}
 
+        grouped_search = group_authors in (True, "1", "true", "True")
+        grouped_archivebate_page_size = 40
         cache_key = f"search:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}:p{page}"
         meta_cache_key = f"search_meta:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}"
         now = time.time()
@@ -751,7 +753,7 @@ class ArchivebateScraper:
                 "total_profiles": meta["total_profiles"],
                 "total_videos": meta["total_videos"],
                 "profiles": meta["profiles"][:30],
-                "videos": cached["videos"][:per_page]
+                "videos": cached["videos"] if grouped_search else cached["videos"][:per_page]
             }
 
         fav_authors_raw = storage.get_favorite_authors()
@@ -809,6 +811,9 @@ class ArchivebateScraper:
             if author_filter == "only_fav" and fav_authors_clean:
                 est_total = min(est_total, max(len(fav_authors_clean) * 35, 35))
                 est_last_page = max(1, math.ceil(est_total / 280))
+            if grouped_search and source == "only-archivebate":
+                # W widoku 1/autora stroną jest porcja autorów, nie sztuczna estymacja filmów.
+                est_last_page = max(1, math.ceil(len(all_profiles) / grouped_archivebate_page_size))
 
             meta = {
                 "profiles": all_profiles,
@@ -861,13 +866,15 @@ class ArchivebateScraper:
         # Pobranie modelek Archivebate odpowiadających stronie (jeśli dozwolone przez source)
         if source != "only-camwhores":
             models_for_page = []
-            ab_model_batch = 16 if source == "only-archivebate" else 8
+            ab_model_batch = grouped_archivebate_page_size if (grouped_search and source == "only-archivebate") else (16 if source == "only-archivebate" else 8)
             if page == 1:
                 models_for_page = all_profiles[:ab_model_batch]
             else:
                 start_m = (page - 1) * ab_model_batch
                 end_m = start_m + ab_model_batch
-                if end_m <= len(all_profiles):
+                if start_m < len(all_profiles):
+                    # Ostatnia częściowa strona ma użyć pozostałych profili zamiast
+                    # ponownie wpadać w zdalną stronę / fallback strony pierwszej.
                     models_for_page = all_profiles[start_m:end_m]
                 else:
                     p_models, _, _ = self._fetch_search_profiles(clean_q, page=page)
@@ -876,10 +883,12 @@ class ArchivebateScraper:
                         p_models = [p for p in p_models if re.sub(r'[^a-z0-9]', '', str(p.get("username", "")).lower()) not in fav_authors_clean]
                     elif author_filter == "only_fav":
                         p_models = [p for p in p_models if re.sub(r'[^a-z0-9]', '', str(p.get("username", "")).lower()) in fav_authors_clean]
-                    models_for_page = p_models[:ab_model_batch] if p_models else all_profiles[:ab_model_batch]
+                    # Brak danych dla strony N oznacza brak tej strony; nigdy nie
+                    # wracaj do all_profiles[:N], bo to duplikuje stronę 1.
+                    models_for_page = p_models[:ab_model_batch]
 
             if models_for_page:
-                with ThreadPoolExecutor(max_workers=ab_model_batch) as executor:
+                with ThreadPoolExecutor(max_workers=min(16, max(1, len(models_for_page)))) as executor:
                     futs = [executor.submit(self.get_archivebate_model_videos, p.get("username"), 1) for p in models_for_page if p.get("username")]
                     for f in as_completed(futs):
                         try:
@@ -906,7 +915,7 @@ class ArchivebateScraper:
                     filtered.append(v)
 
         sorted_vids = sort_videos_newest_first(filtered)
-        final_videos = sorted_vids[:per_page]
+        final_videos = sorted_vids if grouped_search else sorted_vids[:per_page]
 
         self._cache[cache_key] = {
             "videos": final_videos,
@@ -930,6 +939,8 @@ class ArchivebateScraper:
             yield {"type": "done", "total_videos": 0, "total_profiles": 0, "last_page": 1}
             return
 
+        grouped_search = group_authors in (True, "1", "true", "True")
+        grouped_archivebate_page_size = 40
         cache_key = f"search:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}:p1"
         meta_cache_key = f"search_meta:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}"
         now = time.time()
@@ -938,6 +949,7 @@ class ArchivebateScraper:
         if cache_key in self._cache and (now - self._cache[cache_key]["time"] < 600) and meta_cache_key in self._cache:
             cached = self._cache[cache_key]
             meta = self._cache[meta_cache_key]
+            cached_page_videos = cached["videos"] if grouped_search else cached["videos"][:280]
             yield {
                 "type": "profiles",
                 "profiles": meta["profiles"][:30],
@@ -947,15 +959,15 @@ class ArchivebateScraper:
             }
             yield {
                 "type": "videos",
-                "videos": cached["videos"][:280],
-                "total_so_far": len(cached["videos"][:280])
+                "videos": cached_page_videos,
+                "total_so_far": len(cached_page_videos)
             }
             yield {
                 "type": "done",
                 "total_videos": meta["total_videos"],
                 "total_profiles": meta["total_profiles"],
                 "last_page": meta["last_page"],
-                "all_sorted_videos": cached["videos"][:280]
+                "all_sorted_videos": cached_page_videos
             }
             return
 
@@ -1008,6 +1020,8 @@ class ArchivebateScraper:
         if author_filter == "only_fav" and fav_authors_clean:
             est_total = min(est_total, max(len(fav_authors_clean) * 35, 35))
             est_last_page = max(1, math.ceil(est_total / 280))
+        if grouped_search and source == "only-archivebate":
+            est_last_page = max(1, math.ceil(len(all_profiles) / grouped_archivebate_page_size))
 
         # Emitujemy profile natychmiast (0.1 - 0.2s) wraz z oszacowaną liczbą filmów i stron!
         yield {
@@ -1078,7 +1092,8 @@ class ArchivebateScraper:
                 pass
 
         # Partia 2: CW tag 4..6 + CW search 1 oraz Archivebate modelek (współbieżnie)
-        target_profiles = all_profiles[:16] if source == "only-archivebate" else all_profiles[:8]
+        target_profile_count = grouped_archivebate_page_size if (grouped_search and source == "only-archivebate") else (16 if source == "only-archivebate" else 8)
+        target_profiles = all_profiles[:target_profile_count]
         cw_extra = []
 
         with ThreadPoolExecutor(max_workers=12) as executor:
@@ -1169,7 +1184,7 @@ class ArchivebateScraper:
 
         # 4. Finalne sortowanie całości od najnowszego i zapisanie w pamięci RAM
         sorted_all = sort_videos_newest_first(all_videos)
-        page_1_vids = sorted_all[:280]
+        page_1_vids = sorted_all if grouped_search else sorted_all[:280]
 
         self._cache[cache_key] = {
             "videos": page_1_vids,
