@@ -37,6 +37,12 @@
         : 'Indeksowanie trwa';
     }
 
+    if (data.catalog_limited) {
+      return totalPages
+        ? `Gotowe do limitu źródła • ${totalPages.toLocaleString('pl-PL')} stron katalogu`
+        : 'Gotowe do limitu źródła';
+    }
+
     return totalPages
       ? `Gotowe • ${totalPages.toLocaleString('pl-PL')} stron katalogu`
       : 'Gotowe';

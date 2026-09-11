@@ -900,6 +900,8 @@ def get_catalog_stats(source: str = "all", author_filter: str = "all", revision:
         "base_catalog_videos": base_videos,
         "blocked_videos": deducted,
         "catalog_complete": res["catalog_complete"],
+        "catalog_limited": res.get("catalog_limited", False),
+        "limited_sources": res.get("limited_sources", {}),
         "updated_at": res["updated_at"]
     }
 
@@ -2109,6 +2111,8 @@ async def get_system_stats():
         "catalog_pages": catalog_stats["last_page"],
         "base_catalog_videos": catalog_stats["base_catalog_videos"],
         "catalog_complete": catalog_stats.get("catalog_complete", False),
+        "catalog_limited": catalog_stats.get("catalog_limited", False),
+        "limited_sources": catalog_stats.get("limited_sources", {}),
         "updated_at": catalog_stats.get("updated_at", 0),
         "archivebate_pages": 1000,
         "estimated_archivebate_videos": 36000,

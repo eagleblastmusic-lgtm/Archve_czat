@@ -439,6 +439,8 @@ class CatalogService:
                 "revision": 0,
                 "source_error": {},
                 "retryable": False,
+                "catalog_limited": False,
+                "limited_sources": {},
             }
 
         # File-backed reads must not queue behind the background writer.
@@ -451,12 +453,23 @@ class CatalogService:
             revision_error = str(rev_info["error"] or "") if rev_info else ""
             updated_at = float(rev_info["updated_at"]) if rev_info else 0.0
             source_error = {}
-            if is_failed and revision_error:
+            if revision_error:
                 try:
                     decoded_error = json.loads(revision_error)
                     source_error = decoded_error if isinstance(decoded_error, dict) else {"catalog": revision_error}
                 except (ValueError, TypeError):
                     source_error = {"catalog": revision_error}
+
+            limited_rows = conn.execute(
+                "SELECT source, end_reason FROM source_runs "
+                "WHERE revision = ? AND end_reason LIKE 'source_http_limit:%'",
+                (rev,),
+            ).fetchall()
+            limited_sources = {
+                str(row["source"]): str(row["end_reason"] or "")
+                for row in limited_rows
+            }
+            catalog_limited = bool(limited_sources)
 
             # Build dynamic WHERE clause
             where_clauses = ["revision = ?"]
@@ -638,7 +651,9 @@ class CatalogService:
             "snapshot_id": str(rev),
             "revision": rev,
             "source_error": source_error,
-            "retryable": is_failed,
+            "retryable": bool(source_error) and not is_complete,
+            "catalog_limited": catalog_limited,
+            "limited_sources": limited_sources,
         }
 
     def import_cached_raw_pages(self, raw_cache_dir: Optional[Path] = None) -> int:
@@ -667,7 +682,12 @@ class CatalogService:
 
     @staticmethod
     def _is_recoverable_page_limit_error(error_value: Any) -> bool:
-        """Recognize revisions failed only because the pre-resume 1000-page cap was hit."""
+        """Recognize legacy cap failures and the page-1001 5xx boundary probe as resumable.
+
+        The page-1001 HTTP failure is retried by the new worker before it is classified as a
+        source boundary. Older builds could already have persisted that one failure as terminal,
+        so accept it once on upgrade and let the worker perform the qualified boundary probe.
+        """
         if not error_value:
             return False
         decoded = error_value
@@ -675,10 +695,17 @@ class CatalogService:
             try:
                 decoded = json.loads(error_value)
             except (TypeError, ValueError, json.JSONDecodeError):
-                return error_value.startswith("page_limit_exceeded:")
+                decoded = error_value
+
+        def recoverable(value: Any) -> bool:
+            text = str(value or "")
+            if text.startswith("page_limit_exceeded:"):
+                return True
+            return bool(re.search(r"\b5\d\d Server Error\b", text)) and "page=1001" in text
+
         if isinstance(decoded, dict) and decoded:
-            return all(str(value).startswith("page_limit_exceeded:") for value in decoded.values())
-        return False
+            return all(recoverable(value) for value in decoded.values())
+        return recoverable(decoded)
 
     def _reopen_legacy_archivebate_cap_revision(self) -> Optional[int]:
         """Reopen the active revision falsely completed by the old scraper page-1000 guard.
@@ -997,18 +1024,60 @@ class CatalogService:
                 # Cooperative sleep to maintain low background concurrency
                 time.sleep(0.05)
 
-                try:
-                    batch = fetchers[source](page)
-                    if not isinstance(batch, list):
-                        raise RuntimeError(f"Source {source} returned non-list on page {page}")
-                except Exception as exc:
-                    # An error on a page does NOT mean end of source; record error and stop this source run
-                    errors[source] = str(exc)
+                batch = None
+                fetch_error = None
+                # A single 5xx is not proof of a pagination boundary. Retry the exact page
+                # several times before deciding whether this is transient or a stable source cap.
+                for attempt in range(1, 5):
+                    try:
+                        batch = fetchers[source](page)
+                        if not isinstance(batch, list):
+                            raise RuntimeError(f"Source {source} returned non-list on page {page}")
+                        fetch_error = None
+                        break
+                    except Exception as exc:
+                        fetch_error = exc
+                        if attempt < 4:
+                            time.sleep(0.35 * attempt)
+
+                if fetch_error is not None:
+                    response = getattr(fetch_error, "response", None)
+                    status_code = getattr(response, "status_code", None)
+                    # Archivebate's public home pagination currently accepts 1..1000 and returns
+                    # a persistent server error beyond that boundary. Four consecutive 5xx probes
+                    # after page 1000 are recorded as an upstream access limit, not as a clean EOF.
+                    if (
+                        source == "archivebate"
+                        and page > 1000
+                        and isinstance(status_code, int)
+                        and 500 <= status_code < 600
+                    ):
+                        ended.add(source)
+                        reason = f"source_http_limit:{status_code}:{page}"
+                        with self._lock:
+                            conn = self._get_conn()
+                            conn.execute(
+                                "UPDATE source_runs SET complete = 1, failed = 0, error = NULL, end_reason = ?, updated_at = ? "
+                                "WHERE revision = ? AND source = ?",
+                                (reason, time.time(), revision, source),
+                            )
+                            self._indexing_progress["source_progress"][source] = {
+                                "cursor": page,
+                                "items": source_counts[source],
+                                "complete": True,
+                                "limited": True,
+                                "limit_page": page - 1,
+                                "end_reason": reason,
+                            }
+                        continue
+
+                    # Other errors remain real source failures and must not be confused with EOF.
+                    errors[source] = str(fetch_error)
                     with self._lock:
                         conn = self._get_conn()
                         conn.execute(
-                            "UPDATE source_runs SET failed = 1, error = ?, updated_at = ? WHERE revision = ? AND source = ?",
-                            (str(exc), time.time(), revision, source),
+                            "UPDATE source_runs SET failed = 1, complete = 0, error = ?, updated_at = ? WHERE revision = ? AND source = ?",
+                            (str(fetch_error), time.time(), revision, source),
                         )
                     continue
 
