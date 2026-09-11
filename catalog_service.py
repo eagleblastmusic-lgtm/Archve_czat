@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -101,6 +102,10 @@ class CatalogService:
         self.db_path = Path(db_path or os.getenv("ARCHIVEBATE_CATALOG_DB") or DEFAULT_CATALOG_DB)
         self.page_size = page_size
         self._lock = threading.RLock()
+        # Writer connection is serialized by _lock. File-backed catalog reads
+        # use a separate thread-local SQLite connection so WAL can actually
+        # provide concurrent readers while the background indexer is writing.
+        self._read_local = threading.local()
         self._conn: Optional[sqlite3.Connection] = None
         self._indexing_thread: Optional[threading.Thread] = None
         self._indexing_stop = threading.Event()
@@ -130,6 +135,38 @@ class CatalogService:
             conn.execute("PRAGMA temp_store = MEMORY")
             self._conn = conn
         return self._conn
+
+    def _get_read_conn(self) -> sqlite3.Connection:
+        """Return a thread-local read connection for a file-backed WAL DB.
+
+        The indexer deliberately owns the writer connection and _lock. Using
+        that same lock for feed reads serialized the UI behind large import
+        transactions, causing 12s client timeouts even though committed rows
+        were already readable. A separate SQLite reader can observe the last
+        committed WAL snapshot immediately.
+        """
+        if str(self.db_path) == ":memory:":
+            return self._get_conn()
+        conn = getattr(self._read_local, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(
+                str(self.db_path),
+                timeout=1.0,
+                check_same_thread=False,
+                isolation_level=None,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("PRAGMA busy_timeout = 1000")
+            conn.execute("PRAGMA cache_size = -32000")
+            conn.execute("PRAGMA temp_store = MEMORY")
+            self._read_local.conn = conn
+        return conn
+
+    def _read_guard(self):
+        # In-memory SQLite databases cannot be shared by opening a second
+        # connection, so tests/in-memory callers retain the original lock.
+        return self._lock if str(self.db_path) == ":memory:" else nullcontext()
 
     def _init_db(self):
         with self._lock:
@@ -204,6 +241,13 @@ class CatalogService:
                 raise
 
     def close(self):
+        reader = getattr(self._read_local, "conn", None)
+        if reader is not None:
+            try:
+                reader.close()
+            except Exception:
+                pass
+            self._read_local.conn = None
         with self._lock:
             if self._conn:
                 try:
@@ -213,9 +257,9 @@ class CatalogService:
                 self._conn = None
 
     def get_active_revision(self) -> Optional[int]:
-        """Returns the active published revision. If none active, returns latest completed revision. If none completed, returns latest partial revision."""
-        with self._lock:
-            conn = self._get_conn()
+        """Returns the best readable revision without waiting for the writer lock."""
+        with self._read_guard():
+            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
             row = conn.execute("SELECT revision FROM revisions WHERE is_active = 1 AND failed = 0 LIMIT 1").fetchone()
             if row:
                 return int(row["revision"])
@@ -232,27 +276,29 @@ class CatalogService:
             return int(row_any["revision"]) if row_any else None
 
     def get_latest_revision_number(self) -> int:
-        conn = self._get_conn()
-        row = conn.execute("SELECT MAX(revision) AS max_rev FROM revisions").fetchone()
-        return int(row["max_rev"] or 0)
+        with self._read_guard():
+            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
+            row = conn.execute("SELECT MAX(revision) AS max_rev FROM revisions").fetchone()
+            return int(row["max_rev"] or 0)
 
     def is_revision_complete(self, revision: int) -> bool:
-        conn = self._get_conn()
-        row = conn.execute("SELECT complete, failed FROM revisions WHERE revision = ?", (revision,)).fetchone()
-        return bool(row and row["complete"] and not row["failed"])
+        with self._read_guard():
+            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
+            row = conn.execute("SELECT complete, failed FROM revisions WHERE revision = ?", (revision,)).fetchone()
+            return bool(row and row["complete"] and not row["failed"])
 
     def get_revision_stats(self, revision: Optional[int] = None) -> Dict[str, Any]:
-        with self._lock:
-            rev = revision if revision is not None else self.get_active_revision()
-            if rev is None:
-                return {
-                    "revision": 0,
-                    "complete": False,
-                    "video_count": 0,
-                    "updated_at": 0.0,
-                    "indexing_progress": self._indexing_progress,
-                }
-            conn = self._get_conn()
+        rev = revision if revision is not None else self.get_active_revision()
+        if rev is None:
+            return {
+                "revision": 0,
+                "complete": False,
+                "video_count": 0,
+                "updated_at": 0.0,
+                "indexing_progress": self._indexing_progress,
+            }
+        with self._read_guard():
+            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
             row = conn.execute("SELECT * FROM revisions WHERE revision = ?", (rev,)).fetchone()
             if not row:
                 return {
@@ -388,8 +434,10 @@ class CatalogService:
                 "retryable": False,
             }
 
-        with self._lock:
-            conn = self._get_conn()
+        # File-backed reads must not queue behind the background writer.
+        # WAL gives us a consistent committed snapshot on the dedicated reader.
+        with self._read_guard():
+            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
             rev_info = conn.execute("SELECT * FROM revisions WHERE revision = ?", (rev,)).fetchone()
             is_failed = bool(rev_info["failed"]) if rev_info else False
             is_complete = bool(rev_info["complete"]) and not is_failed if rev_info else False
