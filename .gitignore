@@ -17,3 +17,7 @@ data/storyboard_cache/
 # Disposable local UI fixtures
 audit/ui_fixture/
 audit/tmp*/
+
+data/catalog.db
+data/catalog.db-wal
+data/catalog.db-shm
