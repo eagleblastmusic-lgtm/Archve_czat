@@ -6,7 +6,8 @@ function makeButton() {
   return { disabled: false, onclick: null };
 }
 
-// 1) Pagination routing: Next on search must request page 2 for the active query.
+// 1) Pagination routing: Next on search must request page 2 for the active query
+// without pre-committing currentPage before the view loader sees the old page.
 {
   const state = {
     mode: 'search',
@@ -26,6 +27,7 @@ function makeButton() {
     paginationSectionTop: null
   };
   const calls = [];
+  let pageBeforeLoader = null;
   const window = {
     ArchivebateAppContext: { state, dom },
     scrollTo() {}
@@ -35,7 +37,12 @@ function makeButton() {
   vm.runInContext(fs.readFileSync('static/pagination.js', 'utf8'), ctx);
   window.ArchivebatePagination.init({
     loadHomeVideos() {},
-    performSearch: (query, page) => calls.push({ query, page }),
+    performSearch: (query, page) => {
+      pageBeforeLoader = state.currentPage;
+      calls.push({ query, page });
+      // Real performSearch owns the page transition synchronously.
+      state.currentPage = page;
+    },
     loadModelVideos() {},
     loadFavorites() {},
     loadHistory() {},
@@ -44,6 +51,7 @@ function makeButton() {
   window.ArchivebatePagination.render();
   assert.equal(nextPageBtn.disabled, false);
   nextPageBtn.onclick();
+  assert.equal(pageBeforeLoader, 1, 'paginator must leave the previous page visible to the loader');
   assert.equal(state.currentPage, 2);
   assert.deepEqual(calls, [{ query: 'alice', page: 2 }]);
 }
@@ -139,7 +147,8 @@ function makeButton() {
 });
 
 
-// 4) Top paginator owns its handlers exactly once, including jump/last.
+// 4) Top paginator owns its handlers exactly once, including jump/last, and
+// delegates before the loader commits the next page.
 {
   function btn() { return { disabled: false, onclick: null, onkeydown: null }; }
   const state = { mode: 'home', currentPage: 1, lastPage: 5 };
@@ -160,32 +169,41 @@ function makeButton() {
     pageNumbersListTop: null
   };
   const calls = [];
+  const pageBeforeLoader = [];
   const window = { ArchivebateAppContext: { state, dom }, scrollTo() {} };
   const ctx = { window, globalThis: window, console, document: { createElement() { throw new Error('not needed'); } } };
   vm.createContext(ctx);
   vm.runInContext(fs.readFileSync('static/pagination.js', 'utf8'), ctx);
   window.ArchivebatePagination.init({
-    loadHomeVideos: page => calls.push(page), performSearch() {}, loadModelVideos() {},
-    loadFavorites() {}, loadHistory() {}, loadFollowing() {}
+    loadHomeVideos: page => {
+      pageBeforeLoader.push(state.currentPage);
+      calls.push(page);
+      // Real loadHomeVideos owns the page transition synchronously.
+      state.currentPage = page;
+    },
+    performSearch() {}, loadModelVideos() {}, loadFavorites() {}, loadHistory() {}, loadFollowing() {}
   });
   window.ArchivebatePagination.render();
   topNext.onclick();
+  assert.equal(pageBeforeLoader[0], 1, 'home loader must see page 1 before navigating to page 2');
   assert.equal(state.currentPage, 2);
   assert.deepEqual(calls, [2], 'one top Next click must trigger exactly one navigation');
 
-  state.currentPage = 2;
   window.ArchivebatePagination.render();
   topInput.value = '4';
   topJump.onclick();
+  assert.equal(pageBeforeLoader[1], 2, 'jump loader must see the previously rendered page');
   assert.equal(state.currentPage, 4);
   assert.deepEqual(calls, [2, 4]);
 
-  state.currentPage = 4;
   window.ArchivebatePagination.render();
   topLast.onclick();
+  assert.equal(pageBeforeLoader[2], 4, 'last-page loader must see the previously rendered page');
   assert.equal(state.currentPage, 5);
   assert.deepEqual(calls, [2, 4, 5]);
 
+  const paginationSource = fs.readFileSync('static/pagination.js', 'utf8');
+  assert.doesNotMatch(paginationSource, /state\.currentPage\s*=\s*target/, 'paginator must not pre-commit currentPage');
   const eventsSource = fs.readFileSync('static/app-events.js', 'utf8');
   assert.doesNotMatch(eventsSource, /nextPageBtnTop\.addEventListener/, 'top paginator must not have a second event owner');
 }
