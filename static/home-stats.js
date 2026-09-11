@@ -23,6 +23,25 @@
     }, delay);
   }
 
+  function formatCatalogStatus(data, totalPages) {
+    if (data.catalog_complete === false) {
+      const updatedAt = Number(data.updated_at || 0);
+      const ageSeconds = updatedAt > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - updatedAt)) : 0;
+      if (ageSeconds >= 90) {
+        return totalPages
+          ? `Indeksowanie… • ${totalPages.toLocaleString('pl-PL')} stron katalogu • ostatni zapis ${ageSeconds}s temu`
+          : `Indeksowanie… • ostatni zapis ${ageSeconds}s temu`;
+      }
+      return totalPages
+        ? `Indeksowanie trwa • ${totalPages.toLocaleString('pl-PL')} stron katalogu`
+        : 'Indeksowanie trwa';
+    }
+
+    return totalPages
+      ? `Gotowe • ${totalPages.toLocaleString('pl-PL')} stron katalogu`
+      : 'Gotowe';
+  }
+
   async function update() {
     const generation = ++requestGeneration;
     try {
@@ -40,15 +59,7 @@
       }
       if (dom.statCatalogVideosLbl) {
         const totalPages = data.catalog_pages || (data.catalog_videos ? Math.ceil(data.catalog_videos / 280) : 0);
-        if (data.catalog_complete === false) {
-          dom.statCatalogVideosLbl.innerText = totalPages
-            ? `Indeksowanie… (${totalPages.toLocaleString('pl-PL')} stron)`
-            : 'Indeksowanie…';
-        } else {
-          dom.statCatalogVideosLbl.innerText = totalPages
-            ? `W katalogu (${totalPages.toLocaleString('pl-PL')} stron)`
-            : 'W katalogu';
-        }
+        dom.statCatalogVideosLbl.innerText = formatCatalogStatus(data, totalPages);
       }
       if (dom.statPageVideos) {
         dom.statPageVideos.innerText = String(state.videos?.length || 0);
@@ -86,5 +97,5 @@
     }
   }
 
-  global.ArchivebateHomeStats = { update, cancelPoll };
+  global.ArchivebateHomeStats = { update, cancelPoll, formatCatalogStatus };
 })(typeof window !== 'undefined' ? window : globalThis);
