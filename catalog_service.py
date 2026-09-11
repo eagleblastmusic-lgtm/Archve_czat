@@ -21,6 +21,7 @@ DEFAULT_CATALOG_DB = DATA_DIR / "catalog.db"
 # not by reaching an arbitrary catalog-size limit. These values are intentionally far above
 # the old 1000/500 caps so large source catalogs can be indexed to their real end.
 MAX_PAGES_PER_SOURCE = {"archivebate": 1_000_000, "camwhores": 100_000}
+CAMWHORES_EMPTY_END_THRESHOLD = 5
 
 
 def canonical_identity_key(video: Dict[str, Any]) -> str:
@@ -258,6 +259,68 @@ class CatalogService:
                       AND end_reason = 'empty_page'
                     """
                 )
+
+                # Old builds treated the first empty Camwhores page (or a cached has_more=false)
+                # as a definitive EOF. Real-world pagination contains holes (for example page 2
+                # can be empty while page 3+ contains videos), so reopen only the newest completed
+                # revision when it still carries one of those legacy ambiguous endings. The new
+                # worker will verify the boundary with consecutive empty pages before republishing.
+                newest_complete = conn.execute(
+                    "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 "
+                    "ORDER BY revision DESC LIMIT 1"
+                ).fetchone()
+                if newest_complete:
+                    newest_revision = int(newest_complete["revision"])
+                    legacy_camwhores = conn.execute(
+                        """
+                        SELECT 1 FROM source_runs
+                        WHERE revision = ?
+                          AND source = 'camwhores'
+                          AND complete = 1
+                          AND failed = 0
+                          AND COALESCE(end_reason, '') IN ('', 'empty_page', 'cached_end')
+                          AND NOT EXISTS (
+                              SELECT 1 FROM source_runs ab
+                              WHERE ab.revision = source_runs.revision
+                                AND ab.source = 'archivebate'
+                                AND ab.complete = 1
+                                AND ab.failed = 0
+                                AND ab.cursor = 1001
+                                AND ab.pages_scanned = 1000
+                                AND COALESCE(ab.end_reason, '') = ''
+                          )
+                        LIMIT 1
+                        """,
+                        (newest_revision,),
+                    ).fetchone()
+                    if legacy_camwhores:
+                        now = time.time()
+                        conn.execute(
+                            "UPDATE revisions SET complete = 0, is_active = 0, failed = 0, error = NULL, updated_at = ? "
+                            "WHERE revision = ?",
+                            (now, newest_revision),
+                        )
+                        conn.execute(
+                            "UPDATE source_runs SET complete = 0, failed = 0, error = NULL, "
+                            "end_reason = 'legacy_empty_recheck', updated_at = ? "
+                            "WHERE revision = ? AND source = 'camwhores'",
+                            (now, newest_revision),
+                        )
+
+                # Revision numbers are monotonic snapshots. Repair any stale is_active flag left
+                # behind by the old resume bug: the newest completed successful revision is the
+                # only published snapshot. An unfinished newer revision remains inactive while it
+                # is resumed in the background.
+                best_complete = conn.execute(
+                    "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 "
+                    "ORDER BY revision DESC LIMIT 1"
+                ).fetchone()
+                if best_complete:
+                    conn.execute("UPDATE revisions SET is_active = 0")
+                    conn.execute(
+                        "UPDATE revisions SET is_active = 1 WHERE revision = ?",
+                        (int(best_complete["revision"]),),
+                    )
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -280,19 +343,27 @@ class CatalogService:
                 self._conn = None
 
     def get_active_revision(self) -> Optional[int]:
-        """Returns the best readable revision without waiting for the writer lock."""
+        """Return the newest published snapshot, or the best partial revision if none exists."""
         with self._read_guard():
             conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
-            row = conn.execute("SELECT revision FROM revisions WHERE is_active = 1 AND failed = 0 LIMIT 1").fetchone()
-            if row:
-                return int(row["revision"])
-            row_comp = conn.execute("SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 ORDER BY updated_at DESC, revision DESC LIMIT 1").fetchone()
+            # Revision numbers are the publication order. Never let a later updated_at timestamp
+            # on an older resumed revision make it win over a newer completed snapshot.
+            row_comp = conn.execute(
+                "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 "
+                "ORDER BY revision DESC LIMIT 1"
+            ).fetchone()
             if row_comp:
                 return int(row_comp["revision"])
-            # W czasie budowania kolejnej rewizji nie pokazuj pustej, nowej
-            # rewizji kosztem częściowego katalogu, który już ma dane.
+            # With no published snapshot, an explicitly active partial revision is still useful.
+            row_active = conn.execute(
+                "SELECT revision FROM revisions WHERE is_active = 1 AND failed = 0 "
+                "ORDER BY revision DESC LIMIT 1"
+            ).fetchone()
+            if row_active:
+                return int(row_active["revision"])
             row_any = conn.execute(
-                "SELECT revision FROM revisions WHERE failed = 0 ORDER BY video_count DESC, updated_at DESC, revision DESC LIMIT 1"
+                "SELECT revision FROM revisions WHERE failed = 0 "
+                "ORDER BY video_count DESC, revision DESC LIMIT 1"
             ).fetchone()
             if not row_any:
                 row_any = conn.execute("SELECT revision FROM revisions ORDER BY revision DESC LIMIT 1").fetchone()
@@ -378,8 +449,25 @@ class CatalogService:
                 )
                 cnt = conn.execute("SELECT COUNT(*) AS total FROM catalog_items WHERE revision = ?", (revision,)).fetchone()["total"]
                 if complete:
-                    conn.execute("UPDATE revisions SET is_active = 0")
-                    conn.execute("UPDATE revisions SET complete = 1, is_active = 1, updated_at = ?, video_count = ? WHERE revision = ?", (now, cnt, revision))
+                    newer = conn.execute(
+                        "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 AND revision > ? "
+                        "ORDER BY revision DESC LIMIT 1",
+                        (revision,),
+                    ).fetchone()
+                    if newer:
+                        # Preserve the completed data, but an older snapshot can never become active.
+                        conn.execute(
+                            "UPDATE revisions SET complete = 1, is_active = 0, failed = 0, error = NULL, "
+                            "updated_at = ?, video_count = ? WHERE revision = ?",
+                            (now, cnt, revision),
+                        )
+                    else:
+                        conn.execute("UPDATE revisions SET is_active = 0")
+                        conn.execute(
+                            "UPDATE revisions SET complete = 1, is_active = 1, failed = 0, error = NULL, "
+                            "updated_at = ?, video_count = ? WHERE revision = ?",
+                            (now, cnt, revision),
+                        )
                 else:
                     conn.execute("UPDATE revisions SET updated_at = ?, video_count = ? WHERE revision = ?", (now, cnt, revision))
                 conn.execute("COMMIT")
@@ -387,20 +475,36 @@ class CatalogService:
                 conn.execute("ROLLBACK")
                 raise
 
-    def publish_revision(self, revision: int):
-        """Atomically marks a revision as complete and active."""
+    def publish_revision(self, revision: int) -> bool:
+        """Atomically publish a revision unless a newer successful snapshot already exists."""
         with self._lock:
             conn = self._get_conn()
             now = time.time()
             conn.execute("BEGIN IMMEDIATE")
             try:
                 cnt = conn.execute("SELECT COUNT(*) AS total FROM catalog_items WHERE revision = ?", (revision,)).fetchone()["total"]
+                newer = conn.execute(
+                    "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 AND revision > ? "
+                    "ORDER BY revision DESC LIMIT 1",
+                    (revision,),
+                ).fetchone()
+                if newer:
+                    # A stale worker may finish after a newer snapshot was already published.
+                    # Keep its rows for diagnostics/history, but never roll the live feed backwards.
+                    conn.execute(
+                        "UPDATE revisions SET complete = 1, is_active = 0, failed = 0, error = NULL, "
+                        "updated_at = ?, video_count = ? WHERE revision = ?",
+                        (now, cnt, revision),
+                    )
+                    conn.execute("COMMIT")
+                    return False
                 conn.execute("UPDATE revisions SET is_active = 0")
                 conn.execute(
-                    "UPDATE revisions SET complete = 1, is_active = 1, failed = 0, updated_at = ?, video_count = ? WHERE revision = ?",
+                    "UPDATE revisions SET complete = 1, is_active = 1, failed = 0, error = NULL, updated_at = ?, video_count = ? WHERE revision = ?",
                     (now, cnt, revision),
                 )
                 conn.execute("COMMIT")
+                return True
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
@@ -842,14 +946,20 @@ class CatalogService:
         """
         with self._lock:
             conn = self._get_conn()
+            latest_completed = conn.execute(
+                "SELECT MAX(revision) AS revision FROM revisions WHERE complete = 1 AND failed = 0"
+            ).fetchone()
+            completed_floor = int(latest_completed["revision"] or 0) if latest_completed else 0
             rows = conn.execute(
                 """
                 SELECT r.revision, r.failed, r.error
                 FROM revisions r
                 WHERE r.complete = 0
+                  AND r.revision > ?
                   AND EXISTS (SELECT 1 FROM source_runs s WHERE s.revision = r.revision)
                 ORDER BY r.revision DESC
-                """
+                """,
+                (completed_floor,),
             ).fetchall()
             for row in rows:
                 if not bool(row["failed"]) or self._is_recoverable_page_limit_error(row["error"]):
@@ -872,7 +982,7 @@ class CatalogService:
             if self._indexing_thread and self._indexing_thread.is_alive():
                 return self._indexing_progress.get("revision", 0)
 
-            if not force:
+            if not force and "archivebate" in fetchers:
                 self._reopen_legacy_archivebate_cap_revision()
             active = self.get_active_revision()
             resumable = None if force else self.get_resumable_revision()
@@ -999,6 +1109,7 @@ class CatalogService:
         total_items_found = sum(int(row["items_found"] or 0) for row in run_rows.values())
         last_signatures: Dict[str, Optional[str]] = {s: None for s in sources}
         repeated_signatures: Dict[str, int] = {s: 0 for s in sources}
+        consecutive_empty_pages: Dict[str, int] = {s: 0 for s in sources}
 
         # Safety bound protects resources, but reaching it is truncation, not a verified source end.
         max_pages = MAX_PAGES_PER_SOURCE
@@ -1105,6 +1216,51 @@ class CatalogService:
                     continue
 
                 if not batch:
+                    if source == "camwhores":
+                        # Camwhores can contain isolated empty HTTP-200 pages in the middle of the
+                        # catalog. A single hole must not terminate indexing. Advance durably and
+                        # require several consecutive empty pages before accepting a true end.
+                        consecutive_empty_pages[source] += 1
+                        last_signatures[source] = None
+                        repeated_signatures[source] = 0
+                        next_page = page + 1
+                        cursors[source] = next_page
+                        if consecutive_empty_pages[source] < CAMWHORES_EMPTY_END_THRESHOLD:
+                            with self._lock:
+                                conn = self._get_conn()
+                                conn.execute(
+                                    "UPDATE source_runs SET cursor = ?, pages_scanned = pages_scanned + 1, "
+                                    "complete = 0, failed = 0, error = NULL, end_reason = NULL, updated_at = ? "
+                                    "WHERE revision = ? AND source = ?",
+                                    (next_page, time.time(), revision, source),
+                                )
+                                self._indexing_progress["source_progress"][source] = {
+                                    "cursor": next_page,
+                                    "items": source_counts[source],
+                                    "complete": False,
+                                    "empty_streak": consecutive_empty_pages[source],
+                                }
+                            continue
+
+                        ended.add(source)
+                        reason = f"consecutive_empty_pages:{CAMWHORES_EMPTY_END_THRESHOLD}:{page}"
+                        with self._lock:
+                            conn = self._get_conn()
+                            conn.execute(
+                                "UPDATE source_runs SET cursor = ?, pages_scanned = pages_scanned + 1, "
+                                "complete = 1, failed = 0, error = NULL, end_reason = ?, updated_at = ? "
+                                "WHERE revision = ? AND source = ?",
+                                (next_page, reason, time.time(), revision, source),
+                            )
+                            self._indexing_progress["source_progress"][source] = {
+                                "cursor": next_page,
+                                "items": source_counts[source],
+                                "complete": True,
+                                "empty_streak": consecutive_empty_pages[source],
+                                "end_reason": reason,
+                            }
+                        continue
+
                     ended.add(source)
                     # Archivebate page 1001 is an upstream visibility boundary, not proof that the
                     # service has no older videos. Preserve that distinction even when the server
@@ -1128,6 +1284,9 @@ class CatalogService:
                             progress.update({"limited": True, "limit_page": page - 1})
                         self._indexing_progress["source_progress"][source] = progress
                     continue
+
+                if source == "camwhores":
+                    consecutive_empty_pages[source] = 0
 
                 # Some sites clamp out-of-range page numbers and return the same last page forever.
                 # Three identical non-empty pages in a row are treated as a verified pagination clamp.
@@ -1180,9 +1339,14 @@ class CatalogService:
         with self._lock:
             self._indexing_progress["is_indexing"] = False
             if len(ended) == len(sources) and not errors:
-                # All sources completed successfully: publish atomically!
-                self.publish_revision(revision)
-                self._indexing_progress["published_revision"] = revision
+                # All sources completed successfully. A stale worker is allowed to finish but is
+                # never allowed to roll the live feed back over a newer completed revision.
+                published = self.publish_revision(revision)
+                if published:
+                    self._indexing_progress["published_revision"] = revision
+                else:
+                    self._indexing_progress["superseded_revision"] = revision
+                    self._indexing_progress["published_revision"] = self.get_active_revision()
             elif errors:
                 self.mark_revision_failed(revision, json.dumps(errors))
                 self._indexing_progress["error"] = errors
@@ -1190,9 +1354,9 @@ class CatalogService:
     def _read_cached_source_pages(self, source: str, max_age_seconds: float = 6 * 3600):
         """Read contiguous raw source pages and return (items, next page, count, ended).
 
-        A missing page or an old page stops seeding. We never infer the end of
-        pagination from a non-empty page; only an explicitly empty page or
-        ``has_more=false`` is treated as a verified source end.
+        Camwhores is sparse: isolated empty pages and has_more=false values are not reliable EOF
+        signals. For that source we require five consecutive cached empty pages. A missing/old
+        cache page always stops seeding without claiming completion so the live worker can resume.
         """
         cache_dir = Path(FEED_CACHE_DIR)
         if not cache_dir.exists():
@@ -1200,6 +1364,7 @@ class CatalogService:
         page = 1
         collected: List[Dict[str, Any]] = []
         pages_scanned = 0
+        camwhores_empty_streak = 0
         while page <= MAX_PAGES_PER_SOURCE.get(source, 1_000_000):
             path = cache_dir / f"raw_v1_{source}_{page}.json"
             data, _ = read_json_cache(str(path))
@@ -1216,6 +1381,18 @@ class CatalogService:
             pages_scanned += 1
             has_more = data.get("has_more")
             page += 1
+
+            if source == "camwhores":
+                if batch:
+                    camwhores_empty_streak = 0
+                else:
+                    camwhores_empty_streak += 1
+                    if camwhores_empty_streak >= CAMWHORES_EMPTY_END_THRESHOLD:
+                        return collected, page, pages_scanned, True
+                # Do not trust one cached has_more=false for Camwhores; page 2 can be empty while
+                # later pages contain videos. Continue only through actually present fresh files.
+                continue
+
             if not batch or has_more is False:
                 return collected, page, pages_scanned, True
         return collected, page, pages_scanned, False
