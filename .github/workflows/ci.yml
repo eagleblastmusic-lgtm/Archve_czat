@@ -56,6 +56,8 @@ jobs:
         run: python audit/regression_catalog_bootstrap.py
       - name: Catalog durable resume regression
         run: python audit/regression_catalog_resume.py
+      - name: Archivebate true-end regression
+        run: python audit/regression_archivebate_true_end.py
       - name: Catalog read concurrency regression
         run: python audit/regression_catalog_read_concurrency.py
       - name: Integration regression
