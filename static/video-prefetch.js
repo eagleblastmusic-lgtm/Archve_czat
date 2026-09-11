@@ -43,7 +43,9 @@
   // Pamięć podręczna detali wideo dla natychmiastowego startu po kliknięciu
   const videoDetailsCache = new perf.LRUCache(180);
 
-  // Miniatury poza viewportem nie powinny konkurować o łącze z tymi, które użytkownik widzi.
+  // Ładuj obrazy dopiero, gdy karta zbliża się do viewportu. Wcześniej
+  // armLazyThumbnail() ustawiał src od razu wszystkim ~280 kartom, co tworzyło
+  // duży burst requestów do /api/thumb i opóźniało pierwszy użyteczny ekran.
   const lazyThumbObserver = (typeof window !== 'undefined' && 'IntersectionObserver' in window)
     ? new IntersectionObserver((entries, observer) => {
         for (const entry of entries) {
@@ -55,20 +57,26 @@
           }
           observer.unobserve(img);
         }
-      }, { rootMargin: '1000px 0px', threshold: 0.01 })
+      }, { rootMargin: '700px 0px', threshold: 0.01 })
     : null;
+
+  // video-views.js rozłącza obserwator przy zmianie widoku, aby stare elementy
+  // nie utrzymywały requestów po przejściu na inną stronę.
+  global.lazyThumbObserver = lazyThumbObserver;
 
   function armLazyThumbnail(img) {
     if (!img || !img.dataset.src) return;
     const src = img.dataset.src;
-    // Ustaw src od razu, ale pozostaw loading=lazy. Przeglądarka sama decyduje,
-    // kiedy rozpocząć transfer; miniatura nie zależy już wyłącznie od
-    // IntersectionObserver, który w długiej siatce potrafił zostawić dalsze
-    // kafelki bez obrazu.
     img.loading = 'lazy';
+
+    if (lazyThumbObserver) {
+      lazyThumbObserver.observe(img);
+      return;
+    }
+
+    // Fallback dla WebView/przeglądarki bez IntersectionObserver.
     img.src = src;
     delete img.dataset.src;
-    if (lazyThumbObserver) lazyThumbObserver.unobserve(img);
   }
 
   const videoDetailsInflight = new Map();
@@ -145,10 +153,15 @@
     if (!Array.isArray(videos) || videos.length <= start) return;
     if (thumbnailWarmupController) thumbnailWarmupController.abort();
     thumbnailWarmupController = new AbortController();
-    const urls = videos.slice(start, start + count).map(thumbnailUrlForVideo).filter(Boolean);
+
+    // Warmup ma pomagać pierwszemu ekranowi, a nie konkurować z nim. Ograniczamy
+    // go do 12 miniatur; resztę przejmuje IntersectionObserver podczas scrolla.
+    const warmCount = Math.min(Math.max(0, count), 12);
+    if (warmCount === 0) return;
+    const urls = videos.slice(start, start + warmCount).map(thumbnailUrlForVideo).filter(Boolean);
     perf.idle(() => {
-      perf.prefetchUrls(urls, { concurrency: 4, signal: thumbnailWarmupController.signal }).catch(() => {});
-    }, 700);
+      perf.prefetchUrls(urls, { concurrency: 3, signal: thumbnailWarmupController.signal }).catch(() => {});
+    }, 900);
   }
 
   function hasVideoDetails(videoId) {
