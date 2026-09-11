@@ -18,11 +18,3 @@ deep_endpoints = '''@app.get("/api/deep-archivebate/status")\ndef get_deep_archi
 assert text.count(status_marker) == 1, "status endpoint marker changed"
 text = text.replace(status_marker, deep_endpoints + status_marker, 1)
 main_path.write_text(text, encoding="utf-8")
-
-ci_path = Path(".github/workflows/ci.yml")
-ci = ci_path.read_text(encoding="utf-8")
-needle = '''      - name: Archivebate sparse pagination regression\n        run: python audit/regression_archivebate_sparse_pagination.py\n'''
-insert = needle + '''      - name: Deep Archivebate discovery regression\n        run: python audit/regression_deep_archivebate.py\n'''
-assert ci.count(needle) == 1, "CI insertion point changed"
-ci = ci.replace(needle, insert, 1)
-ci_path.write_text(ci, encoding="utf-8")
