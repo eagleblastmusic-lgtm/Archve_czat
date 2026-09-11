@@ -58,6 +58,8 @@ jobs:
         run: python audit/regression_catalog_resume.py
       - name: Archivebate true-end regression
         run: python audit/regression_archivebate_true_end.py
+      - name: Grouped feed batch-query regression
+        run: python audit/regression_grouped_query_batch.py
       - name: Catalog read concurrency regression
         run: python audit/regression_catalog_read_concurrency.py
       - name: Integration regression
