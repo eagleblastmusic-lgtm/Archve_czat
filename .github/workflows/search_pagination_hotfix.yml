@@ -69,12 +69,16 @@ jobs:
         run: python audit/regression_package_d.py
       - name: Unit tests
         run: python -m unittest test_suite -q
-      - name: Finalize qualified hotfix
+      - name: Finalize qualified application hotfix
         run: |
-          git rm tools/apply_search_pagination_fix.py .github/workflows/search_pagination_hotfix.yml
+          # The staged patch adds permanent CI lines, but the Actions token is not
+          # allowed to update workflow files. Publish only the already-qualified
+          # application/test changes; CI wiring is updated separately via GitHub.
+          git checkout -- .github/workflows/ci.yml
+          git rm tools/apply_search_pagination_fix.py
           git config user.name 'eagleblastmusic-lgtm'
           git config user.email 'eagleblastmusic@gmail.com'
-          git add scraper.py static/filters.js audit/regression_search_filters.cjs audit/regression_search_pagination.py .github/workflows/ci.yml
+          git add scraper.py static/filters.js audit/regression_search_filters.cjs audit/regression_search_pagination.py
           git diff --cached --check
           git commit -m 'fix: make search filters and grouped pagination deterministic'
           git push origin HEAD:master
