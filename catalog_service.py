@@ -719,7 +719,8 @@ class CatalogService:
                     (now, revision),
                 )
                 conn.execute(
-                    "UPDATE source_runs SET complete = 0, failed = 0, error = NULL, end_reason = NULL, updated_at = ? "
+                    "UPDATE source_runs SET complete = 0, failed = 0, error = NULL, "
+                    "end_reason = 'legacy_cap_reopened', updated_at = ? "
                     "WHERE revision = ? AND source = 'archivebate'",
                     (now, revision),
                 )
@@ -728,6 +729,65 @@ class CatalogService:
                 conn.execute("ROLLBACK")
                 raise
             return revision
+
+    def _repair_reopened_legacy_archivebate_cursor(self, revision: int) -> bool:
+        """Restore page 1001 if the legacy-cap migration was accidentally restarted at page 1.
+
+        ``_reopen_legacy_archivebate_cap_revision`` is the only normal path that leaves an
+        active revision in an incomplete state. Older builds did not persist an explicit marker,
+        so ``is_active=1 + complete=0`` is also accepted as the legacy migration signature.
+        Fresh partial revisions are not active and therefore are never fast-forwarded.
+        """
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                """
+                SELECT r.is_active, r.complete AS revision_complete, r.failed AS revision_failed,
+                       s.cursor, s.pages_scanned, s.items_found, s.complete AS source_complete,
+                       s.failed AS source_failed, s.end_reason
+                FROM revisions r
+                JOIN source_runs s ON s.revision = r.revision
+                WHERE r.revision = ? AND s.source = 'archivebate'
+                """,
+                (revision,),
+            ).fetchone()
+            if not row:
+                return False
+
+            cursor = int(row["cursor"] or 1)
+            marker = str(row["end_reason"] or "") == "legacy_cap_reopened"
+            legacy_active_partial = (
+                bool(row["is_active"])
+                and not bool(row["revision_complete"])
+                and not bool(row["revision_failed"])
+                and not bool(row["source_complete"])
+                and not bool(row["source_failed"])
+                and not str(row["end_reason"] or "")
+            )
+            if cursor >= 1001 or not (marker or legacy_active_partial):
+                return False
+
+            archivebate_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM catalog_items WHERE revision = ? AND source = 'archivebate'",
+                    (revision,),
+                ).fetchone()["cnt"]
+                or 0
+            )
+            now = time.time()
+            conn.execute(
+                """
+                UPDATE source_runs
+                SET cursor = 1001,
+                    pages_scanned = CASE WHEN pages_scanned < 1000 THEN 1000 ELSE pages_scanned END,
+                    items_found = CASE WHEN items_found < ? THEN ? ELSE items_found END,
+                    complete = 0, failed = 0, error = NULL,
+                    end_reason = 'legacy_cap_reopened', updated_at = ?
+                WHERE revision = ? AND source = 'archivebate'
+                """,
+                (archivebate_count, archivebate_count, now, revision),
+            )
+            return True
 
     def get_resumable_revision(self) -> Optional[int]:
         """Return the newest durable unfinished revision that can safely continue after restart.
@@ -778,9 +838,11 @@ class CatalogService:
             now = time.time()
             conn = self._get_conn()
             resumed = resumable is not None
+            legacy_cursor_repaired = False
 
             if resumed:
                 next_rev = int(resumable)
+                legacy_cursor_repaired = self._repair_reopened_legacy_archivebate_cursor(next_rev)
                 rev_row = conn.execute(
                     "SELECT failed, error FROM revisions WHERE revision = ?",
                     (next_rev,),
@@ -840,6 +902,7 @@ class CatalogService:
                 "is_indexing": True,
                 "revision": next_rev,
                 "resumed": resumed,
+                "legacy_cursor_repaired": legacy_cursor_repaired,
                 "source_progress": {s: {"cursor": 1, "items": 0, "complete": False} for s in fetchers},
                 "error": None,
             }
