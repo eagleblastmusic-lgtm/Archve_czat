@@ -169,8 +169,11 @@
     const groupFn = getGroupVideosByAuthor();
     const displayVideos = shouldGroup ? groupFn(videos) : videos;
 
-    const INITIAL_BATCH = 32;
-    const CHUNK_SIZE = 32;
+    // Keep the first synchronous paint small. A card wires multiple controls,
+    // hover handlers and media nodes, so creating all 280 at once makes a
+    // page transition feel much slower than the API response itself.
+    const INITIAL_BATCH = 16;
+    const CHUNK_SIZE = 24;
     const initial = displayVideos.slice(0, INITIAL_BATCH);
     const firstFragment = document.createDocumentFragment();
 

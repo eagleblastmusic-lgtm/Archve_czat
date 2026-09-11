@@ -189,9 +189,9 @@
     const displayPoster = canonicalPoster;
     const backupPoster = directPoster;
 
-    const eagerThumb = idx < 12;
+    const eagerThumb = idx < 8;
     const thumbLoadAttrs = eagerThumb
-      ? `src="${displayPoster}" loading="eager" fetchpriority="${idx < 6 ? 'high' : 'auto'}"`
+      ? `src="${displayPoster}" loading="eager" fetchpriority="${idx < 4 ? 'high' : 'auto'}"`
       : `data-src="${displayPoster}" loading="lazy" fetchpriority="low"`;
 
     card.innerHTML = `

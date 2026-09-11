@@ -153,4 +153,9 @@ ctx.renderVideoGrid([{id:'new'}]);scheduled.forEach(cb=>cb());assert.deepEqual(c
   const gridSource = fs.readFileSync('static/video-grid.js', 'utf8');
   assert.doesNotMatch(gridSource, /requestIdleCallback\(appendNextChunk/, 'long-grid completion must not depend on idle callbacks');
   assert.match(gridSource, /setTimeout\(appendNextChunk, 0\)/, 'long-grid chunks must have a deterministic scheduler');
+  assert.match(gridSource, /INITIAL_BATCH = 16/, 'first paint must stay bounded to a small synchronous card batch');
+  const viewsPerfSource = fs.readFileSync('static/video-views.js', 'utf8');
+  assert.match(viewsPerfSource, /HOME_PAGE_CACHE_LIMIT = 3/, 'home pagination needs a bounded three-page cache');
+  assert.match(viewsPerfSource, /prefetchHomePage\(current \+ 1/, 'home view must prefetch the likely next page');
+  assert.match(viewsPerfSource, /isInitial && !isSamePageRefresh && !renderedFromPageCache/, 'first page and page transitions must use chunked replacement');
 }

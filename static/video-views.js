@@ -166,8 +166,91 @@
     }
   }
 
+  const HOME_PAGE_CACHE_LIMIT = 3;
+  const HOME_PAGE_CACHE_TTL_MS = 90_000;
+  const homePageCache = new Map();
+  const homePagePrefetchInflight = new Map();
+
+  function homePageCacheKey(page, specKey) {
+    return `${specKey}|page:${Number(page) || 1}`;
+  }
+
+  function rememberHomePage(page, specKey, data) {
+    if (!data || !Array.isArray(data.videos || data.items)) return;
+    const key = homePageCacheKey(page, specKey);
+    const entry = {
+      data: { ...data, videos: data.videos || data.items || [], items: data.items || data.videos || [] },
+      revision: Number(data.catalog_revision !== undefined ? data.catalog_revision : data.revision),
+      storedAt: Date.now()
+    };
+    homePageCache.delete(key);
+    homePageCache.set(key, entry);
+    while (homePageCache.size > HOME_PAGE_CACHE_LIMIT) {
+      homePageCache.delete(homePageCache.keys().next().value);
+    }
+  }
+
+  function getCachedHomePage(page, specKey) {
+    const key = homePageCacheKey(page, specKey);
+    const entry = homePageCache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.storedAt > HOME_PAGE_CACHE_TTL_MS) {
+      homePageCache.delete(key);
+      return null;
+    }
+    const activeRevision = Number(state.catalogRevision);
+    if (Number.isFinite(activeRevision) && activeRevision > 0 && Number.isFinite(entry.revision) && entry.revision !== activeRevision) {
+      homePageCache.delete(key);
+      return null;
+    }
+    homePageCache.delete(key);
+    homePageCache.set(key, entry);
+    return entry.data;
+  }
+
+  function warmPageThumbnails(data, count = 24) {
+    const videos = data?.videos || data?.items || [];
+    if (!Array.isArray(videos) || videos.length === 0) return;
+    const urls = videos.slice(0, count).map(thumbnailUrlForVideo).filter(Boolean);
+    if (!urls.length) return;
+    perf().prefetchUrls(urls, { concurrency: 4 }).catch(() => {});
+  }
+
+  function prefetchHomePage(page, specKey, revision) {
+    const target = Number(page) || 1;
+    const maxPage = Math.max(1, Number(state.lastPage) || 1);
+    if (target < 1 || target > maxPage) return Promise.resolve(null);
+    if (getCachedHomePage(target, specKey)) return Promise.resolve(null);
+
+    const key = homePageCacheKey(target, specKey);
+    if (homePagePrefetchInflight.has(key)) return homePagePrefetchInflight.get(key);
+
+    const src = encodeURIComponent(state.sourceFilter || 'all');
+    const af = encodeURIComponent(state.authorFilter || 'all');
+    const grp = state.groupByAuthor ? '1' : '0';
+    const revParam = Number(revision) > 0 ? `&revision=${encodeURIComponent(revision)}` : '';
+    const request = api().getJSON(
+      `/api/feed?page=${target}&source=${src}&author_filter=${af}&group_authors=${grp}${revParam}`,
+      { timeoutMs: 12000 }
+    ).then(data => {
+      rememberHomePage(target, specKey, data);
+      warmPageThumbnails(data, 24);
+      return data;
+    }).catch(() => null).finally(() => {
+      homePagePrefetchInflight.delete(key);
+    });
+    homePagePrefetchInflight.set(key, request);
+    return request;
+  }
+
   function prefetchNextPage() {
-    // Home is filled via its SSE subscriber.
+    if (state.mode !== 'home') return;
+    const current = Math.max(1, Number(state.currentPage) || 1);
+    const src = encodeURIComponent(state.sourceFilter || 'all');
+    const af = encodeURIComponent(state.authorFilter || 'all');
+    const grp = state.groupByAuthor ? '1' : '0';
+    const specKey = `${src}|${af}|${grp}`;
+    prefetchHomePage(current + 1, specKey, state.catalogRevision);
   }
 
   function beginViewRequest() {
@@ -209,6 +292,8 @@
     const af = encodeURIComponent(state.authorFilter || 'all');
     const grp = state.groupByAuthor ? '1' : '0';
     const specKey = `${src}|${af}|${grp}`;
+    const cachedPage = !force ? getCachedHomePage(page, specKey) : null;
+    let renderedFromPageCache = false;
 
     const hasExistingCards = Boolean(
       dom.videoGrid &&
@@ -221,13 +306,30 @@
     const isSamePageRefresh = hasExistingCards && !force && previousPage === page && state.feedSpecKey === specKey;
 
     if (!isSamePageRefresh) {
-      state.videos = [];
-      showSkeletons();
-      state.gridCardMap = new Map();
-      state.lastAppliedFeedRevision = -1;
-      state.lastAppliedFeedUpdatedAt = 0;
-      state.lastAppliedFeedVideoCount = -1;
-      state.lastAppliedVideosCount = 0;
+      if (cachedPage) {
+        state.videos = cachedPage.videos || cachedPage.items || [];
+        state.feedSpecKey = specKey;
+        state.feedSnapshotId = cachedPage.snapshot_id || null;
+        state.catalogRevision = cachedPage.catalog_revision !== undefined ? cachedPage.catalog_revision : cachedPage.revision;
+        state.lastPage = Math.max(1, Number(cachedPage.page_count || cachedPage.last_page) || 1);
+        state.totalCatalogVideos = Number(cachedPage.video_count !== undefined ? cachedPage.video_count : cachedPage.total_videos) || 0;
+        state.catalogComplete = !!cachedPage.catalog_complete;
+        renderVideoGrid(state.videos);
+        scheduleThumbnailWarmup(state.videos, 8, 24);
+        renderedFromPageCache = true;
+        if (dom.pageJumpInput) dom.pageJumpInput.value = page;
+        if (dom.pageJumpInputTop) dom.pageJumpInputTop.value = page;
+        if (dom.videoCount) dom.videoCount.innerText = `${state.videos.length} na stronie • Strona ${page} • z pamięci podręcznej`;
+        renderPagination();
+      } else {
+        state.videos = [];
+        showSkeletons();
+        state.gridCardMap = new Map();
+        state.lastAppliedFeedRevision = -1;
+        state.lastAppliedFeedUpdatedAt = 0;
+        state.lastAppliedFeedVideoCount = -1;
+        state.lastAppliedVideosCount = 0;
+      }
     } else {
       setFeedRefreshingIndicator(true);
     }
@@ -365,7 +467,16 @@
         state.totalCatalogVideos = batchData.video_count !== undefined ? batchData.video_count : batchData.known_count;
         state.catalogComplete = !!batchData.catalog_complete;
 
-        reconcilePage(state.videos, { complete: batchData.complete || batchData.stopped || batchData.catalog_complete });
+        const pageComplete = batchData.complete || batchData.stopped || batchData.catalog_complete;
+        if (isInitial && !isSamePageRefresh && !renderedFromPageCache) {
+          // Page transitions and the first app paint use chunked replacement:
+          // the first 16 cards become visible immediately, the rest follow
+          // in small deterministic chunks instead of blocking on 280 cards.
+          renderVideoGrid(state.videos);
+        } else {
+          reconcilePage(state.videos, { complete: pageComplete });
+        }
+        rememberHomePage(page, specKey, { ...batchData, videos: state.videos, items: state.videos });
         updateFeedCounters(batchData);
         if (batchData.complete || batchData.stopped || batchData.catalog_complete) {
           setFeedRefreshingIndicator(false);
@@ -395,6 +506,10 @@
       };
 
       apply(data, true);
+      // Prepare the most likely next click while the user is looking at the
+      // current page. JSON and the first posters will usually be warm before
+      // the paginator is used.
+      prefetchNextPage();
       const catalogRevisionStream = data.catalog_complete === false && /^\d+$/.test(String(streamSnapshotId || ''));
       if (data.refresh_pending || catalogRevisionStream || !data.complete) {
         const streamRevisionParam = streamRevision ? `&revision=${encodeURIComponent(streamRevision)}` : '';
