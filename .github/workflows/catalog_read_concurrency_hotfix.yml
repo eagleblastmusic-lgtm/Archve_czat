@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   apply-test-and-commit:
-    if: "${{ github.event.head_commit.message == 'ci: qualify nonblocking catalog reads' }}"
+    if: "${{ github.event.head_commit.message == 'ci: publish nonblocking catalog reads' }}"
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -69,7 +69,7 @@ jobs:
           git rm tools/apply_catalog_read_concurrency_fix.py
           git config user.name 'eagleblastmusic-lgtm'
           git config user.email 'eagleblastmusic@gmail.com'
-          git add catalog_service.py audit/regression_catalog_read_concurrency.py .github/workflows/ci.yml
+          git add catalog_service.py audit/regression_catalog_read_concurrency.py
           git diff --cached --check
           git commit -m 'perf: keep catalog reads responsive during indexing'
           git push origin HEAD:master
