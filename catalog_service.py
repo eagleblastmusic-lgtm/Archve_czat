@@ -196,6 +196,7 @@ class CatalogService:
                     complete INTEGER DEFAULT 0,
                     failed INTEGER DEFAULT 0,
                     error TEXT,
+                    end_reason TEXT,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(revision, source)
                 )
@@ -238,6 +239,9 @@ class CatalogService:
                             ORDER BY updated_at DESC, revision DESC LIMIT 1
                         )
                     """)
+                source_columns = {row["name"] for row in conn.execute("PRAGMA table_info(source_runs)")}
+                if "end_reason" not in source_columns:
+                    conn.execute("ALTER TABLE source_runs ADD COLUMN end_reason TEXT")
                 conn.execute("COMMIT")
             except Exception:
                 conn.execute("ROLLBACK")
@@ -659,6 +663,55 @@ class CatalogService:
             return all(str(value).startswith("page_limit_exceeded:") for value in decoded.values())
         return False
 
+    def _reopen_legacy_archivebate_cap_revision(self) -> Optional[int]:
+        """Reopen the active revision falsely completed by the old scraper page-1000 guard.
+
+        Before the true-end fix, ``_fetch_single_ab_home_page(1001)`` returned ``[]`` locally
+        without contacting Archivebate. A completed active run with exactly 1000 scanned pages,
+        cursor 1001 and no persisted end reason is therefore known to be a false completion.
+        New completions always persist ``end_reason`` and are never reopened here.
+        """
+        with self._lock:
+            conn = self._get_conn()
+            row = conn.execute(
+                """
+                SELECT r.revision
+                FROM revisions r
+                JOIN source_runs s ON s.revision = r.revision
+                WHERE r.is_active = 1
+                  AND r.complete = 1
+                  AND r.failed = 0
+                  AND s.source = 'archivebate'
+                  AND s.complete = 1
+                  AND s.failed = 0
+                  AND s.cursor = 1001
+                  AND s.pages_scanned = 1000
+                  AND COALESCE(s.end_reason, '') = ''
+                ORDER BY r.revision DESC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not row:
+                return None
+            revision = int(row["revision"])
+            now = time.time()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "UPDATE revisions SET complete = 0, failed = 0, error = NULL, updated_at = ? WHERE revision = ?",
+                    (now, revision),
+                )
+                conn.execute(
+                    "UPDATE source_runs SET complete = 0, failed = 0, error = NULL, end_reason = NULL, updated_at = ? "
+                    "WHERE revision = ? AND source = 'archivebate'",
+                    (now, revision),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            return revision
+
     def get_resumable_revision(self) -> Optional[int]:
         """Return the newest durable unfinished revision that can safely continue after restart.
 
@@ -698,6 +751,8 @@ class CatalogService:
             if self._indexing_thread and self._indexing_thread.is_alive():
                 return self._indexing_progress.get("revision", 0)
 
+            if not force:
+                self._reopen_legacy_archivebate_cap_revision()
             active = self.get_active_revision()
             resumable = None if force else self.get_resumable_revision()
             if resumable is None and not force and active is not None and self.is_revision_complete(active):
@@ -723,7 +778,7 @@ class CatalogService:
 
                 # Retry any source that was interrupted mid-page. Completed sources stay completed.
                 conn.execute(
-                    "UPDATE source_runs SET failed = 0, error = NULL, updated_at = ? "
+                    "UPDATE source_runs SET failed = 0, error = NULL, end_reason = NULL, updated_at = ? "
                     "WHERE revision = ? AND complete = 0",
                     (now, next_rev),
                 )
@@ -757,9 +812,10 @@ class CatalogService:
                         if seeded:
                             self.import_items(seeded, revision=next_rev, complete=False, source=src)
                         conn.execute(
-                            "UPDATE source_runs SET cursor = ?, pages_scanned = ?, items_found = ?, complete = ?, updated_at = ? "
-                            "WHERE revision = ? AND source = ?",
-                            (next_cursor, pages_scanned, len(seeded), int(source_complete), time.time(), next_rev, src),
+                            "UPDATE source_runs SET cursor = ?, pages_scanned = ?, items_found = ?, complete = ?, "
+                            "end_reason = ?, updated_at = ? WHERE revision = ? AND source = ?",
+                            (next_cursor, pages_scanned, len(seeded), int(source_complete),
+                             "cached_end" if source_complete else None, time.time(), next_rev, src),
                         )
 
             self._indexing_stop.clear()
@@ -817,6 +873,8 @@ class CatalogService:
         cursors = {s: int(run_rows.get(s)["cursor"] or 1) if run_rows.get(s) else 1 for s in sources}
         source_counts = {s: int(run_rows.get(s)["items_found"] or 0) if run_rows.get(s) else 0 for s in sources}
         total_items_found = sum(int(row["items_found"] or 0) for row in run_rows.values())
+        last_signatures: Dict[str, Optional[str]] = {s: None for s in sources}
+        repeated_signatures: Dict[str, int] = {s: 0 for s in sources}
 
         # Safety bound protects resources, but reaching it is truncation, not a verified source end.
         max_pages = MAX_PAGES_PER_SOURCE
@@ -875,18 +933,50 @@ class CatalogService:
                     continue
 
                 if not batch:
-                    # Verified clean end of pagination
+                    # Verified clean end of pagination returned by the remote source.
                     ended.add(source)
                     with self._lock:
                         conn = self._get_conn()
                         conn.execute(
-                            "UPDATE source_runs SET complete = 1, updated_at = ? WHERE revision = ? AND source = ?",
+                            "UPDATE source_runs SET complete = 1, end_reason = 'empty_page', updated_at = ? "
+                            "WHERE revision = ? AND source = ?",
                             (time.time(), revision, source),
                         )
                         self._indexing_progress["source_progress"][source] = {
                             "cursor": page,
                             "items": source_counts[source],
                             "complete": True,
+                            "end_reason": "empty_page",
+                        }
+                    continue
+
+                # Some sites clamp out-of-range page numbers and return the same last page forever.
+                # Three identical non-empty pages in a row are treated as a verified pagination clamp.
+                signature_keys = sorted(
+                    canonical_identity_key(item) for item in batch if isinstance(item, dict)
+                )
+                signature = hashlib.sha256("\n".join(signature_keys).encode("utf-8")).hexdigest() if signature_keys else None
+                if signature and signature == last_signatures[source]:
+                    repeated_signatures[source] += 1
+                else:
+                    repeated_signatures[source] = 0
+                    last_signatures[source] = signature
+
+                if repeated_signatures[source] >= 2:
+                    ended.add(source)
+                    reason = f"repeated_page:{page}"
+                    with self._lock:
+                        conn = self._get_conn()
+                        conn.execute(
+                            "UPDATE source_runs SET complete = 1, end_reason = ?, updated_at = ? "
+                            "WHERE revision = ? AND source = ?",
+                            (reason, time.time(), revision, source),
+                        )
+                        self._indexing_progress["source_progress"][source] = {
+                            "cursor": page,
+                            "items": source_counts[source],
+                            "complete": True,
+                            "end_reason": reason,
                         }
                     continue
 

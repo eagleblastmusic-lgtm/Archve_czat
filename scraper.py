@@ -345,8 +345,8 @@ class ArchivebateScraper:
             })
 
     def _fetch_single_ab_home_page(self, p: int, strict: bool = False) -> List[Dict[str, Any]]:
-        """Pobiera pojedynczą stronę z Archivebate."""
-        if p > 1000:
+        """Pobiera pojedynczą stronę z Archivebate bez sztucznego limitu numeru strony."""
+        if p < 1:
             return []
         url = f"https://archivebate.com?page={p}" if p > 1 else "https://archivebate.com"
         try:
@@ -462,7 +462,7 @@ class ArchivebateScraper:
         elif source == "only-archivebate":
             # Tylko Archivebate: pobieramy partiami strony AB
             ab_start = (page - 1) * 20 + 1
-            ab_pages = [p for p in range(ab_start, ab_start + 20) if p <= 1000]
+            ab_pages = list(range(ab_start, ab_start + 20))
             ab_videos = []
             with ThreadPoolExecutor(max_workers=16) as executor:
                 futures = {executor.submit(self._fetch_single_ab_home_page, p): p for p in ab_pages}
@@ -476,8 +476,8 @@ class ArchivebateScraper:
 
             # Dociągamy kolejne strony Archivebate jeśli < target_count
             extra_p = ab_start + 20
-            while len(merged) < target_count and extra_p <= ab_start + 40 and extra_p <= 1000:
-                batch = [p for p in range(extra_p, extra_p + 5) if p <= 1000]
+            while len(merged) < target_count and extra_p <= ab_start + 40:
+                batch = list(range(extra_p, extra_p + 5))
                 extra_p += 5
                 if not batch:
                     break
@@ -490,7 +490,7 @@ class ArchivebateScraper:
             # "all": Archivebate + Camwhores równolegle
             ab_start = (page - 1) * 10 + 1
             cw_start = (page - 1) * 6 + 1
-            ab_pages = [p for p in range(ab_start, ab_start + 10) if p <= 1000]
+            ab_pages = list(range(ab_start, ab_start + 10))
             cw_pages = list(range(cw_start, cw_start + 6))
 
             ab_videos = []
@@ -516,7 +516,7 @@ class ArchivebateScraper:
             # Dociągamy kolejne strony jeśli < target_count
             extra_offset = 0
             while len(merged) < target_count and extra_offset < 10:
-                extra_ab = [ab_start + 10 + extra_offset * 3 + i for i in range(3) if ab_start + 10 + extra_offset * 3 + i <= 1000]
+                extra_ab = [ab_start + 10 + extra_offset * 3 + i for i in range(3)]
                 extra_cw = [cw_start + 6 + extra_offset * 2 + i for i in range(2)]
                 extra_offset += 1
 
