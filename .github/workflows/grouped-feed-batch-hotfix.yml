@@ -1,0 +1,58 @@
+name: Grouped feed batch hotfix
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-qualify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Apply hotfix
+        run: python tools/apply_grouped_feed_batch_hotfix.py
+      - name: Compile Python
+        run: python -m compileall -q .
+      - name: Grouped batch-query regression
+        run: python audit/regression_grouped_query_batch.py
+      - name: Archivebate true-end regression
+        run: python audit/regression_archivebate_true_end.py
+      - name: Durable resume regression
+        run: python audit/regression_catalog_resume.py
+      - name: Catalog read concurrency regression
+        run: python audit/regression_catalog_read_concurrency.py
+      - name: Core backend regression
+        run: python audit/regression_checks.py
+      - name: Integration regression
+        run: python audit/regression_integration.py
+      - name: Frontend regression
+        run: node audit/regression_frontend.cjs
+      - name: Unit tests
+        run: python -m unittest test_suite -q
+      - name: Commit qualified hotfix
+        run: |
+          rm tools/apply_grouped_feed_batch_hotfix.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add catalog_service.py audit/regression_grouped_query_batch.py tools/apply_grouped_feed_batch_hotfix.py
+          git diff --cached --check
+          git commit -m "perf: batch grouped feed member queries"
+          git push origin HEAD:master
