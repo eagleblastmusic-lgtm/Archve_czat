@@ -566,6 +566,32 @@ class CatalogService:
                     params + params + [ps, offset],
                 ).fetchall()
 
+                # Fetch grouped members for every leader on this page in one query.
+                # The previous implementation executed one SELECT per author (up to 280
+                # extra queries on every page), which made grouped first paint much slower
+                # than the normal feed and could exceed the browser request timeout.
+                grouped_authors = [
+                    str(r["author_clean"] or "")
+                    for r in leader_rows
+                    if int(r["grp_cnt"]) > 1
+                    and str(r["author_clean"] or "")
+                    and str(r["author_clean"] or "") != "model"
+                ]
+                member_map: Dict[str, List[Dict[str, Any]]] = {}
+                if grouped_authors:
+                    member_placeholders = ",".join("?" for _ in grouped_authors)
+                    member_rows = conn.execute(
+                        f"""
+                        SELECT author_clean, raw_json FROM catalog_items
+                        WHERE {where_sql} AND author_clean IN ({member_placeholders})
+                        ORDER BY author_clean ASC, published_at DESC, canonical_key ASC
+                        """,
+                        params + grouped_authors,
+                    ).fetchall()
+                    for mr in member_rows:
+                        member_author = str(mr["author_clean"] or "")
+                        member_map.setdefault(member_author, []).append(json.loads(mr["raw_json"]))
+
                 items = []
                 for r in leader_rows:
                     v = json.loads(r["raw_json"])
@@ -574,16 +600,7 @@ class CatalogService:
                     if g_cnt > 1 and author_clean and author_clean != "model":
                         v["is_grouped"] = True
                         v["group_count"] = g_cnt
-                        # Fetch all videos for this author in this revision matching filters
-                        member_rows = conn.execute(
-                            f"""
-                            SELECT raw_json FROM catalog_items
-                            WHERE {where_sql} AND author_clean = ?
-                            ORDER BY published_at DESC, canonical_key ASC
-                            """,
-                            params + [author_clean],
-                        ).fetchall()
-                        members = [json.loads(mr["raw_json"]) for mr in member_rows]
+                        members = member_map.get(author_clean, [dict(v)])
                         v["grouped_videos"] = enrich_fn(members) if enrich_fn else members
                     else:
                         v["is_grouped"] = False
