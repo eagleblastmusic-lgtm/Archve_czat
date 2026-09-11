@@ -107,14 +107,14 @@ with tempfile.TemporaryDirectory() as tmp:
             if count < 3:
                 raise Fake500(page)
             return [{"id": "after-boundary", "username": "ok", "source": "archivebate"}]
-        if page == 1002:
+        if 1002 <= page <= 1006:
             return []
         raise AssertionError(page)
 
     rev = restarted.build_revision_background({"archivebate": transient}, force=False)
     assert rev == 1, rev
     wait(restarted)
-    assert calls == [1001, 1001, 1001, 1002], calls
+    assert calls == [1001, 1001, 1001, 1002, 1003, 1004, 1005, 1006], calls
     result = restarted.query_page(revision=1)
     assert result["catalog_complete"] is True, result
     assert result["catalog_limited"] is False, result

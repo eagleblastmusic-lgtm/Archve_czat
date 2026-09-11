@@ -22,6 +22,7 @@ DEFAULT_CATALOG_DB = DATA_DIR / "catalog.db"
 # the old 1000/500 caps so large source catalogs can be indexed to their real end.
 MAX_PAGES_PER_SOURCE = {"archivebate": 1_000_000, "camwhores": 100_000}
 CAMWHORES_EMPTY_END_THRESHOLD = 5
+ARCHIVEBATE_EMPTY_END_THRESHOLD = 5
 
 
 def canonical_identity_key(video: Dict[str, Any]) -> str:
@@ -260,17 +261,29 @@ class CatalogService:
                     """
                 )
 
-                # Old builds treated the first empty Camwhores page (or a cached has_more=false)
-                # as a definitive EOF. Real-world pagination contains holes (for example page 2
-                # can be empty while page 3+ contains videos), so reopen only the newest completed
-                # revision when it still carries one of those legacy ambiguous endings. The new
-                # worker will verify the boundary with consecutive empty pages before republishing.
-                newest_complete = conn.execute(
-                    "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 "
-                    "ORDER BY revision DESC LIMIT 1"
+                # Repair sparse-page endings only on the absolute newest revision. Older completed
+                # snapshots are fallback history and must never be reopened one-by-one on subsequent
+                # application starts. A legacy Archivebate page-1000 false completion has priority:
+                # reopen that source first and leave other sources unchanged for this run.
+                latest_revision_row = conn.execute(
+                    "SELECT revision, complete, failed FROM revisions ORDER BY revision DESC LIMIT 1"
                 ).fetchone()
-                if newest_complete:
-                    newest_revision = int(newest_complete["revision"])
+                if latest_revision_row and not bool(latest_revision_row["failed"]):
+                    latest_revision = int(latest_revision_row["revision"])
+                    legacy_archivebate_cap = conn.execute(
+                        """
+                        SELECT 1 FROM source_runs
+                        WHERE revision = ?
+                          AND source = 'archivebate'
+                          AND complete = 1
+                          AND failed = 0
+                          AND cursor = 1001
+                          AND pages_scanned = 1000
+                          AND COALESCE(end_reason, '') = ''
+                        LIMIT 1
+                        """,
+                        (latest_revision,),
+                    ).fetchone()
                     legacy_camwhores = conn.execute(
                         """
                         SELECT 1 FROM source_runs
@@ -279,33 +292,58 @@ class CatalogService:
                           AND complete = 1
                           AND failed = 0
                           AND COALESCE(end_reason, '') IN ('', 'empty_page', 'cached_end')
-                          AND NOT EXISTS (
-                              SELECT 1 FROM source_runs ab
-                              WHERE ab.revision = source_runs.revision
-                                AND ab.source = 'archivebate'
-                                AND ab.complete = 1
-                                AND ab.failed = 0
-                                AND ab.cursor = 1001
-                                AND ab.pages_scanned = 1000
-                                AND COALESCE(ab.end_reason, '') = ''
-                          )
                         LIMIT 1
                         """,
-                        (newest_revision,),
+                        (latest_revision,),
                     ).fetchone()
-                    if legacy_camwhores:
+                    legacy_archivebate_sparse = conn.execute(
+                        """
+                        SELECT 1 FROM source_runs
+                        WHERE revision = ?
+                          AND source = 'archivebate'
+                          AND complete = 1
+                          AND failed = 0
+                          AND cursor < 1001
+                          AND COALESCE(end_reason, '') IN ('', 'empty_page', 'cached_end')
+                        LIMIT 1
+                        """,
+                        (latest_revision,),
+                    ).fetchone()
+
+                    if legacy_archivebate_cap:
                         now = time.time()
                         conn.execute(
                             "UPDATE revisions SET complete = 0, is_active = 0, failed = 0, error = NULL, updated_at = ? "
                             "WHERE revision = ?",
-                            (now, newest_revision),
+                            (now, latest_revision),
                         )
                         conn.execute(
                             "UPDATE source_runs SET complete = 0, failed = 0, error = NULL, "
-                            "end_reason = 'legacy_empty_recheck', updated_at = ? "
-                            "WHERE revision = ? AND source = 'camwhores'",
-                            (now, newest_revision),
+                            "end_reason = 'legacy_cap_reopened', updated_at = ? "
+                            "WHERE revision = ? AND source = 'archivebate'",
+                            (now, latest_revision),
                         )
+                    elif legacy_camwhores or legacy_archivebate_sparse:
+                        now = time.time()
+                        conn.execute(
+                            "UPDATE revisions SET complete = 0, is_active = 0, failed = 0, error = NULL, updated_at = ? "
+                            "WHERE revision = ?",
+                            (now, latest_revision),
+                        )
+                        if legacy_camwhores:
+                            conn.execute(
+                                "UPDATE source_runs SET complete = 0, failed = 0, error = NULL, "
+                                "end_reason = 'legacy_sparse_recheck', updated_at = ? "
+                                "WHERE revision = ? AND source = 'camwhores'",
+                                (now, latest_revision),
+                            )
+                        if legacy_archivebate_sparse:
+                            conn.execute(
+                                "UPDATE source_runs SET complete = 0, failed = 0, error = NULL, "
+                                "end_reason = 'legacy_sparse_recheck', updated_at = ? "
+                                "WHERE revision = ? AND source = 'archivebate'",
+                                (now, latest_revision),
+                            )
 
                 # Revision numbers are monotonic snapshots. Repair any stale is_active flag left
                 # behind by the old resume bug: the newest completed successful revision is the
@@ -1216,16 +1254,43 @@ class CatalogService:
                     continue
 
                 if not batch:
+                    # Archivebate page 1001 is a known upstream visibility boundary. It is probed
+                    # repeatedly above, then recorded as limited rather than a clean end-of-catalog.
+                    if source == "archivebate" and page == 1001:
+                        ended.add(source)
+                        reason = f"source_page_limit:empty:{page}"
+                        with self._lock:
+                            conn = self._get_conn()
+                            conn.execute(
+                                "UPDATE source_runs SET complete = 1, failed = 0, error = NULL, end_reason = ?, updated_at = ? "
+                                "WHERE revision = ? AND source = ?",
+                                (reason, time.time(), revision, source),
+                            )
+                            self._indexing_progress["source_progress"][source] = {
+                                "cursor": page,
+                                "items": source_counts[source],
+                                "complete": True,
+                                "limited": True,
+                                "limit_page": page - 1,
+                                "end_reason": reason,
+                            }
+                        continue
+
+                    # Both public catalogs have demonstrated sparse HTTP-200 pagination. Treat an
+                    # isolated empty page as a hole and require a run of empty pages before EOF.
+                    sparse_threshold = None
                     if source == "camwhores":
-                        # Camwhores can contain isolated empty HTTP-200 pages in the middle of the
-                        # catalog. A single hole must not terminate indexing. Advance durably and
-                        # require several consecutive empty pages before accepting a true end.
+                        sparse_threshold = CAMWHORES_EMPTY_END_THRESHOLD
+                    elif source == "archivebate":
+                        sparse_threshold = ARCHIVEBATE_EMPTY_END_THRESHOLD
+
+                    if sparse_threshold is not None:
                         consecutive_empty_pages[source] += 1
                         last_signatures[source] = None
                         repeated_signatures[source] = 0
                         next_page = page + 1
                         cursors[source] = next_page
-                        if consecutive_empty_pages[source] < CAMWHORES_EMPTY_END_THRESHOLD:
+                        if consecutive_empty_pages[source] < sparse_threshold:
                             with self._lock:
                                 conn = self._get_conn()
                                 conn.execute(
@@ -1243,7 +1308,7 @@ class CatalogService:
                             continue
 
                         ended.add(source)
-                        reason = f"consecutive_empty_pages:{CAMWHORES_EMPTY_END_THRESHOLD}:{page}"
+                        reason = f"consecutive_empty_pages:{sparse_threshold}:{page}"
                         with self._lock:
                             conn = self._get_conn()
                             conn.execute(
@@ -1262,11 +1327,7 @@ class CatalogService:
                         continue
 
                     ended.add(source)
-                    # Archivebate page 1001 is an upstream visibility boundary, not proof that the
-                    # service has no older videos. Preserve that distinction even when the server
-                    # answers HTTP 200 with an empty page instead of 5xx.
-                    is_archivebate_limit = source == "archivebate" and page == 1001
-                    reason = f"source_page_limit:empty:{page}" if is_archivebate_limit else "empty_page"
+                    reason = "empty_page"
                     with self._lock:
                         conn = self._get_conn()
                         conn.execute(
@@ -1274,18 +1335,15 @@ class CatalogService:
                             "WHERE revision = ? AND source = ?",
                             (reason, time.time(), revision, source),
                         )
-                        progress = {
+                        self._indexing_progress["source_progress"][source] = {
                             "cursor": page,
                             "items": source_counts[source],
                             "complete": True,
                             "end_reason": reason,
                         }
-                        if is_archivebate_limit:
-                            progress.update({"limited": True, "limit_page": page - 1})
-                        self._indexing_progress["source_progress"][source] = progress
                     continue
 
-                if source == "camwhores":
+                if source in ("camwhores", "archivebate"):
                     consecutive_empty_pages[source] = 0
 
                 # Some sites clamp out-of-range page numbers and return the same last page forever.
@@ -1354,9 +1412,10 @@ class CatalogService:
     def _read_cached_source_pages(self, source: str, max_age_seconds: float = 6 * 3600):
         """Read contiguous raw source pages and return (items, next page, count, ended).
 
-        Camwhores is sparse: isolated empty pages and has_more=false values are not reliable EOF
-        signals. For that source we require five consecutive cached empty pages. A missing/old
-        cache page always stops seeding without claiming completion so the live worker can resume.
+        Archivebate and Camwhores can contain isolated empty HTTP-200 pages. For both sources,
+        cached seeding requires consecutive empty pages instead of trusting one empty page or one
+        has_more=false value. Archivebate page 1001 is deliberately left for a live boundary probe.
+        A missing/old cache page stops seeding without claiming completion.
         """
         cache_dir = Path(FEED_CACHE_DIR)
         if not cache_dir.exists():
@@ -1364,9 +1423,10 @@ class CatalogService:
         page = 1
         collected: List[Dict[str, Any]] = []
         pages_scanned = 0
-        camwhores_empty_streak = 0
+        empty_streak = 0
         while page <= MAX_PAGES_PER_SOURCE.get(source, 1_000_000):
-            path = cache_dir / f"raw_v1_{source}_{page}.json"
+            current_page = page
+            path = cache_dir / f"raw_v1_{source}_{current_page}.json"
             data, _ = read_json_cache(str(path))
             if not isinstance(data, dict) or not isinstance(data.get("items"), list):
                 break
@@ -1377,20 +1437,30 @@ class CatalogService:
             if fetched_at and time.time() - fetched_at > max_age_seconds:
                 break
             batch = data.get("items") or []
+
+            # Never consume a cached empty Archivebate page 1001 as EOF. Let the live worker probe
+            # the known upstream boundary so catalog_limited remains truthful.
+            if source == "archivebate" and current_page == 1001 and not batch:
+                return collected, 1001, pages_scanned, False
+
             collected.extend(item for item in batch if isinstance(item, dict))
             pages_scanned += 1
             has_more = data.get("has_more")
-            page += 1
+            page = current_page + 1
 
-            if source == "camwhores":
+            if source in ("camwhores", "archivebate"):
+                threshold = (
+                    CAMWHORES_EMPTY_END_THRESHOLD
+                    if source == "camwhores"
+                    else ARCHIVEBATE_EMPTY_END_THRESHOLD
+                )
                 if batch:
-                    camwhores_empty_streak = 0
+                    empty_streak = 0
                 else:
-                    camwhores_empty_streak += 1
-                    if camwhores_empty_streak >= CAMWHORES_EMPTY_END_THRESHOLD:
+                    empty_streak += 1
+                    if empty_streak >= threshold:
                         return collected, page, pages_scanned, True
-                # Do not trust one cached has_more=false for Camwhores; page 2 can be empty while
-                # later pages contain videos. Continue only through actually present fresh files.
+                # A single has_more=false is not a trustworthy boundary for sparse sources.
                 continue
 
             if not batch or has_more is False:

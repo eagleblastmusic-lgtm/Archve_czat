@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory() as tmp:
         calls.append(page)
         if page == 1001:
             return [{"id": "after_1000", "username": "resume"}]
-        if page == 1002:
+        if 1002 <= page <= 1006:
             return []
         raise AssertionError(f"unexpected page {page}")
 
@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert restarted._indexing_progress.get("resumed") is True
     wait(restarted)
     result = restarted.query_page(revision=7)
-    assert calls == [1001, 1002], calls
+    assert calls == [1001, 1002, 1003, 1004, 1005, 1006], calls
     assert result["catalog_complete"] is True, result
     assert result["video_count"] == 2, result
     # Once complete, a normal startup must reuse it rather than start another full scan.

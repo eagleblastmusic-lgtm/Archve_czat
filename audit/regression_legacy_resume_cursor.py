@@ -84,7 +84,7 @@ with tempfile.TemporaryDirectory() as tmp:
         calls.append(page)
         if page == 37:
             return [{"id": "page37", "username": "partial", "source": "archivebate"}]
-        if page == 38:
+        if 38 <= page <= 42:
             return []
         raise AssertionError(page)
 
@@ -92,7 +92,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert rev == 22, rev
     assert restarted._indexing_progress.get("legacy_cursor_repaired") is False
     wait(restarted)
-    assert calls == [37, 38], calls
+    assert calls == [37, 38, 39, 40, 41, 42], calls
     restarted.close()
 
 print("PASS: reopened legacy Archivebate cursor is repaired to 1001 without touching normal partial resumes")
