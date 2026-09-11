@@ -50,6 +50,8 @@ jobs:
         run: python audit/regression_feed.py
       - name: Catalog bootstrap regression
         run: python audit/regression_catalog_bootstrap.py
+      - name: Catalog read concurrency regression
+        run: python audit/regression_catalog_read_concurrency.py
       - name: Integration regression
         run: python audit/regression_integration.py
       - name: Storyboard package-D regression
