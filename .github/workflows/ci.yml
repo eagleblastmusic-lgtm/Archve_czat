@@ -58,6 +58,10 @@ jobs:
         run: python audit/regression_catalog_resume.py
       - name: Catalog revision monotonicity regression
         run: python audit/regression_catalog_revision_monotonicity.py
+      - name: Latest-only sparse migration scope regression
+        run: python audit/regression_latest_sparse_migration_scope.py
+      - name: Archivebate sparse pagination regression
+        run: python audit/regression_archivebate_sparse_pagination.py
       - name: Camwhores sparse pagination regression
         run: python audit/regression_camwhores_sparse_pagination.py
       - name: Legacy resume cursor regression
