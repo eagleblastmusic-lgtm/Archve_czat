@@ -60,6 +60,8 @@ jobs:
         run: python audit/regression_legacy_resume_cursor.py
       - name: Archivebate true-end regression
         run: python audit/regression_archivebate_true_end.py
+      - name: Archivebate source-limit regression
+        run: python audit/regression_archivebate_source_limit.py
       - name: Grouped feed batch-query regression
         run: python audit/regression_grouped_query_batch.py
       - name: Catalog read concurrency regression
