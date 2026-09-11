@@ -13,6 +13,7 @@
   let updateAllAuthorNameColors;
   let updateBlockedModelsCount;
   let userStatusRetryCount = 0;
+  let accountBootstrapStarted = false;
 
   function init(dependencies = {}) {
     showToast = dependencies.showToast;
@@ -48,10 +49,25 @@
     });
   }
 
+  async function refreshAccountBootstrap(baseStatus) {
+    if (accountBootstrapStarted || !baseStatus || (!baseStatus.logged_in && !baseStatus.last_synced)) return;
+    accountBootstrapStarted = true;
+    try {
+      const summary = await ArchivebateAPI.getJSON('/api/account/summary', { timeoutMs: 120000 });
+      updateUserStatus({ ...baseStatus, ...summary });
+      if (global.ArchivebateHomeStats && typeof global.ArchivebateHomeStats.update === 'function') {
+        await global.ArchivebateHomeStats.update();
+      }
+    } catch (e) {
+      accountBootstrapStarted = false;
+    }
+  }
+
   async function initUserStatus() {
     try {
       const data = await ArchivebateAPI.getJSON('/api/status', { timeoutMs: 5000 });
       updateUserStatus(data);
+      void refreshAccountBootstrap(data);
 
       if (data.account_configured && !data.logged_in && !data.login_error && userStatusRetryCount < 5) {
         userStatusRetryCount += 1;
@@ -131,6 +147,9 @@
       if (data.success) {
         showToast(`Pobrano: ${data.favorites_count} ulubionych, ${data.history_count} historii, ${data.following_count} obserwowanych!`, 'success');
         updateUserStatus(data);
+        if (global.ArchivebateHomeStats && typeof global.ArchivebateHomeStats.update === 'function') {
+          await global.ArchivebateHomeStats.update();
+        }
         if (state.mode === 'favorites') loadFavorites(1);
         if (state.mode === 'history') loadHistory(1);
         if (state.mode === 'following') loadFollowing(1);

@@ -53,7 +53,10 @@ class UserStorage:
             "favorites": [],
             "history": [],
             "following": [],
-            "last_synced": None
+            "last_synced": None,
+            "blocked_models": [],
+            "blocked_model_video_counts": {},
+            "blocked_videos_total": 0,
         }
         self.load()
 
@@ -65,7 +68,11 @@ class UserStorage:
                     with open(STORE_FILE, "r", encoding="utf-8") as f:
                         loaded = json.load(f)
                     if isinstance(loaded, dict):
-                        self.data = loaded
+                        # Zachowaj pełny lokalny schemat także dla starszych plików,
+                        # które nie miały jeszcze pól blokowania.
+                        normalized = dict(self.data)
+                        normalized.update(loaded)
+                        self.data = normalized
                 except Exception as e:
                     logger.error(f"Błąd odczytu magazynu danych: {e}")
 

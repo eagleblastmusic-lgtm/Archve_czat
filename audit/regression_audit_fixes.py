@@ -114,3 +114,83 @@ assert not (ROOT / "audit/performance_results.json").exists()
 assert (ROOT / "audit/historical/frontend_results.legacy.json").exists()
 assert (ROOT / "audit/historical/performance_results.legacy.json").exists()
 print("PASS audit-fix 9: stale diagnostics segregated from release evidence")
+
+
+# 10. Older stores are schema-normalized and account sync preserves local-only block fields.
+import json as _json
+with tempfile.TemporaryDirectory() as td, patch.object(storage_mod, "STORE_FILE", str(Path(td) / "user_store.json")):
+    Path(storage_mod.STORE_FILE).write_text(_json.dumps({
+        "favorites": [{"id": "fav-1", "username": "alpha"}],
+        "history": [{"id": "hist-1", "username": "beta"}],
+        "following": [{"id": "fol-1", "username": "gamma"}],
+        "last_synced": "legacy",
+    }), encoding="utf-8")
+    legacy_store = storage_mod.UserStorage()
+    assert legacy_store.data["blocked_models"] == []
+    assert legacy_store.data["blocked_model_video_counts"] == {}
+    assert legacy_store.data["blocked_videos_total"] == 0
+    legacy_store.data["blocked_models"] = ["KeepBlocked"]
+    legacy_store.data["blocked_model_video_counts"] = {"keepblocked": 7}
+    legacy_store.data["blocked_videos_total"] = 7
+    legacy_store.merge_remote_data([], [], [])
+    assert legacy_store.get_blocked_models() == ["KeepBlocked"]
+    assert legacy_store.get_blocked_stats()["blocked_videos_total"] == 7
+print("PASS audit-fix 10: legacy user-store schema is normalized and local-only block state survives sync")
+
+# 11. Account outcomes contain a complete UI status contract and bootstrap refresh is wired.
+main.session.email = "configured@example.invalid"
+main.session.password = "configured"
+main.session.is_logged_in = True
+account_counts = main._account_counts()
+for required in ("email", "logged_in", "account_configured", "favorites_count", "history_count", "following_count", "last_synced", "favorite_authors"):
+    assert required in account_counts, required
+account_js = (ROOT / "static/account.js").read_text(encoding="utf-8")
+assert "/api/account/summary" in account_js
+assert "refreshAccountBootstrap" in account_js
+assert "ArchivebateHomeStats.update" in account_js
+print("PASS audit-fix 11: account bootstrap refreshes complete UI counters after sync")
+
+# 12. A feed stream pinned to an incomplete revision switches to a newly published revision.
+class _PublishedRevisionFixture:
+    _indexing_progress = {"is_indexing": False}
+
+    def get_active_revision(self):
+        return 2
+
+    def is_revision_complete(self, revision):
+        return revision == 2
+
+    def query_page(self, **kwargs):
+        revision = kwargs.get("revision")
+        complete = revision == 2
+        return {
+            "catalog_revision": revision,
+            "revision": revision,
+            "snapshot_id": str(revision),
+            "updated_at": float(revision),
+            "video_count": 1 if complete else 0,
+            "group_count": 1 if complete else 0,
+            "page_count": 1,
+            "catalog_complete": complete,
+            "complete": complete,
+            "indexing_progress": {"is_indexing": False},
+            "items": [{"id": "published"}] if complete else [],
+            "videos": [{"id": "published"}] if complete else [],
+            "source_error": {},
+        }
+
+fixture_service = _PublishedRevisionFixture()
+with patch.object(catalog_mod, "catalog_service", fixture_service):
+    response = main.progressive_feed_stream(snapshot_id="1", page=1, revision=1)
+
+    async def _first_stream_item():
+        async for item in response.body_iterator:
+            return item
+        raise AssertionError("stream yielded no item")
+
+    first = asyncio.run(_first_stream_item())
+    if isinstance(first, bytes):
+        first = first.decode("utf-8")
+    assert '"catalog_revision": 2' in first, first
+    assert '"catalog_complete": true' in first.lower(), first
+print("PASS audit-fix 12: partial feed stream follows the newly published catalog revision")

@@ -52,10 +52,14 @@ _account_sync_lock = threading.Lock()
 
 def _account_counts() -> dict:
     return {
+        "email": session.email,
+        "logged_in": session.is_logged_in,
+        "account_configured": bool(session.email and session.password),
         "favorites_count": len(storage.get_favorites()),
         "history_count": len(storage.get_history()),
         "following_count": len(storage.get_following()),
         "last_synced": storage.data.get("last_synced"),
+        "favorite_authors": storage.get_favorite_authors(),
     }
 
 
@@ -526,12 +530,8 @@ async def get_account_summary():
     if not storage.data.get("last_synced"):
         await _ensure_account_synced()
     return {
-        "email": session.email,
-        "logged_in": session.is_logged_in,
-        "favorites_count": len(storage.data.get("favorites", [])),
-        "history_count": len(storage.data.get("history", [])),
-        "following_count": len(storage.data.get("following", [])),
-        "last_synced": storage.data.get("last_synced")
+        **_account_counts(),
+        **storage.get_blocked_stats(),
     }
 
 @app.get("/api/account/favorites")
@@ -1140,8 +1140,20 @@ def progressive_feed_stream(
             previous = None
             deadline = time.monotonic() + 120
             idle_since = None
+            current_rev = rev_to_check
             while time.monotonic() < deadline:
-                current_rev = rev_to_check
+                # A partial revision may have been the best local snapshot when
+                # the request started. Once a newer revision is atomically
+                # published, follow it instead of keeping the stream pinned to
+                # a stale partial generation until it reports source_error.
+                published_rev = _published_catalog_revision(catalog_service)
+                if (
+                    published_rev is not None
+                    and published_rev != current_rev
+                    and not catalog_service.is_revision_complete(current_rev)
+                ):
+                    current_rev = published_rev
+                    idle_since = None
                 data = await asyncio.to_thread(
                     catalog_service.query_page,
                     page=page,
