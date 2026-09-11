@@ -1,0 +1,73 @@
+name: UI runtime hotfix
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-and-commit:
+    if: github.event.head_commit.message == 'ci: launch UI runtime hotfix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Apply focused UI runtime fix
+        run: python tools/apply_ui_runtime_fix.py
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile Python
+        run: python -m compileall -q .
+      - name: Consolidated audit-fix regressions
+        run: python audit/regression_audit_fixes.py
+      - name: Core backend regression
+        run: python audit/regression_checks.py
+      - name: Frontend regression
+        run: node audit/regression_frontend.cjs
+      - name: Pagination regression
+        run: node audit/regression_pagination.cjs
+      - name: Search filter regression
+        run: node audit/regression_search_filters.cjs
+      - name: Search backend pagination regression
+        run: python audit/regression_search_pagination.py
+      - name: Storyboard client regression
+        run: node audit/regression_storyboard_client.cjs
+      - name: Storyboard cross-tab regression
+        run: node audit/regression_storyboard_cross_tab.cjs
+      - name: Catalog partial frontend regression
+        run: node audit/regression_catalog_partial_frontend.cjs
+      - name: Feed regression
+        run: python audit/regression_feed.py
+      - name: Catalog bootstrap regression
+        run: python audit/regression_catalog_bootstrap.py
+      - name: Integration regression
+        run: python audit/regression_integration.py
+      - name: Storyboard package-D regression
+        run: python audit/regression_package_d.py
+      - name: Unit tests
+        run: python -m unittest test_suite -q
+
+      - name: Finalize qualified hotfix
+        run: |
+          git rm tools/apply_ui_runtime_fix.py
+          git config user.name 'eagleblastmusic-lgtm'
+          git config user.email 'eagleblastmusic@gmail.com'
+          git add static/home-stats.js static/video-views.js static/pagination.js static/app-events.js static/video-prefetch.js static/video-grid.js audit/regression_pagination.cjs audit/regression_frontend.cjs
+          git diff --cached --check
+          git commit -m 'fix: stabilize catalog UI pagination and thumbnail loading'
+          git push origin HEAD:master
