@@ -53,11 +53,11 @@ jobs:
         run: node audit/regression_frontend.cjs
       - name: Diff check
         run: git diff --check
-      - name: Commit qualified integration
+      - name: Commit qualified app integration
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add main.py .github/workflows/ci.yml
+          git add main.py
           git diff --cached --quiet && exit 0
           git commit -m "feat: start durable Deep Archivebate crawler"
           git push origin HEAD:master
