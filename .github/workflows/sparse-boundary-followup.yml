@@ -60,7 +60,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add catalog_service.py audit/regression_archivebate_sparse_pagination.py audit/regression_latest_sparse_migration_scope.py audit/regression_catalog_resume.py audit/regression_legacy_resume_cursor.py
+          git add catalog_service.py audit/regression_archivebate_sparse_pagination.py audit/regression_latest_sparse_migration_scope.py audit/regression_catalog_resume.py audit/regression_legacy_resume_cursor.py audit/regression_archivebate_source_limit.py
           git diff --cached --quiet && exit 0
           git commit -m "fix: make sparse pagination migration latest-only"
           git push origin HEAD:master
