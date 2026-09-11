@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - tools/apply_catalog_integrity_fix.py
+      - tools/fix_catalog_hotfix_active_normalization.py
       - .github/workflows/catalog-integrity-hotfix.yml
 
 permissions:
@@ -29,38 +30,7 @@ jobs:
       - name: Apply guarded patch
         run: python tools/apply_catalog_integrity_fix.py
       - name: Preserve active partial when no completed snapshot exists
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("catalog_service.py")
-          text = path.read_text(encoding="utf-8")
-          old = '''                conn.execute("UPDATE revisions SET is_active = 0")
-                best_complete = conn.execute(
-                    "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 "
-                    "ORDER BY revision DESC LIMIT 1"
-                ).fetchone()
-                if best_complete:
-                    conn.execute(
-                        "UPDATE revisions SET is_active = 1 WHERE revision = ?",
-                        (int(best_complete["revision"]),),
-                    )
-'''
-          new = '''                best_complete = conn.execute(
-                    "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 "
-                    "ORDER BY revision DESC LIMIT 1"
-                ).fetchone()
-                if best_complete:
-                    conn.execute("UPDATE revisions SET is_active = 0")
-                    conn.execute(
-                        "UPDATE revisions SET is_active = 1 WHERE revision = ?",
-                        (int(best_complete["revision"]),),
-                    )
-'''
-          if text.count(old) != 1:
-              raise SystemExit(f"active-normalization patch expected 1 match, found {text.count(old)}")
-          path.write_text(text.replace(old, new, 1), encoding="utf-8")
-          PY
+        run: python tools/fix_catalog_hotfix_active_normalization.py
       - name: Compile Python
         run: python -m compileall -q .
       - name: Revision monotonicity regression
