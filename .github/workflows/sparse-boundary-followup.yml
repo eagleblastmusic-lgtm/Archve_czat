@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - tools/apply_sparse_boundary_followup.py
+      - tools/fix_sparse_legacy_cap_priority.py
       - tools/update_sparse_resume_regression.py
       - .github/workflows/sparse-boundary-followup.yml
 
@@ -29,6 +30,8 @@ jobs:
           pip install -r requirements.txt
       - name: Apply guarded follow-up
         run: python tools/apply_sparse_boundary_followup.py
+      - name: Preserve legacy Archivebate cap sequencing
+        run: python tools/fix_sparse_legacy_cap_priority.py
       - name: Align durable resume regressions
         run: python tools/update_sparse_resume_regression.py
       - name: Compile Python
