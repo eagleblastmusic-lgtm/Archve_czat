@@ -421,7 +421,7 @@ class DeepArchivebateService:
                 """
                 SELECT * FROM archivebate_models
                 WHERE crawl_complete = 0
-                ORDER BY priority DESC, updated_at ASC, pages_scanned ASC, model_key ASC
+                ORDER BY priority DESC, pages_scanned DESC, updated_at ASC, model_key ASC
                 LIMIT 1
                 """
             ).fetchone()

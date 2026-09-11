@@ -98,4 +98,46 @@ with tempfile.TemporaryDirectory() as td:
     deep.close()
     catalog.close()
 
+
+# Progressed profiles must be continued before fresh shallow profiles of the same
+# priority, otherwise a continuously growing discovery queue starves page 2+ forever.
+class SelectionScraper:
+    def __init__(self):
+        self._cache = {}
+        self.profile_calls = []
+
+    def get_archivebate_model_videos(self, username, page=1):
+        self.profile_calls.append((username, page))
+        return []
+
+
+with tempfile.TemporaryDirectory() as td:
+    db = Path(td) / "catalog.db"
+    catalog = CatalogService(db)
+    deep = DeepArchivebateService(db, request_delay=0.01)
+    conn = deep._get_conn()
+    conn.execute(
+        """
+        INSERT INTO archivebate_models(
+            model_key, username, profile_url, discovered_from, priority,
+            first_seen, updated_at, next_page, pages_scanned, videos_found,
+            empty_streak, repeated_signatures, crawl_complete
+        ) VALUES('deepmodel', 'deep_model', '', 'test', 200, 1, 10, 4, 3, 60, 0, 0, 0)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO archivebate_models(
+            model_key, username, profile_url, discovered_from, priority,
+            first_seen, updated_at, next_page, pages_scanned, videos_found,
+            empty_streak, repeated_signatures, crawl_complete
+        ) VALUES('shallowmodel', 'shallow_model', '', 'test', 200, 1, 1, 1, 0, 0, 0, 0, 0)
+        """
+    )
+    fake = SelectionScraper()
+    assert deep.crawl_step(fake) is True
+    assert fake.profile_calls[0] == ('deep_model', 4), fake.profile_calls
+    deep.close()
+    catalog.close()
+
 print("PASS: Archivebate deep discovery is durable and historical profile items merge into the live catalog")
