@@ -27,7 +27,9 @@ with patch.object(catalog, "FEED_CACHE_DIR", raw):
     result = service.query_page()
     assert result["catalog_complete"] is True
     assert result["video_count"] == 2
-    assert calls == [2], calls
+    # Archivebate can contain isolated empty HTTP-200 pages, so bootstrap must verify
+    # five consecutive empties before accepting normal EOF.
+    assert calls == [2, 3, 4, 5, 6], calls
     service.close()
 
-print("PASS: catalog bootstrap seeds fresh raw pages and resumes at the next source page")
+print("PASS: catalog bootstrap seeds fresh raw pages and resumes through verified sparse EOF")
