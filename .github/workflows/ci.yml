@@ -34,6 +34,8 @@ jobs:
         run: python audit/regression_checks.py
       - name: Frontend regression
         run: node audit/regression_frontend.cjs
+      - name: Block without reload regression
+        run: node audit/regression_block_no_reload.cjs
       - name: Pagination regression
         run: node audit/regression_pagination.cjs
       - name: Search filter regression
