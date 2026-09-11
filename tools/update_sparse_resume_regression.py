@@ -34,4 +34,22 @@ if text.count(old) != 1:
 text = text.replace(old, new, 1)
 path.write_text(text, encoding="utf-8")
 
-print("Updated durable and legacy resume regressions for Archivebate sparse EOF verification")
+# A transient page-1001 HTTP failure that later recovers is not a source limit. After recovery,
+# Archivebate still requires five consecutive empty pages before accepting normal EOF.
+path = Path("audit/regression_archivebate_source_limit.py")
+text = path.read_text(encoding="utf-8")
+
+old = '''        if page == 1002:\n            return []\n        raise AssertionError(page)\n'''
+new = '''        if 1002 <= page <= 1006:\n            return []\n        raise AssertionError(page)\n'''
+if text.count(old) != 1:
+    raise SystemExit(f"source-limit fetch expectation patch expected 1 match, found {text.count(old)}")
+text = text.replace(old, new, 1)
+
+old = '''    assert calls == [1001, 1001, 1001, 1002], calls\n'''
+new = '''    assert calls == [1001, 1001, 1001, 1002, 1003, 1004, 1005, 1006], calls\n'''
+if text.count(old) != 1:
+    raise SystemExit(f"source-limit call expectation patch expected 1 match, found {text.count(old)}")
+text = text.replace(old, new, 1)
+path.write_text(text, encoding="utf-8")
+
+print("Updated resume/source-limit regressions for Archivebate sparse EOF verification")
