@@ -56,6 +56,10 @@ jobs:
         run: python audit/regression_catalog_bootstrap.py
       - name: Catalog durable resume regression
         run: python audit/regression_catalog_resume.py
+      - name: Catalog revision monotonicity regression
+        run: python audit/regression_catalog_revision_monotonicity.py
+      - name: Camwhores sparse pagination regression
+        run: python audit/regression_camwhores_sparse_pagination.py
       - name: Legacy resume cursor regression
         run: python audit/regression_legacy_resume_cursor.py
       - name: Archivebate true-end regression
