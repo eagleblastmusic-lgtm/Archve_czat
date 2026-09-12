@@ -85,6 +85,24 @@
     }
   }
 
+  const pendingChunkTimers = new Set();
+
+  function cancelPendingChunks() {
+    pendingChunkTimers.forEach(timer => clearTimeout(timer));
+    pendingChunkTimers.clear();
+    state.gridPendingTimers = pendingChunkTimers;
+  }
+
+  function scheduleChunk(callback) {
+    const timer = setTimeout(() => {
+      pendingChunkTimers.delete(timer);
+      callback();
+    }, 0);
+    pendingChunkTimers.add(timer);
+    state.gridPendingTimers = pendingChunkTimers;
+    return timer;
+  }
+
   // ELIMINACJA DUPLIKATÓW
   function deduplicateVideos(videos) {
     const seen = new Map();
@@ -141,6 +159,7 @@
   function replaceView(videos, options = {}) {
     if (!dom.videoGrid) return;
 
+    cancelPendingChunks();
     state.gridController?.abort();
     state.gridController = typeof AbortController !== 'undefined' ? new AbortController() : null;
 
@@ -179,7 +198,9 @@
 
     initial.forEach((v, idx) => {
       const card = createVideoCardFn(v, idx);
+      if (!card) return;
       const key = getVideoKey(v);
+      card._cardKey = key;
       if (key && state.gridCardMap) state.gridCardMap.set(key, card);
       firstFragment.appendChild(card);
     });
@@ -195,7 +216,9 @@
       for (let i = cursor; i < end; i += 1) {
         const v = displayVideos[i];
         const card = createVideoCardFn(v, i);
+        if (!card) continue;
         const key = getVideoKey(v);
+        card._cardKey = key;
         if (key && state.gridCardMap) state.gridCardMap.set(key, card);
         fragment.appendChild(card);
       }
@@ -205,7 +228,7 @@
       if (cursor < displayVideos.length) {
         // Gwarantowany kolejny tick zamiast requestIdleCallback: przy ciężkim
         // ładowaniu miniatur idle callback potrafił zbyt długo nie dostać czasu.
-        setTimeout(appendNextChunk, 0);
+        scheduleChunk(appendNextChunk);
       } else {
         updateCheckpointUIFn();
         checkAndHighlightCheckpointFn();
@@ -213,7 +236,7 @@
     };
 
     if (cursor < displayVideos.length) {
-      setTimeout(appendNextChunk, 0);
+      scheduleChunk(appendNextChunk);
     }
   }
 
@@ -221,6 +244,11 @@
   function reconcilePage(videos, options = {}) {
     if (!dom.videoGrid) return;
     if (!videos || !Array.isArray(videos)) return;
+
+    // Reconciliation is authoritative for the current view. Any deferred chunk from an older
+    // replace must be cancelled first or it can append stale cards after this pass.
+    cancelPendingChunks();
+    state.gridGeneration = (state.gridGeneration || 0) + 1;
 
     if (videos.length === 0 && state.gridCardMap && state.gridCardMap.size > 0) {
       return;
@@ -267,6 +295,7 @@
         }
       } else {
         const card = createVideoCardFn(v, idx);
+        if (!card) return;
         if (card && typeof card === 'object') {
           card._cardKey = key;
         }
@@ -308,9 +337,10 @@
   // STOPNIOWE DOKŁADANIE KAFELKÓW W CZASIE RZECZYWISTYM
   function appendVideoBatch(videos) {
     if (!videos || videos.length === 0 || !dom.videoGrid) return;
+    cancelPendingChunks();
     const existingDomIds = new Set(
       Array.from(dom.videoGrid.querySelectorAll('.video-card, .skeleton-card'))
-        .map(el => el.dataset?.videoId || el.getAttribute?.('data-video-id'))
+        .map(el => el._cardKey || getVideoKey(el._videoData || { id: el.dataset?.videoId, source: el.dataset?.source }))
         .filter(Boolean)
     );
 
@@ -318,12 +348,14 @@
     let currentCount = dom.videoGrid.children ? dom.videoGrid.children.length : 0;
 
     videos.forEach((v) => {
-      if (!v || !v.id) return;
-      const vid = String(v.id);
+      const vid = getVideoKey(v);
+      if (!v || !vid) return;
       if (existingDomIds.has(vid)) return;
       existingDomIds.add(vid);
 
       const card = createVideoCardFn(v, currentCount++);
+      if (!card) return;
+      card._cardKey = vid;
       if (card && card.classList) card.classList.add('stream-appear');
       const key = getVideoKey(v);
       if (key && state.gridCardMap) state.gridCardMap.set(key, card);
@@ -347,6 +379,7 @@
     render: renderVideoGrid,
     renderVideoGrid,
     replaceView,
+    cancelPendingChunks,
     reconcilePage,
     getVideoKey,
     append: appendVideoBatch,

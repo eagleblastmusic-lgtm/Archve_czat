@@ -424,7 +424,7 @@
       <video id="mainPlayer" playsinline></video>
 
       <!-- Center Play Overlay -->
-      <div class="center-play-overlay" id="centerPlayOverlay">
+      <div class="center-play-overlay" id="centerPlayOverlay" role="button" tabindex="0" aria-label="Odtwórz film">
         <div class="center-play-btn"><i class="fa-solid fa-play"></i></div>
       </div>
 
@@ -442,7 +442,7 @@
       <!-- Custom Controls Bar -->
       <div class="custom-controls-bar" id="customControlsBar">
         <!-- TIMELINE CONTAINER -->
-        <div class="timeline-container" id="timelineContainer">
+        <div class="timeline-container" id="timelineContainer" role="slider" tabindex="0" aria-label="Pozycja filmu" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00 / 0:00">
           <!-- Floating Tooltip Preview -->
           <div class="timeline-preview-tooltip" id="timelineTooltip">
             <div class="preview-video-box" id="timelinePreviewBox">
@@ -464,23 +464,23 @@
         <!-- CONTROLS ROW -->
         <div class="controls-row">
           <div class="controls-left">
-            <button class="ctrl-btn" id="ctrlPlayBtn" title="Odtwórz / Wstrzymaj (Spacja)"><i class="fa-solid fa-play"></i></button>
-            <button class="ctrl-btn" id="ctrlRewindBtn" title="Cofnij 10s (←)"><i class="fa-solid fa-rotate-left"></i></button>
-            <button class="ctrl-btn" id="ctrlForwardBtn" title="Do przodu 10s (→)"><i class="fa-solid fa-rotate-right"></i></button>
+            <button class="ctrl-btn" id="ctrlPlayBtn" aria-label="Odtwórz film (Spacja)" aria-pressed="false" title="Odtwórz / Wstrzymaj (Spacja)"><i class="fa-solid fa-play"></i></button>
+            <button class="ctrl-btn" id="ctrlRewindBtn" aria-label="Cofnij 10 sekund" title="Cofnij 10s (←)"><i class="fa-solid fa-rotate-left"></i></button>
+            <button class="ctrl-btn" id="ctrlForwardBtn" aria-label="Przejdź 10 sekund do przodu" title="Do przodu 10s (→)"><i class="fa-solid fa-rotate-right"></i></button>
             
             <!-- Volume -->
             <div class="volume-box">
-              <button class="ctrl-btn" id="ctrlVolumeBtn" title="Wycisz (M)"><i class="fa-solid fa-volume-high"></i></button>
-              <input type="range" class="volume-slider" id="ctrlVolumeSlider" min="0" max="1" step="0.05" value="1">
+              <button class="ctrl-btn" id="ctrlVolumeBtn" aria-label="Wycisz (M)" aria-pressed="false" title="Wycisz (M)"><i class="fa-solid fa-volume-high"></i></button>
+              <input type="range" class="volume-slider" id="ctrlVolumeSlider" aria-label="Głośność" min="0" max="1" step="0.05" value="1">
             </div>
 
             <span class="time-display" id="ctrlTimeDisplay">00:00 / 00:00</span>
           </div>
 
           <div class="controls-right">
-            <button class="ctrl-btn speed-btn" id="ctrlSpeedBtn" title="Prędkość odtwarzania">1x</button>
-            <button class="ctrl-btn" id="ctrlPipBtn" title="Obraz w obrazie"><i class="fa-solid fa-clone"></i></button>
-            <button class="ctrl-btn" id="ctrlFullscreenBtn" title="Pełny ekran (F)"><i class="fa-solid fa-expand"></i></button>
+            <button class="ctrl-btn speed-btn" id="ctrlSpeedBtn" aria-label="Prędkość odtwarzania: 1x" title="Prędkość odtwarzania">1x</button>
+            <button class="ctrl-btn" id="ctrlPipBtn" aria-label="Włącz obraz w obrazie" title="Obraz w obrazie"><i class="fa-solid fa-clone"></i></button>
+            <button class="ctrl-btn" id="ctrlFullscreenBtn" aria-label="Pełny ekran (F)" aria-pressed="false" title="Pełny ekran (F)"><i class="fa-solid fa-expand"></i></button>
           </div>
         </div>
       </div>
@@ -505,6 +505,7 @@
   </main>
 
   <script src="/static/api-client.js?v=1"></script>
+  <script src="/static/dom-utils.js?v=1"></script>
   <script src="/static/performance.js?v=1"></script>
   <script src="/static/player-core.js?v=2.2"></script>
   <script src="/static/youtube-storyboard.js?v=3.0"></script>
@@ -546,6 +547,10 @@
     const downloadBtn = document.getElementById('downloadBtn');
     const originalBtn = document.getElementById('originalBtn');
 
+    const safeUrl = (value) => window.ArchivebateDOM?.safeUrl
+      ? window.ArchivebateDOM.safeUrl(value)
+      : (/^(?:https?:\/\/|\/(?!\/)|#)/i.test(String(value || '').trim()) ? String(value).trim() : '');
+
     let currentDetails = null;
     let isDraggingTimeline = false;
     let idleTimeout = null;
@@ -575,18 +580,27 @@
 
     player.addEventListener('play', () => {
       ctrlPlayBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
+      ctrlPlayBtn.setAttribute('aria-label', 'Pauza (Spacja)');
+      ctrlPlayBtn.setAttribute('aria-pressed', 'true');
       centerPlayOverlay.style.display = 'none';
       resetIdleTimer();
     });
 
     player.addEventListener('pause', () => {
       ctrlPlayBtn.innerHTML = '<i class="fa-solid fa-play"></i>';
+      ctrlPlayBtn.setAttribute('aria-label', 'Odtwórz film (Spacja)');
+      ctrlPlayBtn.setAttribute('aria-pressed', 'false');
       centerPlayOverlay.style.display = 'flex';
       controlsBar.classList.remove('idle');
       clearTimeout(idleTimeout);
     });
 
     centerPlayOverlay.addEventListener('click', togglePlay);
+    centerPlayOverlay.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      togglePlay();
+    });
     player.addEventListener('click', togglePlay);
     ctrlPlayBtn.addEventListener('click', togglePlay);
 
@@ -598,6 +612,14 @@
       player.currentTime = Math.min(player.duration || 0, player.currentTime + 10);
     });
 
+    function updateTimelineAria() {
+      const duration = Number.isFinite(player.duration) && player.duration > 0 ? player.duration : 0;
+      const current = duration ? Math.max(0, Math.min(duration, Number(player.currentTime) || 0)) : 0;
+      const percent = duration ? (current / duration) * 100 : 0;
+      timelineContainer.setAttribute('aria-valuenow', String(Math.round(percent)));
+      timelineContainer.setAttribute('aria-valuetext', `${formatTime(current)} / ${formatTime(duration)}`);
+    }
+
     // Time update & Progress
     player.addEventListener('timeupdate', () => {
       if (!isDraggingTimeline && player.duration) {
@@ -606,6 +628,7 @@
         timelineThumb.style.left = `${percent}%`;
         ctrlTimeDisplay.innerText = `${formatTime(player.currentTime)} / ${formatTime(player.duration)}`;
       }
+      updateTimelineAria();
     });
 
     // Buffer update
@@ -769,28 +792,58 @@
       timelineTooltip.style.display = 'none';
       if (previewVideo) previewVideo.style.display = 'none';
     });
+    timelineContainer.addEventListener('keydown', (e) => {
+      const duration = Number.isFinite(player.duration) && player.duration > 0 ? player.duration : 0;
+      if (!duration) return;
+      let nextTime = null;
+      if (e.key === 'ArrowLeft') nextTime = Math.max(0, (Number(player.currentTime) || 0) - 5);
+      else if (e.key === 'ArrowRight') nextTime = Math.min(duration, (Number(player.currentTime) || 0) + 5);
+      else if (e.key === 'Home') nextTime = 0;
+      else if (e.key === 'End') nextTime = duration;
+      if (nextTime === null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      player.currentTime = nextTime;
+      updateTimelineAria();
+    });
 
     // Volume
     ctrlVolumeSlider.addEventListener('input', (e) => {
       player.volume = parseFloat(e.target.value);
       player.muted = (player.volume === 0);
+      if (player.volume > 0) player._archivebateLastVolume = player.volume;
       updateVolumeIcon();
     });
 
     ctrlVolumeBtn.addEventListener('click', () => {
-      player.muted = !player.muted;
+      if (player.muted || player.volume === 0) {
+        player.volume = Math.max(0.05, Math.min(1, Number(player._archivebateLastVolume) || 0.8));
+        player.muted = false;
+      } else {
+        player._archivebateLastVolume = player.volume;
+        player.muted = true;
+      }
       updateVolumeIcon();
     });
 
     function updateVolumeIcon() {
       if (player.muted || player.volume === 0) {
         ctrlVolumeBtn.innerHTML = '<i class="fa-solid fa-volume-xmark"></i>';
+        ctrlVolumeBtn.setAttribute('aria-label', 'Włącz dźwięk (M)');
+        ctrlVolumeBtn.setAttribute('aria-pressed', 'true');
       } else if (player.volume < 0.5) {
         ctrlVolumeBtn.innerHTML = '<i class="fa-solid fa-volume-low"></i>';
+        ctrlVolumeBtn.setAttribute('aria-label', 'Wycisz (M)');
+        ctrlVolumeBtn.setAttribute('aria-pressed', 'false');
       } else {
         ctrlVolumeBtn.innerHTML = '<i class="fa-solid fa-volume-high"></i>';
+        ctrlVolumeBtn.setAttribute('aria-label', 'Wycisz (M)');
+        ctrlVolumeBtn.setAttribute('aria-pressed', 'false');
       }
+      ctrlVolumeSlider.setAttribute('aria-valuenow', String(player.volume));
     }
+    player._archivebateLastVolume = player.volume || 1;
+    updateVolumeIcon();
 
     // Speed toggle
     const speeds = [1, 1.25, 1.5, 2, 0.75];
@@ -800,26 +853,36 @@
       const s = speeds[speedIdx];
       player.playbackRate = s;
       ctrlSpeedBtn.innerText = `${s}x`;
+      ctrlSpeedBtn.setAttribute('aria-label', `Prędkość odtwarzania: ${s}x`);
     });
 
     // PiP
     ctrlPipBtn.addEventListener('click', async () => {
-      if (document.pictureInPictureElement) {
-        await document.exitPictureInPicture();
-      } else if (document.pictureInPictureEnabled) {
-        await player.requestPictureInPicture();
-      }
+      try {
+        if (document.pictureInPictureElement) {
+          await document.exitPictureInPicture();
+        } else if (document.pictureInPictureEnabled && typeof player.requestPictureInPicture === 'function') {
+          await player.requestPictureInPicture();
+        }
+      } catch (_) {}
     });
 
     // Fullscreen
     ctrlFullscreenBtn.addEventListener('click', toggleFullscreen);
     function toggleFullscreen() {
-      if (!document.fullscreenElement) {
-        playerBox.requestFullscreen().catch(() => {});
-      } else {
-        document.exitFullscreen().catch(() => {});
-      }
+      const result = !document.fullscreenElement
+        ? playerBox.requestFullscreen?.()
+        : document.exitFullscreen?.();
+      Promise.resolve(result).catch(() => {});
     }
+    document.addEventListener('fullscreenchange', () => {
+      const active = document.fullscreenElement === playerBox;
+      ctrlFullscreenBtn.innerHTML = active
+        ? '<i class="fa-solid fa-compress"></i>'
+        : '<i class="fa-solid fa-expand"></i>';
+      ctrlFullscreenBtn.setAttribute('aria-label', active ? 'Wyjdź z pełnego ekranu (F)' : 'Pełny ekran (F)');
+      ctrlFullscreenBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
 
     // Auto-hide controls on idle
     function resetIdleTimer() {
@@ -933,6 +996,7 @@
     // Keyboard shortcuts
     window.addEventListener('keydown', (e) => {
       if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
+      if (e.target === timelineContainer && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key || e.code)) return;
       if (e.code === 'Space') {
         e.preventDefault();
         togglePlay();
@@ -1083,7 +1147,7 @@
         document.title = `${data.username || 'Wideo'} — Archivebate Player`;
         modelNameText.innerText = data.username || 'Model';
         dateText.innerText = data.date || 'Niedawno';
-        originalBtn.href = data.url || `https://archivebate.com/watch/${videoId}`;
+        originalBtn.href = safeUrl(data.url) || safeUrl(`https://archivebate.com/watch/${encodeURIComponent(videoId)}`);
 
         if (data.description) {
           descText.innerText = data.description;
@@ -1114,14 +1178,31 @@
           player.pause();
           player.removeAttribute('src');
           player.load();
-          loader.innerHTML = `
-            <div style="text-align: center; max-width: 540px; padding: 28px; background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.25); border-radius: 12px;">
-              <i class="fa-solid fa-lock" style="font-size: 42px; color: #f59e0b; margin-bottom: 14px; display: block;"></i>
-              <div style="font-size: 17px; font-weight: 700; color: #f87171; margin-bottom: 8px;">Film prywatny na Camwhores</div>
-              <div style="font-size: 13px; color: #94a3b8; line-height: 1.6; margin-bottom: 18px;">Autor oznaczył to nagranie jako prywatne na platformie Camwhores (dostępne wyłącznie dla użytkowników wgrywających wideo).</div>
-              ${data.url ? `<a href="${data.url}" target="_blank" rel="noreferrer" style="display: inline-flex; align-items: center; gap: 8px; padding: 10px 20px; background: #1e293b; color: #f8fafc; border: 1px solid rgba(255,255,255,0.1); border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: 600;"><i class="fa-solid fa-arrow-up-right-from-square"></i> Otwórz na Camwhores</a>` : ''}
-            </div>
-          `;
+          const privateBox = document.createElement('div');
+          privateBox.style.cssText = 'text-align:center;max-width:540px;padding:28px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);border-radius:12px;';
+          const privateIcon = document.createElement('i');
+          privateIcon.className = 'fa-solid fa-lock';
+          privateIcon.style.cssText = 'font-size:42px;color:#f59e0b;margin-bottom:14px;display:block;';
+          const privateTitle = document.createElement('div');
+          privateTitle.textContent = 'Film prywatny na Camwhores';
+          privateTitle.style.cssText = 'font-size:17px;font-weight:700;color:#f87171;margin-bottom:8px;';
+          const privateText = document.createElement('div');
+          privateText.textContent = 'Autor oznaczył to nagranie jako prywatne na platformie Camwhores (dostępne wyłącznie dla użytkowników wgrywających wideo).';
+          privateText.style.cssText = 'font-size:13px;color:#94a3b8;line-height:1.6;margin-bottom:18px;';
+          privateBox.append(privateIcon, privateTitle, privateText);
+          const privateUrl = safeUrl(data.url);
+          if (privateUrl) {
+            const privateLink = document.createElement('a');
+            privateLink.href = privateUrl;
+            privateLink.target = '_blank';
+            privateLink.rel = 'noopener noreferrer';
+            privateLink.style.cssText = 'display:inline-flex;align-items:center;gap:8px;padding:10px 20px;background:#1e293b;color:#f8fafc;border:1px solid rgba(255,255,255,.1);border-radius:8px;text-decoration:none;font-size:13px;font-weight:600;';
+            const privateLinkIcon = document.createElement('i');
+            privateLinkIcon.className = 'fa-solid fa-arrow-up-right-from-square';
+            privateLink.append(privateLinkIcon, document.createTextNode(' Otwórz na Camwhores'));
+            privateBox.appendChild(privateLink);
+          }
+          loader.replaceChildren(privateBox);
           return;
         }
 
@@ -1140,13 +1221,14 @@
 
           // YouTube-style storyboard. Camwhores ma własne gotowe klatki;
           // Archivebate dostaje jeden sprite JPG generowany i cache'owany przez backend.
-          let posterBg = (data.thumbnail || data.poster || '').replace('.mp4', '.jpg');
+          let posterBg = safeUrl(data.thumbnail || data.poster || '').replace('.mp4', '.jpg');
           const isCamwhores = String(videoId).startsWith('cw_') || String(data.url || '').includes('camwhores');
           let watchPosterSrc = posterBg;
           if (isCamwhores && watchPosterSrc.includes('/180x135/')) {
             watchPosterSrc = watchPosterSrc.replace(/\/180x135\/\d+\.jpg/, '/preview.jpg');
           }
 
+          watchPosterSrc = safeUrl(watchPosterSrc);
           if (watchPoster && watchPosterSrc && player.readyState < 2) {
             watchPoster.src = watchPosterSrc;
             watchPoster.style.display = 'block';
@@ -1166,10 +1248,10 @@
               timelinePrefix = `${baseFolder}180x135/`;
             }
             timelineCount = 15;
-            timelinePreviewImg.src = `${timelinePrefix}1.jpg`;
+            timelinePreviewImg.src = safeUrl(`${timelinePrefix}1.jpg`);
             timelinePreviewImg.style.display = 'block';
             timelinePreviewStatus.style.display = 'none';
-            ArchivebatePerf.prefetchUrls(Array.from({length:timelineCount},(_,i)=>`${timelinePrefix}${i+1}.jpg`),{concurrency:2,signal:controller.signal});
+            ArchivebatePerf.prefetchUrls(Array.from({length:timelineCount},(_,i)=>safeUrl(`${timelinePrefix}${i+1}.jpg`)).filter(Boolean),{concurrency:2,signal:controller.signal});
           } else {
             timelinePrefix = null;
             timelineCount = 0;
@@ -1203,11 +1285,14 @@
         }
 
         if (data.direct_url || data.download_url) {
-          downloadBtn.href = data.direct_url || data.download_url;
-          downloadBtn.style.display = 'inline-flex';
+          const downloadUrl = safeUrl(data.direct_url || data.download_url);
+          if (downloadUrl) {
+            downloadBtn.href = downloadUrl;
+            downloadBtn.style.display = 'inline-flex';
+          }
         }
 
-        const recordHistory = () => ArchivebateAPI.postJSON('/api/account/history/record', {id:videoId,url:data.url,username:data.username,thumbnail:data.thumbnail,date:data.date}, {timeoutMs:5000}).catch(()=>{});
+        const recordHistory = () => ArchivebateAPI.postJSON('/api/account/history/record', {source: data.source || (String(videoId).startsWith('cw_') ? 'camwhores' : 'archivebate'), id:videoId,url:data.url,username:data.username,thumbnail:data.thumbnail,date:data.date}, {timeoutMs:5000}).catch(()=>{});
         if (!player.paused && player.readyState >= 2) recordHistory();
         else player.addEventListener('playing', recordHistory, {once:true,signal:controller.signal});
 
@@ -1233,6 +1318,7 @@
       if (!currentDetails) return;
       try {
         const data = await ArchivebateAPI.postJSON('/api/account/favorites/toggle', {
+          source: currentDetails.source || (String(videoId).startsWith('cw_') ? 'camwhores' : 'archivebate'),
           id: videoId,
           url: currentDetails.url,
           username: currentDetails.username,

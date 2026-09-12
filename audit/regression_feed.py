@@ -4,7 +4,10 @@ from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import feed_service as f
-with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp, patch.object(f,'FEED_CACHE_DIR',tmp):
+# Use the OS temp root. The repository's managed Windows ACL can leave an
+# earlier failed fixture directory undeletable; the default temp root keeps
+# this probe isolated without depending on checkout-directory permissions.
+with tempfile.TemporaryDirectory() as tmp, patch.object(f,'FEED_CACHE_DIR',tmp):
     def page(n):
         return [{'id':str(i),'username':str(i//2)} for i in range((n-1)*36,min(n*36,720))]
     snap=f.Snapshot({'test':'plain'},{'fixture':page},lambda x:x)

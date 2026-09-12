@@ -40,16 +40,19 @@ class ModelTagManager:
         self._db: Dict[str, Dict[str, Any]] = {}
         self._dirty = False
         self._last_save = time.time()
+        self._stop = threading.Event()
+        self._closed = False
+        self._async_workers = set()
         self._load()
-        
+
         def _flusher():
-            while True:
-                time.sleep(2)
+            while not self._stop.wait(2):
                 if self._dirty:
                     with self._lock:
                         if self._dirty and self._save():
                             self._dirty = False
-        threading.Thread(target=_flusher, daemon=True).start()
+        self._flusher_thread = threading.Thread(target=_flusher, daemon=True, name="model-tags-flusher")
+        self._flusher_thread.start()
 
     def _load(self):
         with self._lock:
@@ -81,6 +84,8 @@ class ModelTagManager:
             return self._db.get(norm)
 
     def set_model(self, username: str, gender: Optional[str] = None, tags: Optional[List[str]] = None):
+        if self._closed:
+            return
         norm = re.sub(r'[^a-z0-9]', '', str(username).lower())
         if not norm:
             return
@@ -192,6 +197,8 @@ class ModelTagManager:
             try:
                 with ThreadPoolExecutor(max_workers=6) as executor:
                     for u in set(usernames):
+                        if self._stop.is_set():
+                            break
                         if u and not self.get_model(u):
                             try:
                                 executor.submit(self.resolve_model, u)
@@ -199,7 +206,36 @@ class ModelTagManager:
                                 pass
             except RuntimeError:
                 pass
-        threading.Thread(target=_worker, daemon=True).start()
+            finally:
+                with self._lock:
+                    self._async_workers.discard(threading.current_thread())
+        worker = threading.Thread(target=_worker, daemon=True, name="model-tags-resolver")
+        with self._lock:
+            self._async_workers.add(worker)
+        worker.start()
+
+    def close(self, timeout: float = 10.0):
+        """Stop background persistence and flush the final in-memory update."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._stop.set()
+            flusher = self._flusher_thread
+            workers = list(self._async_workers)
+        if flusher and flusher is not threading.current_thread():
+            flusher.join(timeout=max(0.0, timeout))
+        deadline = time.monotonic() + max(0.0, timeout)
+        for worker in workers:
+            remaining = max(0.0, deadline - time.monotonic())
+            if worker is not threading.current_thread():
+                worker.join(timeout=remaining)
+        with self._lock:
+            if self._dirty:
+                if self._save():
+                    self._dirty = False
+
+    shutdown = close
 
     def enrich_video(self, v: Dict[str, Any]) -> Dict[str, Any]:
         """Wzbogaca tagi wideo o informacje z bazy profili i zewnętrznych serwisów."""

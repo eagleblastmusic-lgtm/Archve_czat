@@ -44,7 +44,17 @@ assert result["count"] == 280, result["count"]
 assert result["group_count"] == 300, result["group_count"]
 assert all(v.get("group_count") == 3 for v in result["videos"]), result["videos"][:2]
 assert all(len(v.get("grouped_videos") or []) == 3 for v in result["videos"]), result["videos"][:2]
-assert len(selects) <= 6, f"grouped page used {len(selects)} SELECT/WITH statements; N+1 query likely returned"
+member_batch_selects = [
+    statement
+    for statement in selects
+    if "ROW_NUMBER() OVER" in statement.upper()
+    and "PARTITION BY AUTHOR_CLEAN" in statement.upper()
+]
+assert len(selects) <= 8, f"grouped page used {len(selects)} SELECT/WITH statements; query budget regressed"
+assert len(member_batch_selects) == 1, (
+    "grouped members must be loaded by exactly one batch query; "
+    f"observed {len(member_batch_selects)} member queries"
+)
 
 service.close()
 print(f"PASS: grouped catalog page uses a bounded batch query ({len(selects)} SELECT/WITH statements for 280 authors)")

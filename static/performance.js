@@ -214,11 +214,18 @@
     if (now - lastStatusReport < 800) return;
     lastStatusReport = now;
     try {
-      if (typeof fetch === 'function') {
+      const body = { is_busy: !!isBusy, buffered_seconds: buffered };
+      if (globalThis.ArchivebateAPI?.postJSON) {
+        globalThis.ArchivebateAPI.postJSON('/api/playback/status', body, {
+          keepalive: true,
+          timeoutMs: 3000
+        }).catch(() => {});
+      } else if (typeof fetch === 'function') {
+        const token = document.querySelector('meta[name="archivebate-mutation-token"]')?.content || '';
         fetch('/api/playback/status', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ is_busy: !!isBusy, buffered_seconds: buffered }),
+          headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Archivebate-Mutation-Token': token } : {}) },
+          body: JSON.stringify(body),
           keepalive: true
         }).catch(() => {});
       }

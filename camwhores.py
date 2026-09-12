@@ -20,6 +20,8 @@ DEFAULT_HEADERS = {
 }
 from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from fetch_contract import FetchResult
+from video_identity import VideoKey, normalize_video_url
 
 class CamwhoresScraper:
     def __init__(self):
@@ -209,6 +211,18 @@ class CamwhoresScraper:
         if strict and not valid_response: raise RuntimeError("Source did not return a successful response")
         return []
 
+    def get_latest_videos_result(self, page: int = 1) -> FetchResult:
+        """Typed variant used by workers: network/parser failures are not EOF."""
+        try:
+            values = self.get_latest_videos(page=page, strict=True)
+            return FetchResult.success(values, source="camwhores", page=page) if values else FetchResult.empty(
+                source="camwhores", page=page, end_reason="confirmed_empty"
+            )
+        except requests.Timeout as exc:
+            return FetchResult.error_result(exc, status="timeout", source="camwhores", page=page)
+        except Exception as exc:
+            return FetchResult.error_result(exc, source="camwhores", page=page)
+
     def get_query_last_page(self, query: str) -> int:
         """Zwraca wykrytą lub oszacowaną maksymalną liczbę stron Camwhores dla danego zapytania."""
         clean_q = query.replace("#", "").strip().lower()
@@ -290,6 +304,17 @@ class CamwhoresScraper:
                 continue
 
         return []
+
+    def search_videos_result(self, query: str, page: int = 1) -> FetchResult:
+        try:
+            values = self.search_videos(query, page=page)
+            return FetchResult.success(values, source="camwhores", page=page) if values else FetchResult.empty(
+                source="camwhores", page=page, end_reason="confirmed_empty"
+            )
+        except requests.Timeout as exc:
+            return FetchResult.error_result(exc, status="timeout", source="camwhores", page=page)
+        except Exception as exc:
+            return FetchResult.error_result(exc, source="camwhores", page=page)
 
     def search_videos_multi(self, query: str, pages: List[int] = None) -> List[Dict[str, Any]]:
         """Pobiera równolegle wiele stron wyników z Camwhores (szybki transfer 150-300 wideo)."""
@@ -480,6 +505,10 @@ class CamwhoresScraper:
             logger.error(f"Błąd pobierania detali Camwhores ({watch_url}): {e}")
             return {"id": f"cw_{raw_id}", "url": watch_url, "direct_url": "", "embed_url": watch_url, "source": "camwhores"}
 
+    def close(self) -> None:
+        """Zwalnia pulę połączeń HTTP podczas zamykania aplikacji."""
+        self.session.close()
+
 # ============================================================
 # INTELIGENTNA DEDUPLIKACJA (ANTI-DUPLICATE)
 # ============================================================
@@ -506,13 +535,12 @@ def extract_date_signature(text: str) -> Optional[str]:
 def video_identity(video):
     """Source-scoped identity; descriptive metadata never proves equality."""
     ident = str(video.get("id") or "").strip()
-    source = "camwhores" if ident.startswith("cw_") or video.get("source") == "camwhores" else (video.get("source") or "archivebate")
-    if source == "camwhores" and ident.startswith("cw_"):
-        ident = ident[3:]
-    if ident:
-        return (source, "id", ident)
-    url = str(video.get("url") or "").strip().split("#")[0].rstrip("/")
-    return (source, "url", url) if url else None
+    key = VideoKey.from_video(video, require_source=True)
+    if not key:
+        return None
+    raw_id = str(video.get("id") or "").strip()
+    kind = "id" if raw_id else "url"
+    return (key.source, kind, key.provider_id)
 
 
 def is_duplicate(video_a, video_b):

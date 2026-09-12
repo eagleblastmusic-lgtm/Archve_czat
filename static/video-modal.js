@@ -53,13 +53,25 @@
 
   const api = () => g.ArchivebateAPI || {
     getJSON: (url, opts) => fetch(url, opts).then(r => r.json()),
-    postJSON: (url, body, opts) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), ...opts }).then(r => r.json())
+    postJSON: (url, body, opts) => {
+      const token = document.querySelector('meta[name="archivebate-mutation-token"]')?.content || '';
+      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Archivebate-Mutation-Token': token } : {}) }, body: JSON.stringify(body), ...opts }).then(async response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      });
+    }
   };
 
   const perf = () => g.ArchivebatePerf || {
     measure: () => {},
     setPlaybackBusy: () => {}
   };
+
+  function safeUrl(value) {
+    if (g.ArchivebateDOM && typeof g.ArchivebateDOM.safeUrl === 'function') return g.ArchivebateDOM.safeUrl(value);
+    const raw = String(value || '').trim();
+    return (/^https?:\/\//i.test(raw) || /^\/(?!\/)/.test(raw) || raw === '#') ? raw : '';
+  }
 
   const parseDurationToSeconds = (durStr) => {
     if (g.ArchivebatePlayerCore && typeof g.ArchivebatePlayerCore.parseDurationToSeconds === 'function') {
@@ -128,6 +140,33 @@
 
   const authorPlaylists = new Map();
   let loadingMarkup;
+  let modalPreviousFocus = null;
+  let modalKeyHandler = null;
+
+  function installModalFocusManagement() {
+    if (!dom.videoModal || modalKeyHandler) return;
+    modalPreviousFocus = document.activeElement;
+    dom.videoModal.setAttribute('aria-hidden', 'false');
+    modalKeyHandler = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeModal();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const focusable = Array.from(dom.videoModal.querySelectorAll('button, a[href], input, [tabindex]:not([tabindex="-1"])'))
+        .filter(element => !element.disabled && element.offsetParent !== null);
+      if (!focusable.length) return;
+      const current = focusable.indexOf(document.activeElement);
+      const next = event.shiftKey
+        ? (current <= 0 ? focusable.length - 1 : current - 1)
+        : (current === focusable.length - 1 ? 0 : current + 1);
+      event.preventDefault();
+      focusable[next].focus();
+    };
+    dom.videoModal.addEventListener('keydown', modalKeyHandler);
+    (dom.modalCloseBtn || dom.videoModal.querySelector('.modal-content'))?.focus?.();
+  }
 
   async function getAuthorVideosList(username) {
     if (!username || username.toLowerCase() === 'model') return null;
@@ -473,12 +512,13 @@
       posterSrc = posterSrc.replace(/\/180x135\/\d+\.jpg/, '/preview.jpg');
     }
     if (dom.modalLoadingPoster) {
-      dom.modalLoadingPoster.src = posterSrc || '';
-      dom.modalLoadingPoster.style.display = posterSrc ? 'block' : 'none';
+      const posterUrl = safeUrl(posterSrc);
+      dom.modalLoadingPoster.src = posterUrl;
+      dom.modalLoadingPoster.style.display = posterUrl ? 'block' : 'none';
       dom.modalLoadingPoster.style.opacity = '1';
     }
     if (dom.modalVideo) {
-      dom.modalVideo.poster = posterSrc || '';
+      dom.modalVideo.poster = safeUrl(posterSrc);
     }
 
     if (dom.modalPlatform) dom.modalPlatform.innerText = video.platform || 'Chaturbate';
@@ -522,7 +562,7 @@
       if (isFav) modalContent.classList.add('is-favorite-modal');
       else modalContent.classList.remove('is-favorite-modal');
     }
-    if (dom.modalOriginalBtn) dom.modalOriginalBtn.href = video.url;
+    if (dom.modalOriginalBtn) dom.modalOriginalBtn.href = safeUrl(video.url) || '#';
     if (dom.modalPopoutBtn) {
       const popDur = parseDurationToSeconds(video?.duration);
       dom.modalPopoutBtn.href = `/watch/${video.id}${popDur > 0 ? `?duration=${popDur}` : ''}`;
@@ -537,7 +577,11 @@
 
     const recordStartedVideo = () => {
       if (generation !== state.playerGeneration) return;
-      api().postJSON('/api/account/history/record', video).then(d => {
+      const historyVideo = {
+        ...video,
+        source: video.source || (String(video.id || '').startsWith('cw_') ? 'camwhores' : '')
+      };
+      api().postJSON('/api/account/history/record', historyVideo).then(d => {
         state.historyCount = d.total_history;
         if (dom.navHistCount) dom.navHistCount.innerText = state.historyCount;
         if (dom.statHistCount) dom.statHistCount.innerText = state.historyCount;
@@ -579,7 +623,10 @@
       };
     }
 
-    if (dom.videoModal) dom.videoModal.classList.add('active');
+    if (dom.videoModal) {
+      dom.videoModal.classList.add('active');
+      installModalFocusManagement();
+    }
     if (typeof document !== 'undefined' && document.body) document.body.style.overflow = 'hidden';
 
     try {
@@ -668,7 +715,7 @@
       }
 
       const rawStream = immediateStream || details.proxy_stream_url || details.direct_url;
-      const streamSource = rawStream ? (forceRefresh ? `${rawStream}${rawStream.includes('?') ? '&' : '?'}retry=${generation}` : rawStream) : '';
+      const streamSource = safeUrl(rawStream ? (forceRefresh ? `${rawStream}${rawStream.includes('?') ? '&' : '?'}retry=${generation}` : rawStream) : '');
       if (streamSource && dom.modalVideo) {
         const currentSrc = dom.modalVideo.getAttribute('src') || dom.modalVideo.src || '';
         const normalize = (u) => {
@@ -692,13 +739,22 @@
       }
 
       if (dom.modalDownloadBtn && (details.direct_url || details.proxy_stream_url)) {
-        dom.modalDownloadBtn.href = details.proxy_stream_url || details.direct_url;
+        dom.modalDownloadBtn.href = safeUrl(details.proxy_stream_url || details.direct_url) || '#';
         dom.modalDownloadBtn.style.display = 'flex';
       }
 
       if (dom.modalKeywords) {
         if (Array.isArray(details.keywords) && details.keywords.length > 0) {
-          dom.modalKeywords.innerHTML = details.keywords.map(kw => `<span class="tag-badge" data-tag="${kw.toLowerCase()}">#${kw}</span>`).join('');
+          dom.modalKeywords.replaceChildren();
+          details.keywords.forEach(rawKeyword => {
+            const keyword = String(rawKeyword ?? '').trim();
+            if (!keyword) return;
+            const badge = document.createElement('span');
+            badge.className = 'tag-badge';
+            badge.dataset.tag = keyword.toLowerCase();
+            badge.textContent = `#${keyword}`;
+            dom.modalKeywords.appendChild(badge);
+          });
           dom.modalKeywords.querySelectorAll('.tag-badge').forEach(badge => {
             const kwTag = badge.dataset.tag;
             badge.onclick = (e) => {
@@ -753,7 +809,7 @@
     if (dom.modalIframe) {
       dom.modalIframe.style.display = 'block';
       if (state.currentVideoDetails && state.currentVideoDetails.embed_url) {
-        dom.modalIframe.src = state.currentVideoDetails.embed_url;
+        dom.modalIframe.src = safeUrl(state.currentVideoDetails.embed_url);
       }
     }
   }
@@ -880,6 +936,11 @@
     state.localStoryboard = null;
     state.currentStoryboardKey = null;
     if (dom.videoModal) dom.videoModal.classList.remove('active');
+    if (dom.videoModal) dom.videoModal.setAttribute('aria-hidden', 'true');
+    if (dom.videoModal && modalKeyHandler) {
+      dom.videoModal.removeEventListener('keydown', modalKeyHandler);
+      modalKeyHandler = null;
+    }
     if (dom.modalVideo) {
       dom.modalVideo.pause();
       dom.modalVideo.removeAttribute('src');
@@ -896,6 +957,8 @@
     }
     if (dom.modalIframe) dom.modalIframe.src = '';
     if (typeof document !== 'undefined' && document.body) document.body.style.overflow = '';
+    modalPreviousFocus?.focus?.();
+    modalPreviousFocus = null;
   }
 
   const moduleExports = {

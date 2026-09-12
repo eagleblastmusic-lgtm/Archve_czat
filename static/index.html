@@ -19,14 +19,6 @@
 </head>
 <body>
 
-  <!-- DESKTOP APP TABS BAR -->
-  <div class="app-tabs-bar" id="appTabsBar">
-    <div class="app-tabs-container" id="appTabsContainer"></div>
-    <button class="app-tab-new-btn" id="appTabNewBtn" title="Nowa karta (Ctrl + T)">
-      <i class="fa-solid fa-plus"></i>
-    </button>
-  </div>
-
   <!-- NAVBAR -->
   <header class="navbar">
     <div class="nav-container">
@@ -63,14 +55,19 @@
         <div class="search-input-box">
           <i class="fa-solid fa-magnifying-glass search-icon"></i>
           <input type="text" id="searchInput" class="search-input" placeholder="Wyszukaj po tagu (#trans, #teen), modelce lub kategorii..." autocomplete="off">
-          <button id="clearSearchBtn" class="clear-btn" title="Wyczyść"><i class="fa-solid fa-xmark"></i></button>
+          <button id="clearSearchBtn" class="clear-btn" aria-label="Wyczyść wyszukiwanie" title="Wyczyść"><i class="fa-solid fa-xmark"></i></button>
         </div>
+        <label class="sr-only" for="searchScopeSelect">Zakres wyszukiwania</label>
+        <select id="searchScopeSelect" class="search-scope-select" title="Wybierz zakres wyszukiwania">
+          <option value="online">Online</option>
+          <option value="local">Mój katalog</option>
+        </select>
       </div>
 
       <div class="user-status-card" id="userStatusCard" title="Status zalogowania">
         <div class="status-dot" id="statusDot"></div>
         <span class="user-email" id="userEmail">Łączenie...</span>
-        <button id="reloginBtn" class="btn-refresh" title="Synchronizuj / Ponów logowanie">
+        <button id="reloginBtn" class="btn-refresh" aria-label="Synchronizuj lub ponów logowanie" title="Synchronizuj / Ponów logowanie">
           <i class="fa-solid fa-rotate-right"></i>
         </button>
       </div>
@@ -98,7 +95,7 @@
           <div class="account-info">
             <h2 class="account-email" id="panelEmail">Brak danych konta</h2>
             <div class="account-badges">
-              <span class="badge-account-status online"><i class="fa-solid fa-circle-check"></i> Zalogowano do Archivebate</span>
+              <span class="badge-account-status" id="accountStatusBadge" aria-live="polite">Stan konta: ładowanie</span>
               <span class="badge-account-sync" id="panelLastSync"><i class="fa-solid fa-clock"></i> Synchronizacja...</span>
             </div>
           </div>
@@ -109,14 +106,66 @@
             <button class="btn-card" id="panelClearHistoryBtn">
               <i class="fa-solid fa-trash"></i> Wyczyść historię
             </button>
+            <button class="btn-card" id="accountExportBtn" type="button">
+              <i class="fa-solid fa-file-export"></i> Eksportuj dane
+            </button>
+            <button class="btn-card" id="accountRestoreBtn" type="button">
+              <i class="fa-solid fa-file-import"></i> Przywróć dane
+            </button>
+            <button class="btn-card" id="diagnosticsBtn" type="button">
+              <i class="fa-solid fa-stethoscope"></i> Diagnostyka
+            </button>
+            <input id="accountRestoreFile" type="file" accept="application/json,.json" hidden>
           </div>
         </div>
+
+        <details class="diagnostics-panel" id="diagnosticsPanel" hidden>
+          <summary>Diagnostyka aktywnej instancji</summary>
+          <div class="diagnostics-toolbar">
+            <span>Raport nie zawiera haseł, tokenów ani cookies.</span>
+            <div>
+              <button class="btn-card" id="diagnosticsRefreshBtn" type="button">Odśwież</button>
+              <button class="btn-card" id="diagnosticsCopyBtn" type="button" disabled>Kopiuj raport</button>
+            </div>
+          </div>
+        <pre class="diagnostics-output" id="diagnosticsOutput" aria-live="polite">Otwórz panel, aby pobrać raport.</pre>
+        </details>
+
+        <section class="jobs-panel" aria-labelledby="jobsPanelTitle">
+          <div class="jobs-panel-header">
+            <div>
+              <h3 id="jobsPanelTitle">Zadania w tle</h3>
+              <span id="jobsOverallStatus" class="jobs-overall-status" role="status">Stan: ładowanie…</span>
+            </div>
+            <button class="btn-card" id="jobsRefreshBtn" type="button" aria-label="Odśwież status zadań w tle">
+              <i class="fa-solid fa-rotate" aria-hidden="true"></i> Odśwież
+            </button>
+          </div>
+          <div class="jobs-grid">
+            <div class="job-row">
+              <div><strong>Synchronizacja konta</strong><span>lokalny zapis i wynik zdalny</span></div>
+              <span id="jobSyncStatus" class="job-status" role="status">Nieznany</span>
+            </div>
+            <div class="job-row">
+              <div><strong>Szybki skan profili</strong><span>uzupełnianie tagów w tle</span></div>
+              <span id="jobQuickStatus" class="job-status" role="status">Nieznany</span>
+            </div>
+            <div class="job-row job-row-deep">
+              <div><strong>Głębokie odkrywanie Archivebate</strong><span id="jobDeepProgress">Stan i postęp są pobierane na żądanie.</span></div>
+              <div class="job-actions">
+                <span id="jobDeepStatus" class="job-status" role="status">Nieznany</span>
+                <button class="btn-card" id="jobsDeepStartBtn" type="button">Uruchom</button>
+                <button class="btn-card danger" id="jobsDeepStopBtn" type="button">Zatrzymaj</button>
+              </div>
+            </div>
+          </div>
+        </section>
 
         <div class="account-stats-grid">
           <div class="stat-box" id="statBoxFavs">
             <div class="stat-icon fav"><i class="fa-solid fa-heart"></i></div>
             <div class="stat-details">
-              <span class="stat-number" id="statFavCount">0</span>
+              <span class="stat-number" id="statFavCount">--</span>
               <span class="stat-title">Ulubione / Zapisane</span>
             </div>
             <button class="stat-action-btn" id="statBtnFavs">Przeglądaj <i class="fa-solid fa-arrow-right"></i></button>
@@ -125,7 +174,7 @@
           <div class="stat-box" id="statBoxHist">
             <div class="stat-icon hist"><i class="fa-solid fa-clock-rotate-left"></i></div>
             <div class="stat-details">
-              <span class="stat-number" id="statHistCount">0</span>
+              <span class="stat-number" id="statHistCount">--</span>
               <span class="stat-title">Obejrzane filmy (Historia)</span>
             </div>
             <button class="stat-action-btn" id="statBtnHist">Przeglądaj <i class="fa-solid fa-arrow-right"></i></button>
@@ -134,7 +183,7 @@
           <div class="stat-box" id="statBoxFoll">
             <div class="stat-icon foll"><i class="fa-solid fa-user-group"></i></div>
             <div class="stat-details">
-              <span class="stat-number" id="statFollCount">0</span>
+              <span class="stat-number" id="statFollCount">--</span>
               <span class="stat-title">Obserwowane kanały</span>
             </div>
             <button class="stat-action-btn" id="statBtnFoll">Przeglądaj <i class="fa-solid fa-arrow-right"></i></button>
@@ -143,9 +192,9 @@
           <div class="stat-box" id="statBoxBlocked">
             <div class="stat-icon" style="background: rgba(239, 68, 68, 0.15); color: #ef4444;"><i class="fa-solid fa-ban"></i></div>
             <div class="stat-details">
-              <span class="stat-number" id="statBlockedCount">0</span>
+              <span class="stat-number" id="statBlockedCount">--</span>
               <span class="stat-title">Zablokowane profile</span>
-              <span class="stat-sub" id="statBlockedVideosSub" style="font-size: 0.75rem; color: var(--text-muted); display: block; margin-top: 2px;">usunięto 0 filmów</span>
+              <span class="stat-sub" id="statBlockedVideosSub" style="font-size: 0.75rem; color: var(--text-muted); display: block; margin-top: 2px;">szacunkowo ukryto -- filmów</span>
             </div>
             <button class="stat-action-btn" id="statBtnBlocked">Zarządzaj <i class="fa-solid fa-arrow-right"></i></button>
           </div>
@@ -160,8 +209,8 @@
           <i class="fa-solid fa-film"></i>
         </div>
         <div class="stat-card-text">
-          <span class="stat-card-val" id="statGlobalVideos">5 500 000+</span>
-          <span class="stat-card-lbl">Łącznie w serwisach</span>
+          <span class="stat-card-val" id="statGlobalVideos">--</span>
+          <span class="stat-card-lbl">Zewnętrzny szacunek</span>
         </div>
       </div>
 
@@ -180,7 +229,7 @@
           <i class="fa-solid fa-users"></i>
         </div>
         <div class="stat-card-text">
-          <span class="stat-card-val" id="statGlobalProfiles">1 440+</span>
+          <span class="stat-card-val" id="statGlobalProfiles">--</span>
           <span class="stat-card-lbl">Zaindeksowane profile modelek</span>
         </div>
       </div>
@@ -190,7 +239,7 @@
           <i class="fa-solid fa-layer-group"></i>
         </div>
         <div class="stat-card-text">
-          <span class="stat-card-val" id="statPageVideos">0</span>
+          <span class="stat-card-val" id="statPageVideos">--</span>
           <span class="stat-card-lbl">Filmów na tej stronie</span>
         </div>
       </div>
@@ -200,7 +249,7 @@
           <i class="fa-solid fa-bookmark"></i>
         </div>
         <div class="stat-card-text">
-          <span class="stat-card-val" id="statUserLibrary">0</span>
+          <span class="stat-card-val" id="statUserLibrary">--</span>
           <span class="stat-card-lbl">Twoja biblioteka (ulubione i historia)</span>
         </div>
       </div>
@@ -210,8 +259,8 @@
           <i class="fa-solid fa-ban"></i>
         </div>
         <div class="stat-card-text">
-          <span class="stat-card-val" id="statBlockedInfo">0 autorów</span>
-          <span class="stat-card-lbl" id="statBlockedVideosLbl">0 filmów usuniętych łącznie</span>
+          <span class="stat-card-val" id="statBlockedInfo">--</span>
+          <span class="stat-card-lbl" id="statBlockedVideosLbl">Zakres ukrycia: --</span>
         </div>
       </div>
     </div>
@@ -224,8 +273,12 @@
       </div>
       <div class="content-header-actions" style="display: flex; align-items: center; gap: 10px;">
         <button class="btn-scan-profiles" id="quickScanBtn" title="Błyskawicznie przeskanuj i uzupełnij tagi wszystkich profili w tle">
-          <i class="fa-solid fa-bolt"></i> Baza profili: <span id="scannedModelsCount">650+</span>
+          <i class="fa-solid fa-bolt"></i> Baza profili: <span id="scannedModelsCount">--</span>
         </button>
+        <button class="btn-card danger" id="quickScanStopBtn" type="button" hidden aria-label="Zatrzymaj skanowanie profili" title="Zatrzymaj skanowanie profili">
+          <i class="fa-solid fa-stop"></i> Stop
+        </button>
+        <span id="quickScanStatus" aria-live="polite" style="font-size:12px;color:var(--text-muted);"></span>
         <button class="btn-toggle-camwhores mode-all" id="toggleCamwhoresBtn" title="Przełącz źródło: Wszystkie / Tylko Camwhores / Tylko Archivebate">
           <i class="fa-solid fa-layer-group" id="sourceToggleIcon"></i> Źródło: <span id="camwhoresToggleLabel">Wszystkie</span>
         </button>
@@ -269,7 +322,7 @@
         </button>
         <div class="page-jump-box">
           <span>Strona:</span>
-          <input type="number" id="pageJumpInputTop" min="1" max="1000" value="1">
+          <input type="number" id="pageJumpInputTop" min="1" value="1">
           <button class="page-jump-btn" id="pageJumpBtnTop">Przejdź</button>
         </div>
       </div>
@@ -291,11 +344,11 @@
           Następna <i class="fa-solid fa-chevron-right"></i>
         </button>
         <button class="page-nav-btn last-page-btn" id="lastPageBtn" title="Idź do ostatniej strony">
-          Ostatnia (<span id="lastPageNumber">1 000</span>) <i class="fa-solid fa-angles-right"></i>
+          Ostatnia (<span id="lastPageNumber">1</span>) <i class="fa-solid fa-angles-right"></i>
         </button>
         <div class="page-jump-box">
           <span>Strona:</span>
-          <input type="number" id="pageJumpInput" min="1" max="1000" value="1">
+          <input type="number" id="pageJumpInput" min="1" value="1">
           <button class="page-jump-btn" id="pageJumpBtn">Przejdź</button>
         </div>
       </div>
@@ -306,21 +359,21 @@
   </main>
 
   <!-- MODAL BEZPOŚREDNIEGO ODTWARZACZA WIDEO (BEZ REKLAM) -->
-  <div class="modal-overlay" id="videoModal">
-    <div class="modal-content">
+  <div class="modal-overlay" id="videoModal" role="dialog" aria-modal="true" aria-labelledby="modalModelName" aria-hidden="true">
+    <div class="modal-content" tabindex="-1">
       <div class="modal-header">
         <div class="modal-title-box">
           <span class="badge-platform" id="modalPlatform">Chaturbate</span>
           <span class="modal-title" id="modalModelName">Model</span>
         </div>
         <div style="margin-left: auto; display: flex; align-items: center; gap: 8px; margin-right: 8px;">
-          <button class="btn-card danger" id="modalBlockModelBtn" title="Zablokuj modelkę: usuń ten profil z katalogu programu i ukryj wszystkie jej nagrania">
+          <button class="btn-card danger" id="modalBlockModelBtn" aria-label="Zablokuj profil autora" title="Zablokuj profil autora i ukryj jego nagrania">
             <i class="fa-solid fa-ban"></i> Blokuj profil
           </button>
-          <a class="btn-card" id="modalPopoutBtn" href="#" target="_blank" title="Otwórz w nowej karcie / oknie">
+          <a class="btn-card" id="modalPopoutBtn" href="#" target="_blank" rel="noopener noreferrer" title="Otwórz w nowej karcie / oknie">
             <i class="fa-solid fa-arrow-up-right-from-square"></i> Nowe okno
           </a>
-          <button class="modal-close-btn" id="modalCloseBtn" title="Zamknij"><i class="fa-solid fa-xmark"></i></button>
+          <button class="modal-close-btn" id="modalCloseBtn" aria-label="Zamknij okno wideo" title="Zamknij"><i class="fa-solid fa-xmark"></i></button>
         </div>
       </div>
 
@@ -339,22 +392,22 @@
         <video id="modalVideo" class="modal-player-video" playsinline preload="auto"></video>
 
         <!-- Przycisk Play na środku przy pauzie -->
-        <div class="center-play-overlay" id="modalCenterPlay">
+        <div class="center-play-overlay" id="modalCenterPlay" role="button" tabindex="0" aria-label="Odtwórz film">
           <div class="center-play-btn"><i class="fa-solid fa-play"></i></div>
         </div>
 
         <!-- Pływające strzałki nawigacji: Poprzedni / Następny film -->
-        <button class="modal-nav-arrow prev" id="modalNavPrevArrow" title="Poprzedni film na liście (←)">
+        <button class="modal-nav-arrow prev" id="modalNavPrevArrow" aria-label="Poprzedni film na liście" title="Poprzedni film na liście (←)">
           <i class="fa-solid fa-chevron-left"></i>
         </button>
-        <button class="modal-nav-arrow next" id="modalNavNextArrow" title="Następny film na liście (→)">
+        <button class="modal-nav-arrow next" id="modalNavNextArrow" aria-label="Następny film na liście" title="Następny film na liście (→)">
           <i class="fa-solid fa-chevron-right"></i>
         </button>
 
         <!-- Własny pasek kontroli z podglądem klatki na osi czasu -->
         <div class="custom-controls-bar" id="modalControlsBar">
           <!-- OŚ CZASU (TIMELINE) -->
-          <div class="timeline-container" id="modalTimelineContainer">
+          <div class="timeline-container" id="modalTimelineContainer" role="slider" tabindex="0" aria-label="Pozycja filmu" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="0:00 / 0:00">
             <!-- Pływający podgląd klatki wideo na osi czasu -->
             <div class="timeline-preview-tooltip" id="modalTimelineTooltip">
               <div class="preview-video-box" id="modalTimelinePreviewBox">
@@ -376,27 +429,27 @@
           <!-- PRZYCISKI ODTWARZACZA -->
           <div class="controls-row">
             <div class="controls-left">
-              <button class="ctrl-btn" id="modalCtrlPrevVideoBtn" title="Poprzedni film na liście (←)"><i class="fa-solid fa-backward-step"></i></button>
-              <button class="ctrl-btn" id="modalCtrlPlayBtn" title="Odtwórz / Pauza (Spacja)"><i class="fa-solid fa-play"></i></button>
-              <button class="ctrl-btn" id="modalCtrlNextVideoBtn" title="Następny film na liście (→)"><i class="fa-solid fa-forward-step"></i></button>
-              <button class="ctrl-btn" id="modalCtrlPrevAuthorBtn" title="Poprzedni film tego autora (Strzałka w górę ↑)"><i class="fa-solid fa-user-minus"></i></button>
-              <button class="ctrl-btn" id="modalCtrlNextAuthorBtn" title="Następny film tego autora (Strzałka w dół ↓)"><i class="fa-solid fa-user-plus"></i></button>
-              <button class="ctrl-btn" id="modalCtrlRewindBtn" title="Cofnij 10s (Shift + ←)"><i class="fa-solid fa-rotate-left"></i></button>
-              <button class="ctrl-btn" id="modalCtrlForwardBtn" title="Do przodu 10s (Shift + →)"><i class="fa-solid fa-rotate-right"></i></button>
+              <button class="ctrl-btn" id="modalCtrlPrevVideoBtn" aria-label="Poprzedni film na liście" title="Poprzedni film na liście (←)"><i class="fa-solid fa-backward-step"></i></button>
+              <button class="ctrl-btn" id="modalCtrlPlayBtn" aria-label="Odtwórz film (Spacja)" aria-pressed="false" title="Odtwórz / Pauza (Spacja)"><i class="fa-solid fa-play"></i></button>
+              <button class="ctrl-btn" id="modalCtrlNextVideoBtn" aria-label="Następny film na liście" title="Następny film na liście (→)"><i class="fa-solid fa-forward-step"></i></button>
+              <button class="ctrl-btn" id="modalCtrlPrevAuthorBtn" aria-label="Poprzedni film tego autora" title="Poprzedni film tego autora (Strzałka w górę ↑)"><i class="fa-solid fa-user-minus"></i></button>
+              <button class="ctrl-btn" id="modalCtrlNextAuthorBtn" aria-label="Następny film tego autora" title="Następny film tego autora (Strzałka w dół ↓)"><i class="fa-solid fa-user-plus"></i></button>
+              <button class="ctrl-btn" id="modalCtrlRewindBtn" aria-label="Cofnij 10 sekund" title="Cofnij 10s (Shift + ←)"><i class="fa-solid fa-rotate-left"></i></button>
+              <button class="ctrl-btn" id="modalCtrlForwardBtn" aria-label="Przejdź 10 sekund do przodu" title="Do przodu 10s (Shift + →)"><i class="fa-solid fa-rotate-right"></i></button>
               
               <!-- Głośność -->
               <div class="volume-box">
-                <button class="ctrl-btn" id="modalCtrlVolumeBtn" title="Wycisz (M)"><i class="fa-solid fa-volume-high"></i></button>
-                <input type="range" class="volume-slider" id="modalCtrlVolumeSlider" min="0" max="1" step="0.05" value="1">
+                <button class="ctrl-btn" id="modalCtrlVolumeBtn" aria-label="Wycisz (M)" aria-pressed="false" title="Wycisz (M)"><i class="fa-solid fa-volume-high"></i></button>
+                <input type="range" class="volume-slider" id="modalCtrlVolumeSlider" aria-label="Głośność" min="0" max="1" step="0.05" value="1">
               </div>
 
               <span class="time-display" id="modalCtrlTimeDisplay">00:00 / 00:00</span>
             </div>
 
             <div class="controls-right">
-              <button class="ctrl-btn speed-btn" id="modalCtrlSpeedBtn" title="Prędkość odtwarzania">1x</button>
-              <button class="ctrl-btn" id="modalCtrlPipBtn" title="Obraz w obrazie"><i class="fa-solid fa-clone"></i></button>
-              <button class="ctrl-btn" id="modalCtrlFullscreenBtn" title="Pełny ekran (F)"><i class="fa-solid fa-expand"></i></button>
+              <button class="ctrl-btn speed-btn" id="modalCtrlSpeedBtn" aria-label="Prędkość odtwarzania: 1x" title="Prędkość odtwarzania">1x</button>
+              <button class="ctrl-btn" id="modalCtrlPipBtn" aria-label="Włącz obraz w obrazie" title="Obraz w obrazie"><i class="fa-solid fa-clone"></i></button>
+              <button class="ctrl-btn" id="modalCtrlFullscreenBtn" aria-label="Pełny ekran (F)" aria-pressed="false" title="Pełny ekran (F)"><i class="fa-solid fa-expand"></i></button>
             </div>
           </div>
         </div>
@@ -438,6 +491,7 @@
   <script src="/static/player-core.js?v=2.2"></script>
   <script src="/static/youtube-storyboard.js?v=3.0"></script>
   <script src="/static/app-context.js?v=1.0"></script>
+  <script src="/static/dom-utils.js?v=1.0"></script>
   <script src="/static/toast.js?v=1.0"></script>
   <script src="/static/filters.js?v=1.0"></script>
   <script src="/static/profile-scanner.js?v=1.0"></script>

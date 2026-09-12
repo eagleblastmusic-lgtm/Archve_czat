@@ -10,6 +10,7 @@ data/stream_cache/
 # Local account data and temporary storage
 data/user_store.json
 data/user_store.json.*.tmp
+data/user_store.json.lock
 
 # Generated storyboard cache and media
 data/storyboard_cache/
@@ -17,6 +18,10 @@ data/storyboard_cache/
 # Disposable local UI fixtures
 audit/ui_fixture/
 audit/tmp*/
+audit/nextgen_*
+audit/audit_fixes_*
+audit/package_b_*
+audit/deep_fixture_*
 
 data/catalog.db
 data/catalog.db-wal

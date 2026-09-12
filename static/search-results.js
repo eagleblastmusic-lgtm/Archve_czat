@@ -111,6 +111,26 @@
     if (typeof global.renderPagination === 'function') return global.renderPagination();
   }
 
+  function renderEmptySearch(query) {
+    if (!dom.videoGrid) return;
+    dom.videoGrid.replaceChildren();
+    const empty = document.createElement('div');
+    empty.className = 'empty-state';
+    empty.style.gridColumn = '1 / -1';
+    const icon = document.createElement('div');
+    icon.className = 'empty-state-icon';
+    const iconEl = document.createElement('i');
+    iconEl.className = 'fa-solid fa-film';
+    iconEl.setAttribute('aria-hidden', 'true');
+    icon.appendChild(iconEl);
+    const title = document.createElement('h3');
+    title.textContent = `Nie znaleziono filmów dla "${query}"`;
+    const description = document.createElement('p');
+    description.textContent = 'Spróbuj użyć innego tagu, nazwy modelki lub platformy.';
+    empty.append(icon, title, description);
+    dom.videoGrid.appendChild(empty);
+  }
+
   function loadModelVideos(username, page) {
     if (global.ArchivebateVideoViews && typeof global.ArchivebateVideoViews.loadModelVideos === 'function') {
       return global.ArchivebateVideoViews.loadModelVideos(username, page);
@@ -158,6 +178,57 @@
     const af = encodeURIComponent(state.authorFilter || 'all');
     const grp = state.groupByAuthor ? '1' : '0';
 
+    // Local search is deliberately an explicit, metadata-only scope. It never opens
+    // SSE/provider fetches and it pins subsequent pages to the revision used by page 1.
+    const localScope = dom.searchScopeSelect?.value === 'local';
+    if (localScope) {
+      const previousVideos = Array.isArray(state.videos) ? state.videos.slice() : [];
+      showSkeletons();
+      state.isLoading = true;
+      if (dom.paginationSection) dom.paginationSection.style.display = 'flex';
+      if (dom.paginationSectionTop) dom.paginationSectionTop.style.display = 'flex';
+      if (dom.videoCount) dom.videoCount.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> Szukanie w lokalnym katalogu...`;
+      const revision = page > 1 && Number.isInteger(Number(state.catalogRevision))
+        ? `&revision=${encodeURIComponent(state.catalogRevision)}`
+        : '';
+      try {
+        const data = await api().getJSON(
+          `/api/search/local?q=${encodeURIComponent(query)}&page=${page}&per_page=200&source=${src}${revision}`,
+          { timeoutMs: 30000, signal: controller.signal }
+        );
+        if (generation !== state.viewGeneration) return;
+        const items = Array.isArray(data.items) ? data.items : [];
+        state.catalogRevision = data.catalog_revision || null;
+        state.lastPage = Math.max(1, Number(data.page_count || data.last_page) || 1);
+        state.currentPage = Math.min(page, state.lastPage);
+        state.videos = items;
+        if (items.length > 0) {
+          renderVideoGrid(items);
+          scheduleThumbnailWarmup(items);
+        } else {
+          renderEmptySearch(query);
+        }
+        renderPagination();
+        if (dom.videoCount) {
+          const revisionLabel = state.catalogRevision ? ` • rewizja ${state.catalogRevision}` : '';
+          dom.videoCount.innerText = `${items.length} na stronie • Strona ${state.currentPage} z ${state.lastPage} • Łącznie: ${Number(data.total || 0).toLocaleString('pl-PL')} wyników lokalnych${revisionLabel}`;
+        }
+      } catch (e) {
+        if (generation !== state.viewGeneration || e?.code === 'cancelled') return;
+        state.currentPage = previousPage;
+        state.videos = previousVideos;
+        if (dom.pageJumpInput) dom.pageJumpInput.value = previousPage;
+        if (dom.pageJumpInputTop) dom.pageJumpInputTop.value = previousPage;
+        renderVideoGrid(state.videos);
+        renderPagination();
+        if (dom.videoCount) dom.videoCount.innerText = 'Nie udało się przeszukać lokalnego katalogu.';
+        triggerToast(e?.message || 'Błąd wyszukiwania lokalnego', 'error');
+      } finally {
+        if (generation === state.viewGeneration) state.isLoading = false;
+      }
+      return;
+    }
+
     // Kolejne strony mogą wymagać realnych zapytań do źródeł, jeśli nie ma ich jeszcze w cache.
     if (page > 1) {
       const previousVideos = Array.isArray(state.videos) ? state.videos.slice() : [];
@@ -176,7 +247,7 @@
         renderVideoGrid(state.videos);
         scheduleThumbnailWarmup(state.videos);
         renderPagination();
-        if (dom.videoCount) dom.videoCount.innerText = `${state.videos.length} na stronie • Strona ${state.currentPage} z ${state.lastPage} • Łącznie: ${Number(data.total_videos || 0).toLocaleString('pl-PL')} filmów • 5.5M+ w serwisach`;
+        if (dom.videoCount) dom.videoCount.innerText = `${state.videos.length} na stronie • Strona ${state.currentPage} z ${state.lastPage} • Łącznie: ${Number(data.total_videos || 0).toLocaleString('pl-PL')} filmów`;
       } catch (e) {
         if (generation !== state.viewGeneration || e?.code === 'cancelled') return;
         state.currentPage = previousPage;
@@ -223,13 +294,18 @@
             profiles.forEach(p => {
               const chip = document.createElement('div');
               chip.className = 'profile-chip';
-              chip.innerHTML = `
-                <div class="profile-chip-avatar">${(p.username || 'M').substring(0, 2).toUpperCase()}</div>
-                <div>
-                  <div class="profile-chip-name">${p.username}</div>
-                  <div class="profile-chip-meta">${p.platform || 'Cam'} ${p.gender ? '• ' + p.gender : ''}</div>
-                </div>
-              `;
+              const avatar = document.createElement('div');
+              avatar.className = 'profile-chip-avatar';
+              avatar.textContent = String(p.username || 'M').substring(0, 2).toUpperCase();
+              const info = document.createElement('div');
+              const name = document.createElement('div');
+              name.className = 'profile-chip-name';
+              name.textContent = String(p.username || '');
+              const meta = document.createElement('div');
+              meta.className = 'profile-chip-meta';
+              meta.textContent = `${p.platform || 'Cam'} ${p.gender ? '• ' + p.gender : ''}`;
+              info.append(name, meta);
+              chip.append(avatar, info);
               chip.title = `Zobacz profil ${p.username} (LPM) lub otwórz w nowej karcie (Kółko myszy)`;
               chip.addEventListener('click', () => loadModelVideos(p.username, 1));
               chip.addEventListener('auxclick', (e) => {
@@ -282,15 +358,7 @@
           state.activeSearchSource = null;
 
           if (accumulatedVideos.length === 0) {
-            if (dom.videoGrid) {
-              dom.videoGrid.innerHTML = `
-                <div class="empty-state" style="grid-column: 1 / -1;">
-                  <div class="empty-state-icon"><i class="fa-solid fa-film"></i></div>
-                  <h3>Nie znaleziono filmów dla "${query}"</h3>
-                  <p>Spróbuj użyć innego tagu, nazwy modelki lub platformy.</p>
-                </div>
-              `;
-            }
+            renderEmptySearch(query);
             if (dom.videoCount) dom.videoCount.innerText = '0 filmów';
           } else {
             if (payload.all_sorted_videos && payload.all_sorted_videos.length > 0) {
@@ -302,7 +370,7 @@
             const totalCount = payload.total_videos || accumulatedVideos.length;
             state.lastPage = payload.last_page || Math.ceil(totalCount / 280) || 1;
             if (dom.videoCount) {
-              dom.videoCount.innerText = `${accumulatedVideos.length} na stronie • Strona 1 z ${state.lastPage} • Łącznie: ${Number(totalCount).toLocaleString('pl-PL')} filmów • 5.5M+ w serwisach`;
+              dom.videoCount.innerText = `${accumulatedVideos.length} na stronie • Strona 1 z ${state.lastPage} • Łącznie: ${Number(totalCount).toLocaleString('pl-PL')} filmów`;
             }
             renderPagination();
           }

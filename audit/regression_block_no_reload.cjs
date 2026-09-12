@@ -10,8 +10,8 @@ assert.doesNotMatch(
 );
 assert.match(
   blockedSource,
-  /state\.videos\s*=\s*state\.videos\.filter/,
-  'blocking an author must prune the current client-side video list'
+  /data\s*&&\s*data\.success[\s\S]*?pruneBlockedAuthorFromClientState\(norm\)/,
+  'blocking an author may prune the current client-side list only after API confirmation'
 );
 assert.match(
   blockedSource,
@@ -21,12 +21,12 @@ assert.match(
 assert.match(
   blockedSource,
   /clientBlockedAuthors\(\)\.add\(norm\)/,
-  'blocking an author must mark the optimistic client-side block'
+  'blocking an author must mark the confirmed client-side block'
 );
 assert.match(
   blockedSource,
-  /setTimeout\(\(\) => c\.remove\(\), 180\)/,
-  'blocked cards should disappear locally so CSS Grid can close the gap'
+  /pendingBlocks\.add\(norm\)/,
+  'duplicate block requests must be serialized while the API is pending'
 );
 
-console.log('PASS: blocking an author compacts the current grid without reloading the page');
+console.log('PASS: blocking an author waits for API confirmation, then compacts the current grid without reloading');

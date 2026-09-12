@@ -142,3 +142,32 @@ Zrealizowano wyłącznie zakres **PAKIETU D** z pliku `PLAN_NAPRAWY_REGRESJI_V2.
 - `python audit/regression_checks.py`: **PASS**.
 - `python audit/regression_feed.py`: **PASS**.
 - `python audit/regression_feed_errors.py`: **PASS**.
+
+## Stan realizacji planu Next Generation — 2026-09-13
+
+Poniższa mapa uzupełnia wcześniejszy raport, który opisywał stan sprzed wdrożenia backlogu B01–B16. Zakres implementacyjny obejmuje wszystkie elementy materialne B01–B16, F17–F20 i U01–U08. U09 pozostaje świadomie pominięte: raport klasyfikuje je jako funkcję spekulatywną bez potwierdzonej potrzeby.
+
+| Zakres | Stan | Dowód i ograniczenie |
+|---|---|---|
+| B01–B08 | wdrożone | fail-safe store, lock, niedestrukcyjny block, immutable revision, typed fetch, kontrakty mutacji, keyed renderer i projekcje/counts; pokryte testami backend/frontend |
+| B09 | wdrożone, częściowo odebrane | local desired/outbox i jawne remote outcomes; brak kontrolowanego testu na prawdziwym koncie/providerze |
+| B10–B14 | wdrożone | source-scoped identity, cache `preferencesVersion`, trust/HTML boundaries, bounded groups/lazy members, stats poza event loop; testy regresji i fixture, bez pomiaru realnego CDN |
+| B15 | wdrożone, częściowo odebrane | admission/drain/reader registry/lifespan; lokalny test close/read/delete przechodzi, brak długiego soak i natywnego WebView |
+| B16 | wdrożone | active-path probes, negative controls, testy Windows CI i separacja historycznych testów od gate'a |
+| F17, F18, F20 | wdrożone | parser dotenv, supervisor/status dla scanów i usunięcie martwych kontrolek; testy kontraktów oraz UI |
+| F19, U06 | wdrożone w zakresie DOM/keyboard | role, labels, focus lifecycle, timeline slider i akcje klawiaturowe; pełny screen-reader, kontrast i reflow wymagają ręcznego odbioru |
+| U01–U05 | wdrożone | jawne stany UI, block+undo/manager, export/restore, diagnostyka i centrum jobs |
+| U07–U08 | wdrożone | local catalog search oraz versioned checkpoint z filtrami, rewizją, snapshotem i anchor identity |
+| U09 | pominięte decyzją zakresową | funkcja P3/speculative; nie liczę jej jako brak naprawy |
+
+Wskaźnik należy czytać w dwóch warstwach: realizacja kodowa przyjętego zakresu to **28/28 elementów**, natomiast pełny odbiór produktu to uczciwie około **90%**. Pozostałe ~10% to dowody, których lokalny offline harness nie może zastąpić: prawdziwy provider/account sync, pywebview, długotrwałe/crash/power-loss soak oraz pełny manualny odbiór AT/kontrastu/reflow i obciążenia realnym CDN. To nie jest procent pokrycia linii ani obietnica produkcyjnego SLA.
+
+### Końcowa weryfikacja po implementacji
+
+- 23 aktywne skrypty audytu Python: **PASS** poza sandboxem; dodatkowo `regression_checks.py`: **PASS**.
+- 15 aktywnych skryptów Node/frontend: **PASS**.
+- `python -m unittest -v test_suite.py`: **2 PASS, 1 jawnie pominięty** test zewnętrznego źródła.
+- Kompilacja/składnia: **53 pliki Python i 43 pliki JavaScript**; `git diff --check` bez błędów whitespace (tylko ostrzeżenia LF/CRLF).
+- Skan CI dla sekretów i destrukcyjnych komend startowych: **PASS**; workflow zawiera osobny job Windows.
+
+Testy z katalogami tymczasowymi uruchamiane w sandboxie Windows mogą kończyć się `PermissionError`; wynik poza sandboxem jest właściwym dowodem dla tych przypadków. Nie wykonano commita. Zastane zmiany `data/model_tags.json` i kopie magazynu użytkownika zachowano.

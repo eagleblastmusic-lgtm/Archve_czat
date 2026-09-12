@@ -2,31 +2,36 @@ import asyncio
 import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# Keep this acceptance harness isolated from the user's real data files.
+os.environ.setdefault("ARCHIVEBATE_USER_STORE", str(ROOT / "audit" / f"audit_fixes_{os.getpid()}_store.json"))
+os.environ.setdefault("ARCHIVEBATE_CATALOG_DB", str(ROOT / "audit" / f"audit_fixes_{os.getpid()}_catalog.db"))
+
+def fixture_path(label: str) -> Path:
+    """Use workspace-local fixture files; managed Windows temp dirs can be ACL-locked."""
+    return ROOT / "audit" / f"audit_fixes_{os.getpid()}_{label}"
+
 import config
 
 # 1. Anonymous startup: no embedded fallback.
-with tempfile.TemporaryDirectory() as td, \
-     patch.dict(os.environ, {}, clear=True), \
-     patch.object(config, "ENV_FILE", Path(td) / ".env.local"), \
-     patch.object(config, "LOCAL_CREDENTIALS_FILE", Path(td) / "credentials.local.json"):
+with patch.dict(os.environ, {}, clear=True), \
+     patch.object(config, "ENV_FILE", fixture_path("anonymous.env.local")), \
+     patch.object(config, "LOCAL_CREDENTIALS_FILE", fixture_path("anonymous.credentials.local.json")):
     assert config.get_archivebate_credentials() == ("", "")
 print("PASS audit-fix 1: no-config credentials fail closed")
 
 # 2. UserStorage persistence failure rolls memory back and propagates the error.
 import storage as storage_mod
-with tempfile.TemporaryDirectory() as td, \
-     patch.object(storage_mod, "STORE_FILE", str(Path(td) / "user_store.json")):
+with patch.object(storage_mod, "STORE_FILE", str(fixture_path("disk-full-store.json"))):
     test_store = storage_mod.UserStorage()
     with patch.object(storage_mod, "atomic_write_json", side_effect=OSError("disk full")):
         try:
-            test_store.add_favorite({"id": "audit-1", "username": "fixture"})
+            test_store.add_favorite({"id": "audit-1", "source": "archivebate", "username": "fixture"})
             raise AssertionError("persistence failure was acknowledged")
         except OSError:
             pass
@@ -37,18 +42,18 @@ print("PASS audit-fix 2: persistence failure is not acknowledged and memory roll
 from catalog_service import CatalogService, canonical_identity_key, MAX_PAGES_PER_SOURCE
 fixture = {"source": "archivebate", "title": "no id/url fixture", "username": "fixture"}
 key = canonical_identity_key(fixture)
-assert key.startswith("archivebate:hash:") and len(key.rsplit(":", 1)[-1]) == 64
+assert key.startswith("unscoped:hash:") and len(key.rsplit(":", 1)[-1]) == 64
 code = "from catalog_service import canonical_identity_key; print(canonical_identity_key(" + repr(fixture) + "))"
-env1 = dict(os.environ, PYTHONHASHSEED="1")
-env2 = dict(os.environ, PYTHONHASHSEED="2")
+env1 = dict(os.environ, PYTHONHASHSEED="1", ARCHIVEBATE_USER_STORE=str(fixture_path("hashseed-1-store.json")), ARCHIVEBATE_CATALOG_DB=str(fixture_path("hashseed-1-catalog.db")))
+env2 = dict(os.environ, PYTHONHASHSEED="2", ARCHIVEBATE_USER_STORE=str(fixture_path("hashseed-2-store.json")), ARCHIVEBATE_CATALOG_DB=str(fixture_path("hashseed-2-catalog.db")))
 k1 = subprocess.check_output([sys.executable, "-c", code], cwd=ROOT, env=env1, text=True).strip()
 k2 = subprocess.check_output([sys.executable, "-c", code], cwd=ROOT, env=env2, text=True).strip()
 assert k1 == k2 == key
 print("PASS audit-fix 3: fallback catalog identity is cross-process stable")
 
 # 4. Failed revision is never projected as complete/no-error.
-with tempfile.TemporaryDirectory() as td:
-    svc = CatalogService(Path(td) / "catalog.db")
+svc = CatalogService(fixture_path("failed-revision.db"))
+try:
     svc.import_items([{"id": "1", "source": "archivebate", "title": "x"}], revision=1)
     svc.mark_revision_failed(1, '{"archivebate":"forced"}')
     data = svc.query_page(revision=1)
@@ -58,24 +63,26 @@ with tempfile.TemporaryDirectory() as td:
     assert data["retryable"] is True
     assert data["source_error"].get("archivebate") == "forced"
     svc.close()
+except Exception:
+    svc.close()
+    raise
 print("PASS audit-fix 4: failed catalog revision is explicit")
 
 # 5. Safety page cap is a failure/truncation state, not verified end.
-with tempfile.TemporaryDirectory() as td:
-    svc = CatalogService(Path(td) / "cap.db")
-    import catalog_service as catalog_mod
-    old = dict(catalog_mod.MAX_PAGES_PER_SOURCE)
-    catalog_mod.MAX_PAGES_PER_SOURCE["archivebate"] = 2
-    try:
-        svc.build_revision_background({"archivebate": lambda page: [{"id": str(page), "source": "archivebate"}]}, force=True)
-        svc._indexing_thread.join(10)
-        stats = svc.get_revision_stats(1)
-        assert stats["failed"] is True and stats["complete"] is False, stats
-        page = svc.query_page(revision=1)
-        assert page["catalog_state"] == "failed" and page["retryable"] is True
-    finally:
-        catalog_mod.MAX_PAGES_PER_SOURCE.clear(); catalog_mod.MAX_PAGES_PER_SOURCE.update(old)
-        svc.close()
+svc = CatalogService(fixture_path("cap.db"))
+import catalog_service as catalog_mod
+old = dict(catalog_mod.MAX_PAGES_PER_SOURCE)
+catalog_mod.MAX_PAGES_PER_SOURCE["archivebate"] = 2
+try:
+    svc.build_revision_background({"archivebate": lambda page: [{"id": str(page), "source": "archivebate"}]}, force=True)
+    svc._indexing_thread.join(10)
+    stats = svc.get_revision_stats(1)
+    assert stats["failed"] is True and stats["complete"] is False, stats
+    page = svc.query_page(revision=1)
+    assert page["catalog_state"] == "failed" and page["retryable"] is True
+finally:
+    catalog_mod.MAX_PAGES_PER_SOURCE.clear(); catalog_mod.MAX_PAGES_PER_SOURCE.update(old)
+    svc.close()
 print("PASS audit-fix 5: catalog hard cap cannot publish complete")
 
 # 6. Main account outcome is typed and async GETs use offload/coalescing helper.
@@ -94,11 +101,13 @@ print("PASS audit-fix 6: account sync exposes failure and async GET path offload
 # 7. Remote favorite failure is not reported as fully successful.
 with patch.object(main.storage, "toggle_favorite", return_value=True), \
      patch.object(main.scraper, "toggle_remote_save", return_value=False), \
+     patch.object(main.storage, "set_remote_intent", return_value={"status": "pending"}), \
+     patch.object(main.storage, "set_remote_status", return_value={"status": "failed"}), \
      patch.object(main, "invalidate_feed_cache", return_value=None):
     main.session.email = "configured@example.invalid"; main.session.password = "configured"
-    fav = main.toggle_favorite({"id": "42"})
+    fav = main.toggle_favorite({"id": "42", "source": "archivebate"})
 assert fav["local_committed"] is True and fav["remote_synced"] is False
-assert fav["success"] is False and fav["sync_state"] == "remote_failed"
+assert fav["success"] is False and fav["sync_state"] == "failed"
 print("PASS audit-fix 7: favorite remote failure is explicit")
 
 # 8. No launcher contains port-authorized force termination.
@@ -118,11 +127,12 @@ print("PASS audit-fix 9: stale diagnostics segregated from release evidence")
 
 # 10. Older stores are schema-normalized and account sync preserves local-only block fields.
 import json as _json
-with tempfile.TemporaryDirectory() as td, patch.object(storage_mod, "STORE_FILE", str(Path(td) / "user_store.json")):
-    Path(storage_mod.STORE_FILE).write_text(_json.dumps({
-        "favorites": [{"id": "fav-1", "username": "alpha"}],
-        "history": [{"id": "hist-1", "username": "beta"}],
-        "following": [{"id": "fol-1", "username": "gamma"}],
+legacy_store_path = fixture_path("legacy-store.json")
+with patch.object(storage_mod, "STORE_FILE", str(legacy_store_path)):
+    legacy_store_path.write_text(_json.dumps({
+        "favorites": [{"id": "fav-1", "source": "archivebate", "username": "alpha"}],
+        "history": [{"id": "hist-1", "source": "archivebate", "username": "beta"}],
+        "following": [{"id": "fol-1", "source": "archivebate", "username": "gamma"}],
         "last_synced": "legacy",
     }), encoding="utf-8")
     legacy_store = storage_mod.UserStorage()

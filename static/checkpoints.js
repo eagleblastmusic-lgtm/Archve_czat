@@ -35,13 +35,24 @@
   }
 
   function setCheckpoint(v) {
+    const source = String(v.source || (String(v.id || '').startsWith('cw_') ? 'camwhores' : 'archivebate'));
+    const providerId = String(v.provider_id || v.id || '').replace(/^cw_/, '');
     const checkpoint = {
-      videoId: String(v.id),
-      videoTitle: v.username || 'Film',
-      videoDate: v.date || '',
+      videoId: providerId,
+      source,
+      videoKey: `${source}:id:${providerId}`,
+      videoTitle: String(v.username || 'Film'),
+      videoDate: String(v.date || ''),
       page: state.currentPage || 1,
       mode: state.mode || 'home',
       query: state.currentQuery || '',
+      currentModel: state.currentModel || '',
+      searchScope: dom.searchScopeSelect?.value || 'online',
+      sourceFilter: state.sourceFilter || 'all',
+      authorFilter: state.authorFilter || 'all',
+      groupByAuthor: Boolean(state.groupByAuthor),
+      catalogRevision: Number(state.catalogRevision || state.currentRevision || 0) || 0,
+      snapshotId: state.feedSnapshotId || null,
       timestamp: Date.now()
     };
     localStorage.setItem('archivebate_checkpoint', JSON.stringify(checkpoint));
@@ -68,15 +79,26 @@
     }
 
     document.querySelectorAll('.card-date-badge').forEach(badge => {
-      const bVidId = badge.dataset.videoId;
-      if (cp && bVidId === cp.videoId) {
+      const card = badge.closest('.video-card');
+      const source = card?.dataset?.source || 'archivebate';
+      const bVidId = String(badge.dataset.videoId || '').replace(/^cw_/, '');
+      const currentKey = `${source}:id:${bVidId}`;
+      if (cp && (currentKey === cp.videoKey || (!cp.videoKey && source === (cp.source || 'archivebate') && bVidId === cp.videoId))) {
         badge.classList.add('is-checkpoint');
-        badge.innerHTML = `<i class="fa-solid fa-location-dot"></i> Checkpoint`;
+        badge.replaceChildren();
+        const icon = document.createElement('i');
+        icon.className = 'fa-solid fa-location-dot';
+        icon.setAttribute('aria-hidden', 'true');
+        badge.append(icon, document.createTextNode(' Checkpoint'));
         badge.title = `Ten film to Twój aktywny punkt kontrolny (Strona ${cp.page})`;
       } else {
         badge.classList.remove('is-checkpoint');
         if (badge.dataset.origDate) {
-          badge.innerHTML = `<i class="fa-regular fa-calendar-days"></i> ${badge.dataset.origDate}`;
+          badge.replaceChildren();
+          const icon = document.createElement('i');
+          icon.className = 'fa-regular fa-calendar-days';
+          icon.setAttribute('aria-hidden', 'true');
+          badge.append(icon, document.createTextNode(` ${badge.dataset.origDate}`));
           badge.title = 'Kliknij na datę, aby ustawić punkt kontrolny (checkpoint)';
         }
       }
@@ -91,13 +113,29 @@
     }
 
     state.targetCheckpointId = cp.videoId;
+    state.targetCheckpointKey = cp.videoKey || `${cp.source || 'archivebate'}:id:${cp.videoId}`;
+    state.sourceFilter = cp.sourceFilter || 'all';
+    state.authorFilter = cp.authorFilter || 'all';
+    state.groupByAuthor = Boolean(cp.groupByAuthor);
+    state.catalogRevision = Number(cp.catalogRevision) || null;
+    if (dom.searchScopeSelect) dom.searchScopeSelect.value = cp.searchScope || 'online';
+    global.ArchivebateFilters?.updateCamwhoresToggleUI?.();
+    global.ArchivebateFilters?.updateAuthorFilterUI?.();
+    global.ArchivebateFilters?.updateGroupToggleUI?.();
+    state.checkpointContext = {
+      catalogRevision: Number(cp.catalogRevision) || 0,
+      snapshotId: cp.snapshotId || null,
+      sourceFilter: cp.sourceFilter || 'all',
+      authorFilter: cp.authorFilter || 'all',
+      groupByAuthor: Boolean(cp.groupByAuthor)
+    };
 
     if (cp.mode === 'search' && cp.query) {
       dom.searchInput.value = cp.query;
       dom.clearSearchBtn.style.display = 'flex';
       performSearch(cp.query, cp.page);
-    } else if (cp.mode === 'model' && cp.query) {
-      loadModelVideos(cp.query, cp.page);
+    } else if (cp.mode === 'model' && (cp.currentModel || cp.query)) {
+      loadModelVideos(cp.currentModel || cp.query, cp.page);
     } else if (cp.mode === 'favorites') {
       setActiveNavTab(dom.navFavoritesBtn);
       loadFavorites(cp.page);
@@ -115,7 +153,11 @@
 
   function checkAndHighlight() {
     if (state.targetCheckpointId) {
-      const targetCard = dom.videoGrid.querySelector(`[data-video-id="${state.targetCheckpointId}"]`);
+      const targetCard = Array.from(dom.videoGrid.querySelectorAll('.video-card')).find(card => {
+        const source = card.dataset?.source || 'archivebate';
+        const id = String(card.dataset?.videoId || '').replace(/^cw_/, '');
+        return `${source}:id:${id}` === state.targetCheckpointKey;
+      });
       if (targetCard) {
         targetCard.classList.add('checkpoint-highlight');
         setTimeout(() => {

@@ -140,6 +140,10 @@ class ArchivebateSession:
             "login_error": self.last_login_error
         }
 
+    def close(self) -> None:
+        """Zwalnia pulę połączeń requests podczas zamykania aplikacji."""
+        self.session.close()
+
     def call_livewire(self, component_name: str, fingerprint: dict, server_memo: dict, method: str, params: list = None) -> Optional[str]:
         """Wywołuje metodę komponentu Livewire z zachowaniem sesji."""
         url = f"{self.BASE_URL}/livewire/message/{component_name}"

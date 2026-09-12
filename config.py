@@ -15,20 +15,37 @@ def _read_env_file(path: Path) -> Dict[str, str]:
     if not path.exists():
         return values
     try:
-        import re
         content = path.read_text(encoding="utf-8-sig")
         for line in content.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # Szuka par KEY=VALUE nawet jeśli są na jednej linii
-            pairs = re.findall(r'([A-Za-z0-9_]+)\s*=\s*([^\s\r\n]+|"[^"]*"|\'[^\']*\')', line)
-            if pairs:
-                for k, v in pairs:
-                    values[k.strip().lstrip("\ufeff")] = v.strip().strip('"').strip("'")
-            elif "=" in line:
-                k, v = line.split("=", 1)
-                values[k.strip().lstrip("\ufeff")] = v.strip().strip('"').strip("'")
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            key = key.strip().lstrip("\ufeff")
+            if not key or not all(ch.isalnum() or ch == "_" for ch in key):
+                continue
+
+            # Strip comments only outside quotes. Unquoted values may contain spaces; this is
+            # important for quoted Windows secrets and passphrases with punctuation.
+            quote = None
+            value_chars = []
+            for index, char in enumerate(raw_value.strip()):
+                if char in {"'", '"'}:
+                    if quote is None:
+                        quote = char
+                    elif quote == char:
+                        quote = None
+                if char == "#" and quote is None and (index == 0 or raw_value.strip()[index - 1].isspace()):
+                    break
+                value_chars.append(char)
+            value = "".join(value_chars).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            values[key] = value
     except OSError:
         pass
     return values

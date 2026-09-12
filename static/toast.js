@@ -9,7 +9,7 @@
   const context = global.ArchivebateAppContext || { dom: {} };
   const dom = context.dom || {};
 
-  function show(message, type = 'info', existingToast = null) {
+  function show(message, type = 'info', existingToast = null, actions = []) {
     let toast = existingToast;
     let icon = 'fa-info-circle';
     if (type === 'success') icon = 'fa-circle-check';
@@ -20,7 +20,25 @@
       toast.className = 'toast';
       dom.toastContainer.appendChild(toast);
     }
-    toast.innerHTML = `<i class="fa-solid ${icon}" style="color: ${type === 'success' ? 'var(--success)' : type === 'error' ? 'var(--danger)' : 'var(--primary)'}"></i> <span>${message}</span>`;
+    toast.replaceChildren();
+    const iconEl = document.createElement('i');
+    iconEl.className = `fa-solid ${icon}`;
+    iconEl.style.color = type === 'success' ? 'var(--success)' : type === 'error' ? 'var(--danger)' : 'var(--primary)';
+    iconEl.setAttribute('aria-hidden', 'true');
+    const textEl = document.createElement('span');
+    textEl.textContent = String(message ?? '');
+    toast.append(iconEl, document.createTextNode(' '), textEl);
+    if (Array.isArray(actions)) {
+      actions.forEach(action => {
+        if (!action || typeof action.onClick !== 'function') return;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'toast-action';
+        button.textContent = String(action.label || 'Wykonaj');
+        button.addEventListener('click', () => action.onClick(button));
+        toast.appendChild(button);
+      });
+    }
     toast.style.opacity = '1';
     toast.style.transform = 'none';
 

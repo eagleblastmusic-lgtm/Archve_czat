@@ -20,9 +20,9 @@ def add_source_run(service, revision, source="archivebate"):
 with tempfile.TemporaryDirectory() as tmp:
     db = Path(tmp) / "catalog.db"
     service = catalog.CatalogService(db)
-    service.import_items([{"id": "r17", "username": "old"}], revision=17, complete=True)
-    service.import_items([{"id": "r20", "username": "newer"}], revision=20, complete=True)
-    service.import_items([{"id": "r23", "username": "newest"}], revision=23, complete=True)
+    service.import_items([{"id": "r17", "source": "archivebate", "username": "old"}], revision=17, complete=True)
+    service.import_items([{"id": "r20", "source": "archivebate", "username": "newer"}], revision=20, complete=True)
+    service.import_items([{"id": "r23", "source": "archivebate", "username": "newest"}], revision=23, complete=True)
 
     # Reproduce the broken on-disk shape: an older revision was activated later and therefore has
     # a newer updated_at. Reopening the service must still select revision 23 by revision order.
@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory() as tmp:
     assert [int(r["revision"]) for r in active_rows] == [23], active_rows
 
     # A stale unfinished revision below the completed floor must never be resumed.
-    service.import_items([{"id": "r18", "username": "stale"}], revision=18, complete=False)
+    service.import_items([{"id": "r18", "source": "archivebate", "username": "stale"}], revision=18, complete=False)
     add_source_run(service, 18)
     assert service.get_resumable_revision() is None
 
@@ -50,11 +50,11 @@ with tempfile.TemporaryDirectory() as tmp:
     assert service.get_active_revision() == 23
 
     # The same monotonic rule applies to import_items(..., complete=True).
-    service.import_items([{"id": "r19", "username": "stale2"}], revision=19, complete=True)
+    service.import_items([{"id": "r19", "source": "archivebate", "username": "stale2"}], revision=19, complete=True)
     assert service.get_active_revision() == 23
 
     # A genuinely newer partial revision remains resumable.
-    service.import_items([{"id": "r24", "username": "future"}], revision=24, complete=False)
+    service.import_items([{"id": "r24", "source": "archivebate", "username": "future"}], revision=24, complete=False)
     add_source_run(service, 24)
     assert service.get_resumable_revision() == 24
     service.close()

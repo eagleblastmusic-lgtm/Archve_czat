@@ -42,7 +42,13 @@
 
   const api = () => global.ArchivebateAPI || {
     getJSON: (url, opts) => fetch(url, opts).then(r => r.json()),
-    postJSON: (url, body, opts) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), ...opts }).then(r => r.json())
+    postJSON: (url, body, opts) => {
+      const token = document.querySelector('meta[name="archivebate-mutation-token"]')?.content || '';
+      return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Archivebate-Mutation-Token': token } : {}) }, body: JSON.stringify(body), ...opts }).then(async response => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      });
+    }
   };
 
   const perf = () => global.ArchivebatePerf || {
@@ -138,6 +144,7 @@
 
   function showSkeletons() {
     state.gridGeneration = (state.gridGeneration || 0) + 1;
+    global.ArchivebateVideoGrid?.cancelPendingChunks?.();
     if (dom.videoGrid) {
       dom.videoGrid.innerHTML = '';
       for (let i = 0; i < 12; i++) {
@@ -292,6 +299,13 @@
     const af = encodeURIComponent(state.authorFilter || 'all');
     const grp = state.groupByAuthor ? '1' : '0';
     const specKey = `${src}|${af}|${grp}`;
+    const checkpoint = state.checkpointContext;
+    if (checkpoint && checkpoint.sourceFilter === (state.sourceFilter || 'all') && checkpoint.authorFilter === (state.authorFilter || 'all') && checkpoint.groupByAuthor === Boolean(state.groupByAuthor)) {
+      state.catalogRevision = checkpoint.catalogRevision || null;
+      state.feedSnapshotId = checkpoint.snapshotId || null;
+      state.feedSpecKey = specKey;
+      state.checkpointContext = null;
+    }
     const cachedPage = !force ? getCachedHomePage(page, specKey) : null;
     let renderedFromPageCache = false;
 
@@ -390,6 +404,14 @@
         const pageCount = d.page_count || d.last_page || 1;
         state.lastPage = pageCount;
         state.totalCatalogVideos = totalVids;
+        if (dom.statCatalogVideos) {
+          dom.statCatalogVideos.innerText = Number.isFinite(Number(totalVids))
+            ? Number(totalVids).toLocaleString('pl-PL')
+            : '--';
+        }
+        if (dom.statCatalogVideosLbl) {
+          dom.statCatalogVideosLbl.innerText = `Bieżący zakres • ${Number(pageCount).toLocaleString('pl-PL')} stron`;
+        }
         if (dom.pageJumpInput) dom.pageJumpInput.max = pageCount;
         if (dom.pageJumpInputTop) dom.pageJumpInputTop.max = pageCount;
 
@@ -435,22 +457,7 @@
           return;
         }
 
-        const currentVideosCount = state.videos ? state.videos.length : 0;
         const incomingVideos = batchData.videos || batchData.items || [];
-        if (!isInitial && currentVideosCount >= 280 && incomingVideos.length === currentVideosCount && state.lastAppliedVideosCount === currentVideosCount) {
-          state.lastAppliedFeedRevision = currentRev;
-          state.lastAppliedFeedUpdatedAt = incomingUpdatedAt;
-          state.lastAppliedFeedVideoCount = incomingVideoCount;
-          state.catalogRevision = currentRev;
-          if (batchData.snapshot_id) state.feedSnapshotId = batchData.snapshot_id;
-          state.catalogComplete = !!batchData.catalog_complete;
-          state.totalCatalogVideos = batchData.video_count !== undefined ? batchData.video_count : batchData.known_count;
-          state.feedHasMore = batchData.has_more;
-          state.lastPage = batchData.page_count || batchData.last_page;
-          updateFeedCounters(batchData);
-          if (batchData.complete || batchData.stopped) setFeedRefreshingIndicator(false);
-          return;
-        }
 
         state.lastAppliedFeedRevision = currentRev;
         state.lastAppliedFeedUpdatedAt = incomingUpdatedAt;
@@ -854,7 +861,7 @@
 
       renderVideoGrid(state.videos);
       scheduleThumbnailWarmup(state.videos);
-      if (dom.videoCount) dom.videoCount.innerText = `${state.videos.length} na stronie • Modelka: ${username} • 5.5M+ w serwisach`;
+      if (dom.videoCount) dom.videoCount.innerText = `${state.videos.length} na stronie • Modelka: ${username}`;
 
       if (state.videos.length === 0 && page > 1) {
         state.lastPage = page - 1;

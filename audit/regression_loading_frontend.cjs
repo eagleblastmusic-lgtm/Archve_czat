@@ -7,7 +7,8 @@ function element() {
     appendChild(child){ this.children.push(child); child.remove = () => this.children.splice(this.children.indexOf(child),1); },
     querySelectorAll(selector){ return this.children.filter(c => '.'+c.className === selector); },
     querySelector(selector){ return this.querySelectorAll(selector)[0] || null; },
-    addEventListener(){}, pause(){}, load(){}, play(){return Promise.resolve();},
+    addEventListener(){}, removeEventListener(){}, pause(){}, load(){}, play(){return Promise.resolve();},
+    setAttribute(name, value){this[name] = String(value);},
     removeAttribute(name){this[name]='';}, getAttribute(name){return this[name] || '';}
   };
   return e;
@@ -17,7 +18,10 @@ function env(state, dom) {
     location:{href:'http://localhost/'}, ArchivebateAppContext:{state,dom},
     document:{body:{style:{}},getElementById:()=>null,createElement:element,querySelectorAll:()=>[]},
     ArchivebatePerf:{measure(){},setPlaybackBusy(){}},
-    ArchivebateVideoGrid:{reconcilePage(v){dom.videoGrid.children=[];v.forEach(()=>dom.videoGrid.appendChild(element()));}},
+    ArchivebateVideoGrid:{
+      renderVideoGrid(v){dom.videoGrid.children=[];v.forEach(()=>dom.videoGrid.appendChild(element()));},
+      reconcilePage(v){dom.videoGrid.children=[];v.forEach(()=>dom.videoGrid.appendChild(element()));}
+    },
   };
   c.window=c;
   vm.createContext(c);

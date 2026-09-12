@@ -1,12 +1,21 @@
 """Regression for durable Archivebate model discovery + deep-profile merge."""
 import sys
-import tempfile
+import os
+from contextlib import contextmanager
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from catalog_service import CatalogService
 from deep_archivebate import DeepArchivebateService
+
+
+@contextmanager
+def fixture_directory(label: str):
+    """Avoid managed Windows tempfile ACLs while keeping fixtures isolated."""
+    path = Path(__file__).parent / f"deep_fixture_{os.getpid()}_{label}"
+    path.mkdir(exist_ok=True)
+    yield path
 
 
 def video(video_id, username, date):
@@ -42,8 +51,8 @@ class FakeScraper:
         return []
 
 
-with tempfile.TemporaryDirectory() as td:
-    db = Path(td) / "catalog.db"
+with fixture_directory("primary") as td:
+    db = td / "catalog.db"
     catalog = CatalogService(db)
     catalog.import_items([video(1, "recent_model", "1 hour ago")], revision=1, complete=True)
 
@@ -67,14 +76,14 @@ with tempfile.TemporaryDirectory() as td:
     # Search-discovered models have higher priority, so the first profile page immediately
     # contributes an older video and a brand-new author to the live completed revision.
     assert deep.crawl_step(fake) is True
-    grouped = catalog.query_page(source="only-archivebate", group_authors=True, revision=1)
+    grouped = catalog.query_page(source="only-archivebate", group_authors=True)
     assert grouped["video_count"] == 2, grouped
     assert grouped["group_count"] == 2, grouped
     assert grouped["page_count"] == 1, grouped
     usernames = {item.get("username") for item in grouped["items"]}
     assert usernames == {"recent_model", "ancient_new_model"}, usernames
 
-    ungrouped = catalog.query_page(source="only-archivebate", group_authors=False, revision=1)
+    ungrouped = catalog.query_page(source="only-archivebate", group_authors=False)
     assert ungrouped["video_count"] == 2, ungrouped
     assert any(item.get("date") == "01.01.2020" for item in ungrouped["items"]), ungrouped
 
@@ -91,7 +100,7 @@ with tempfile.TemporaryDirectory() as td:
     # The catalog-seeded model then gets its own historical page merged without duplicating
     # the existing recent item.
     assert deep.crawl_step(fake) is True
-    final = catalog.query_page(source="only-archivebate", revision=1)
+    final = catalog.query_page(source="only-archivebate")
     assert final["video_count"] == 3, final
     assert deep.status()["deep_items"] == 2, deep.status()
 
@@ -111,8 +120,8 @@ class SelectionScraper:
         return []
 
 
-with tempfile.TemporaryDirectory() as td:
-    db = Path(td) / "catalog.db"
+with fixture_directory("selection") as td:
+    db = td / "catalog.db"
     catalog = CatalogService(db)
     deep = DeepArchivebateService(db, request_delay=0.01)
     conn = deep._get_conn()

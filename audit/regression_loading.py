@@ -18,9 +18,9 @@ with patch.object(requests.Session, 'request', side_effect=AssertionError('Exter
     with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
         db = Path(tmp) / 'legacy.db'
         service = catalog.CatalogService(db)
-        service.import_items([{'id': 'old', 'username': 'fixture'}], 1, complete=True)
-        service.import_items([{'id': 'published', 'username': 'fixture'}], 2, complete=True)
-        service.import_items([{'id': 'partial', 'username': 'fixture'}], 3)
+        service.import_items([{'id': 'old', 'username': 'fixture', 'source': 'archivebate'}], 1, complete=True)
+        service.import_items([{'id': 'published', 'username': 'fixture', 'source': 'archivebate'}], 2, complete=True)
+        service.import_items([{'id': 'partial', 'username': 'fixture', 'source': 'archivebate'}], 3)
         service.close()
         with sqlite3.connect(db) as conn:
             conn.execute('ALTER TABLE revisions DROP COLUMN is_active')

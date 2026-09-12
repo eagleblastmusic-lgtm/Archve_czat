@@ -66,7 +66,7 @@ def wait(service):
 with tempfile.TemporaryDirectory() as tmp:
     db = Path(tmp) / "catalog.db"
     service = catalog.CatalogService(db)
-    service.import_items([{"id": "legacy", "username": "legacy"}], revision=21, complete=True)
+    service.import_items([{"id": "legacy", "source": "archivebate", "username": "legacy"}], revision=21, complete=True)
     with service._lock:
         conn = service._get_conn()
         conn.execute(

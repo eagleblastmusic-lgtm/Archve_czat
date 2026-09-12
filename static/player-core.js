@@ -19,6 +19,186 @@
     return clamp(raw, halfWidth, rect.width - halfWidth);
   }
 
+  function formatTime(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const remainder = total % 60;
+    if (hours > 0) {
+      return `${hours}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
+    }
+    return `${minutes}:${String(remainder).padStart(2, '0')}`;
+  }
+
+  function parseDurationToSeconds(value) {
+    if (value === null || value === undefined || value === '') return 0;
+    if (typeof value === 'number') return Number.isFinite(value) ? Math.max(0, value) : 0;
+    const parts = String(value).trim().split(':').map(Number);
+    if (parts.some(part => !Number.isFinite(part))) return 0;
+    if (parts.length === 3) return Math.max(0, parts[0] * 3600 + parts[1] * 60 + parts[2]);
+    if (parts.length === 2) return Math.max(0, parts[0] * 60 + parts[1]);
+    return Number.isFinite(parts[0]) ? Math.max(0, parts[0]) : 0;
+  }
+
+  function setButtonLabel(button, label) {
+    if (!button || typeof button.setAttribute !== 'function') return;
+    button.setAttribute('aria-label', label);
+    button.setAttribute('title', label);
+  }
+
+  function updateVolumeIcon(video, button) {
+    if (!button || !video) return;
+    const muted = Boolean(video.muted) || Number(video.volume) <= 0;
+    const volume = Number(video.volume) || 0;
+    if (muted) {
+      button.innerHTML = '<i class="fa-solid fa-volume-xmark"></i>';
+      setButtonLabel(button, 'Włącz dźwięk (M)');
+    } else if (volume < 0.5) {
+      button.innerHTML = '<i class="fa-solid fa-volume-low"></i>';
+      setButtonLabel(button, 'Wycisz (M)');
+    } else {
+      button.innerHTML = '<i class="fa-solid fa-volume-high"></i>';
+      setButtonLabel(button, 'Wycisz (M)');
+    }
+    if (button.setAttribute) button.setAttribute('aria-pressed', muted ? 'true' : 'false');
+  }
+
+  function setupVolumeControls(video, slider, button) {
+    if (!video) return () => {};
+
+    const updateSlider = () => {
+      if (slider) {
+        slider.value = String(clamp(Number(video.volume) || 0, 0, 1));
+        if (slider.setAttribute) slider.setAttribute('aria-valuenow', slider.value);
+      }
+      updateVolumeIcon(video, button);
+    };
+    const onSliderInput = (event) => {
+      const value = clamp(Number(event?.target?.value) || 0, 0, 1);
+      video.volume = value;
+      video.muted = value === 0;
+      if (value > 0) video._archivebateLastVolume = value;
+      updateSlider();
+    };
+    const onButtonClick = (event) => {
+      event?.stopPropagation?.();
+      if (video.muted || Number(video.volume) <= 0) {
+        const restored = clamp(Number(video._archivebateLastVolume) || 0.8, 0.05, 1);
+        video.volume = restored;
+        video.muted = false;
+      } else {
+        video._archivebateLastVolume = clamp(Number(video.volume) || 0.8, 0.05, 1);
+        video.muted = true;
+      }
+      updateSlider();
+    };
+    const onVolumeChange = () => updateSlider();
+
+    if (slider?.addEventListener) slider.addEventListener('input', onSliderInput);
+    if (button?.addEventListener) button.addEventListener('click', onButtonClick);
+    video.addEventListener?.('volumechange', onVolumeChange);
+    if (!Number.isFinite(Number(video.volume))) video.volume = 1;
+    if (Number(video.volume) > 0) video._archivebateLastVolume = clamp(Number(video.volume), 0.05, 1);
+    updateSlider();
+
+    return () => {
+      slider?.removeEventListener?.('input', onSliderInput);
+      button?.removeEventListener?.('click', onButtonClick);
+      video.removeEventListener?.('volumechange', onVolumeChange);
+    };
+  }
+
+  function setupSpeedToggle(video, button) {
+    if (!video || !button?.addEventListener) return () => {};
+    const speeds = [1, 1.25, 1.5, 2, 0.75];
+    let index = Math.max(0, speeds.findIndex(speed => Math.abs(speed - (Number(video.playbackRate) || 1)) < 0.01));
+    if (index < 0) index = 0;
+
+    const render = () => {
+      const speed = speeds[index];
+      video.playbackRate = speed;
+      button.innerText = `${speed}x`;
+      setButtonLabel(button, `Prędkość odtwarzania: ${speed}x`);
+    };
+    const onClick = (event) => {
+      event?.stopPropagation?.();
+      index = (index + 1) % speeds.length;
+      render();
+    };
+    button.addEventListener('click', onClick);
+    render();
+    return () => button.removeEventListener?.('click', onClick);
+  }
+
+  function setupFullscreenToggle(wrapper, button) {
+    if (!wrapper || !button?.addEventListener) return () => {};
+    const doc = wrapper.ownerDocument || (typeof document !== 'undefined' ? document : null);
+    if (!doc) return () => {};
+
+    const render = () => {
+      const active = doc.fullscreenElement === wrapper;
+      button.innerHTML = active
+        ? '<i class="fa-solid fa-compress"></i>'
+        : '<i class="fa-solid fa-expand"></i>';
+      setButtonLabel(button, active ? 'Wyjdź z pełnego ekranu (F)' : 'Pełny ekran (F)');
+      if (button.setAttribute) button.setAttribute('aria-pressed', active ? 'true' : 'false');
+    };
+    const onClick = async (event) => {
+      event?.stopPropagation?.();
+      try {
+        if (doc.fullscreenElement) {
+          await doc.exitFullscreen?.();
+        } else if (typeof wrapper.requestFullscreen === 'function') {
+          await wrapper.requestFullscreen();
+        } else if (typeof wrapper.webkitRequestFullscreen === 'function') {
+          wrapper.webkitRequestFullscreen();
+        }
+      } catch (_) {
+        // Przeglądarka może odmówić fullscreen bez gestu użytkownika.
+      } finally {
+        render();
+      }
+    };
+    button.addEventListener('click', onClick);
+    doc.addEventListener?.('fullscreenchange', render);
+    render();
+    return () => {
+      button.removeEventListener?.('click', onClick);
+      doc.removeEventListener?.('fullscreenchange', render);
+    };
+  }
+
+  function setupIdleTimer(wrapper, controls, video, delayMs = 2500) {
+    let timer = null;
+    const clear = () => {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    };
+    const reset = () => {
+      controls?.classList?.remove?.('idle');
+      clear();
+      if (!video?.paused && !video?.ended) {
+        timer = setTimeout(() => controls?.classList?.add?.('idle'), delayMs);
+      }
+    };
+    const onPause = () => {
+      clear();
+      controls?.classList?.remove?.('idle');
+    };
+    const onPointerLeave = () => {
+      if (!video?.paused && !video?.ended) controls?.classList?.add?.('idle');
+    };
+
+    wrapper?.addEventListener?.('pointermove', reset, { passive: true });
+    wrapper?.addEventListener?.('pointerenter', reset, { passive: true });
+    wrapper?.addEventListener?.('pointerleave', onPointerLeave, { passive: true });
+    video?.addEventListener?.('play', reset);
+    video?.addEventListener?.('pause', onPause);
+    reset();
+
+    return reset;
+  }
+
   function nextAnimationFrame() {
     return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
   }
@@ -212,6 +392,13 @@
     clamp,
     ratioFromPointer,
     tooltipX,
+    formatTime,
+    parseDurationToSeconds,
+    updateVolumeIcon,
+    setupVolumeControls,
+    setupSpeedToggle,
+    setupFullscreenToggle,
+    setupIdleTimer,
     waitForPresentedFrame,
     createPreviewSeeker,
     findNearestFrameIndex

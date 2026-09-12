@@ -50,6 +50,7 @@ const context = {
   Image: FakeImage,
   window: {},
   document: {
+    querySelector() { return null; },
     createElement(tag) { return new FakeElement(tag); }
   }
 };

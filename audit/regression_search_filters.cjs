@@ -45,4 +45,11 @@ assert.deepEqual(calls, [['#trans', 1]]);
 authorBtn.click();
 assert.equal(state.authorFilter, 'only_fav');
 assert.deepEqual(calls, [['#trans', 1], ['#trans', 1]]);
+
+const searchSource = fs.readFileSync('static/search-results.js', 'utf8');
+const indexSource = fs.readFileSync('static/index.html', 'utf8');
+assert.match(indexSource, /id="searchScopeSelect"/, 'search must expose an explicit online/local scope');
+assert.match(searchSource, /dom\.searchScopeSelect\?\.value === 'local'/, 'local search must be selected explicitly');
+assert.match(searchSource, /\/api\/search\/local\?q=/, 'local search must use the local catalog endpoint');
+assert.match(searchSource, /wyników lokalnych/, 'local results must be labelled as metadata-only');
 console.log('PASS: search source/author filters rerun active query from page 1');

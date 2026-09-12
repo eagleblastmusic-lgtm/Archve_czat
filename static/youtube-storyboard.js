@@ -13,6 +13,14 @@
   const CROSS_TAB_LEASE_MS = 8000;
   const crossTabId = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
 
+  function mutationRequest(url, options = {}) {
+    if (globalThis.ArchivebateAPI?.request) return globalThis.ArchivebateAPI.request(url, options);
+    const headers = { ...(options.headers || {}) };
+    const token = document.querySelector('meta[name="archivebate-mutation-token"]')?.content || '';
+    if (token) headers['X-Archivebate-Mutation-Token'] = token;
+    return fetch(url, { ...options, headers });
+  }
+
   function makeCrossTabBridge() {
     let channel = null;
     let storageAvailable = false;
@@ -240,7 +248,7 @@
     const key = cacheKey(videoId, duration);
     const existing = memory.get(key);
     if (existing?.quality === 'full') return;
-    fetch(`/api/storyboard?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}`, {
+    mutationRequest(`/api/storyboard?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}`, {
       cache: 'no-store',
       priority: 'low', method: 'POST'
     }).catch(() => {});
@@ -423,21 +431,21 @@
     if (cached?.quality === 'full') return cached;
     const consumer=globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`;
     const leaseUrl=`/api/storyboard/demand?id=${encodeURIComponent(videoId)}&consumer=${encodeURIComponent(consumer)}`;
-    const leaseResponse=await fetch(leaseUrl,{method:'POST',signal});
+    const leaseResponse=await mutationRequest(leaseUrl,{method:'POST',signal});
     if(!leaseResponse.ok)throw new Error('Storyboard demand unavailable');
     let timer;
     let expiry;
     const release=()=>{
       clearInterval(timer);clearTimeout(expiry);
       signal?.removeEventListener('abort',release);
-      fetch(leaseUrl,{method:'DELETE',keepalive:true}).catch(()=>{});
+      mutationRequest(leaseUrl,{method:'DELETE',keepalive:true}).catch(()=>{});
     };
-    timer=setInterval(()=>fetch(leaseUrl,{method:'POST'}).catch(()=>{}),20000);
+    timer=setInterval(()=>mutationRequest(leaseUrl,{method:'POST'}).catch(()=>{}),20000);
     expiry=setTimeout(release,120000);
     signal?.addEventListener('abort',release,{once:true});
     if(signal?.aborted){release();throw new DOMException('Aborted','AbortError');}
     try {
-    const buildResponse = await fetch(`/api/storyboard?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}`, {method:'POST',signal});
+    const buildResponse = await mutationRequest(`/api/storyboard?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}`, {method:'POST',signal});
     if (!buildResponse.ok) { release(); throw new Error(`Storyboard HTTP ${buildResponse.status}`); }
     if (cached) {
       if (cached.quality !== 'full') startUpgradeWatcher({ videoId, duration, key, signal, onUpgrade });
@@ -500,7 +508,7 @@
     const execute = (async () => {
       try {
         const postUrl = `/api/storyboard/segment?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}&segment=${encodeURIComponent(segmentIndex)}&prefetch_next=true`;
-        const startRes = await fetch(postUrl, { method: 'POST', cache: 'no-store' });
+        const startRes = await mutationRequest(postUrl, { method: 'POST', cache: 'no-store' });
         if (!startRes.ok) throw new Error(`Segment start HTTP ${startRes.status}`);
         const startData = await startRes.json();
         if (startData.status === 'ready' && startData.sprite_url) {

@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from cache_store import FEED_CACHE_DIR, atomic_write_json, read_json_cache
 from camwhores import deduplicate_videos
+from fetch_contract import FetchResult, coerce_fetch_result
 
 PAGE_SIZE = 280
 _source_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix='feed-source')
@@ -32,6 +33,7 @@ class Snapshot:
         self.cursor = {source: 1 for source in fetchers}
         self.ended = set()
         self.errors = {}
+        self.outcomes = {}
         self.revision = 0
         self.lock = threading.RLock()
         self.building = False
@@ -44,6 +46,7 @@ class Snapshot:
             self.cursor=saved['cursor']
             self.ended=set(saved['ended'])
             self.items=self.enrich(copy.deepcopy(self.raw))
+            self.outcomes = dict(saved.get('outcomes') or {})
 
     def read(self, page):
         with self.lock:
@@ -84,7 +87,8 @@ class Snapshot:
                     'subscribers': self.subscribers,
                     'ended': list(self.ended),
                     'errors': dict(self.errors),
-                }
+                },
+                'source_outcomes': dict(self.outcomes),
             }
 
     def _page(self, source, page):
@@ -95,12 +99,32 @@ class Snapshot:
         path = Path(FEED_CACHE_DIR)/f'raw_v1_{source}_{page}.json'
         cached, _ = read_json_cache(str(path))
         if not self.force and isinstance(cached,dict) and cached.get('schema_version')==1 and time.time()-cached.get('fetched_at',0)<3600:
-            return cached['items']
-        items = self.fetchers[source](page)
-        if not isinstance(items,list):
-            raise RuntimeError('Invalid source response')
-        atomic_write_json(str(path),{'schema_version':1,'fetched_at':time.time(),'items':items,'complete':True,'has_more':bool(items),'source_error':None})
-        return items
+            items = cached.get('items') if isinstance(cached.get('items'), list) else []
+            status = cached.get('outcome_status') or ('confirmed_empty' if not items and cached.get('complete') else 'success')
+            return FetchResult(
+                status=status,
+                items=items,
+                source=source,
+                page=page,
+                error=cached.get('source_error'),
+                end_reason=cached.get('end_reason'),
+                has_more=cached.get('has_more'),
+            )
+        outcome = coerce_fetch_result(self.fetchers[source](page), source=source, page=page)
+        if not outcome.ok:
+            return outcome
+        items = outcome.items
+        atomic_write_json(str(path), {
+            'schema_version': 1,
+            'fetched_at': time.time(),
+            'items': items,
+            'complete': outcome.status in {'confirmed_empty', 'confirmed_end'},
+            'has_more': outcome.has_more if outcome.has_more is not None else bool(items),
+            'outcome_status': outcome.status,
+            'end_reason': outcome.end_reason,
+            'source_error': outcome.error,
+        })
+        return outcome
 
     def run(self):
         goal_at_start = self.target
@@ -126,19 +150,44 @@ class Snapshot:
                 for future in as_completed(pending):
                     source = pending[future]
                     try:
-                        batch = future.result()
+                        outcome = coerce_fetch_result(future.result(), source=source, page=self.cursor[source])
                     except Exception as exc:
                         with self.lock:
                             self.errors[source]=str(exc)
+                            self.outcomes[source] = {'status': 'retryable_error', 'error': str(exc)}
                             self.revision+=1
                         continue
+                    if not outcome.ok:
+                        with self.lock:
+                            self.errors[source] = outcome.error or outcome.status
+                            self.outcomes[source] = {
+                                'status': outcome.status,
+                                'error': outcome.error,
+                                'retry_after': outcome.retry_after,
+                            }
+                            self.revision += 1
+                        continue
+                    batch = outcome.items
                     with self.lock:
                         self.cursor[source]+=1
-                        if not batch: self.ended.add(source)
+                        if outcome.status in {'confirmed_empty', 'confirmed_end'} or outcome.has_more is False:
+                            self.ended.add(source)
+                        self.outcomes[source] = {
+                            'status': outcome.status,
+                            'end_reason': outcome.end_reason,
+                            'count': len(batch),
+                        }
                         self.raw=deduplicate_videos(self.raw+batch)
                         self.items=self.enrich(copy.deepcopy(self.raw))
                         self.revision+=1
-                        saved={'schema_version':1,'fetched_at':time.time(),'items':list(self.raw),'cursor':dict(self.cursor),'ended':list(self.ended)}
+                        saved={
+                            'schema_version':1,
+                            'fetched_at':time.time(),
+                            'items':list(self.raw),
+                            'cursor':dict(self.cursor),
+                            'ended':list(self.ended),
+                            'outcomes': dict(self.outcomes),
+                        }
                     atomic_write_json(str(self.path),saved)
         finally:
             with self.lock:

@@ -1,10 +1,9 @@
 """Durable Archivebate model discovery and deep-profile crawler.
 
-The normal Archivebate home feed is intentionally treated as a fresh-content source.  This
-service builds a second durable index by discovering model profiles through Archivebate's search
-API and walking profile pagination.  Deep items are persisted independently and mirrored into the
-currently published/latest catalog revisions so existing feed SQL, filters and pagination can use
-them immediately without a second query path.
+The normal Archivebate home feed is intentionally treated as a fresh-content source. This service
+builds a second durable index by discovering model profiles through Archivebate's search API and
+walking profile pagination. Deep items are persisted independently and published as a new catalog
+revision; an already published snapshot is never mutated in place.
 """
 from __future__ import annotations
 
@@ -19,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from cache_store import DATA_DIR
+from fetch_contract import FetchResult, coerce_fetch_result
 
 DEFAULT_DB = DATA_DIR / "catalog.db"
 DISCOVERY_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789_- ."
@@ -40,6 +40,7 @@ class DeepArchivebateService:
         self._conn: Optional[sqlite3.Connection] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._closed = False
         self._scraper = None
         self._last_targets: Tuple[int, ...] = ()
         self._progress: Dict[str, Any] = {
@@ -129,10 +130,20 @@ class DeepArchivebateService:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_abdeep_author ON archivebate_deep_items(author_clean, published_at DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_abmodels_crawl ON archivebate_models(crawl_complete, priority DESC, updated_at ASC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_abqueue_status ON archivebate_discovery_queue(status, depth, updated_at)")
+            model_columns = {row["name"] for row in conn.execute("PRAGMA table_info(archivebate_models)")}
+            if "retry_count" not in model_columns:
+                conn.execute("ALTER TABLE archivebate_models ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+            if "retry_at" not in model_columns:
+                conn.execute("ALTER TABLE archivebate_models ADD COLUMN retry_at REAL")
 
     def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._stop.set()
         self.stop(wait=True)
         with self._lock:
+            if self._thread and self._thread.is_alive():
+                raise RuntimeError("deep Archivebate worker did not drain before shutdown")
             if self._conn is not None:
                 try:
                     self._conn.close()
@@ -155,38 +166,9 @@ class DeepArchivebateService:
             targets.add(int(row["revision"]))
         return tuple(sorted(targets))
 
-    def _merge_all_into_targets_locked(self, targets: Sequence[int]) -> None:
-        conn = self._get_conn()
-        for revision in targets:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO catalog_items(
-                        canonical_key, source, video_id, author, author_clean,
-                        published_at, duration_seconds, duration_str, poster, url,
-                        preview_video, title, platform, raw_json, revision
-                    )
-                    SELECT canonical_key, source, video_id, author, author_clean,
-                           published_at, duration_seconds, duration_str, poster, url,
-                           preview_video, title, platform, raw_json, ?
-                    FROM archivebate_deep_items
-                    """,
-                    (revision,),
-                )
-                cnt = int(conn.execute("SELECT COUNT(*) AS cnt FROM catalog_items WHERE revision = ?", (revision,)).fetchone()["cnt"] or 0)
-                conn.execute("UPDATE revisions SET video_count = ?, updated_at = ? WHERE revision = ?", (cnt, time.time(), revision))
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
-
     def _refresh_targets(self) -> None:
         with self._lock:
-            targets = self._target_revisions_locked()
-            if targets != self._last_targets:
-                self._merge_all_into_targets_locked(targets)
-                self._last_targets = targets
+            self._last_targets = self._target_revisions_locked()
 
     def seed_catalog_models(self) -> int:
         """Seed the crawl registry from the newest useful catalog revision."""
@@ -291,7 +273,15 @@ class DeepArchivebateService:
             self._progress["current_prefix"] = prefix
 
         try:
-            profiles, total, last_page = scraper._fetch_search_profiles(prefix, page=page)
+            if hasattr(scraper, "fetch_search_profiles_result"):
+                search_result = scraper.fetch_search_profiles_result(prefix, page=page)
+                if not search_result.ok:
+                    raise RuntimeError(search_result.error or search_result.status)
+                profiles = search_result.items
+                total = search_result.meta.get("total_models", 0)
+                last_page = search_result.meta.get("last_page", 1)
+            else:
+                profiles, total, last_page = scraper._fetch_search_profiles(prefix, page=page)
             total = int(total or 0)
             last_page = max(1, int(last_page or 1))
             now = time.time()
@@ -339,19 +329,26 @@ class DeepArchivebateService:
         finally:
             self._progress["current_prefix"] = None
 
-    def _profile_batch(self, scraper, username: str, page: int) -> List[Dict[str, Any]]:
+    def _profile_batch(self, scraper, username: str, page: int) -> FetchResult:
         cache_key = f"ab_model:{username}:{page}"
-        last: List[Dict[str, Any]] = []
+        last = FetchResult.error_result("profile fetch did not complete", source="archivebate", page=page)
         for attempt in range(3):
             try:
                 if hasattr(scraper, "_cache"):
                     scraper._cache.pop(cache_key, None)
-                batch = scraper.get_archivebate_model_videos(username, page=page)
-                if isinstance(batch, list) and batch:
-                    return batch
-                last = batch if isinstance(batch, list) else []
-            except Exception:
-                last = []
+                if hasattr(scraper, "get_archivebate_model_videos_result"):
+                    result = scraper.get_archivebate_model_videos_result(username, page=page)
+                else:
+                    try:
+                        batch = scraper.get_archivebate_model_videos(username, page=page, typed=True)
+                    except TypeError:
+                        batch = scraper.get_archivebate_model_videos(username, page=page)
+                    result = coerce_fetch_result(batch, source="archivebate", page=page)
+                last = coerce_fetch_result(result, source="archivebate", page=page)
+                if last.ok:
+                    return last
+            except Exception as exc:
+                last = FetchResult.error_result(exc, source="archivebate", page=page)
             if attempt < 2:
                 time.sleep(0.25 * (attempt + 1))
         return last
@@ -363,6 +360,79 @@ class DeepArchivebateService:
             ids.append(str(video.get("id") or video.get("url") or json.dumps(video, sort_keys=True, ensure_ascii=False)))
         return hashlib.sha256("\n".join(sorted(ids)).encode("utf-8")).hexdigest()
 
+    def _publish_deep_revision_locked(self, new_records: List[Tuple[Any, ...]]) -> Optional[int]:
+        """Copy the last snapshot plus deep rows into a fresh immutable revision."""
+        if not new_records:
+            return None
+        conn = self._get_conn()
+        base_row = conn.execute(
+            "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        if base_row:
+            base_revision = int(base_row["revision"])
+        else:
+            base_row = conn.execute(
+                "SELECT revision FROM revisions WHERE failed = 0 ORDER BY revision DESC LIMIT 1"
+            ).fetchone()
+            base_revision = int(base_row["revision"]) if base_row else 0
+        next_revision = int(conn.execute("SELECT COALESCE(MAX(revision), 0) AS revision FROM revisions").fetchone()["revision"] or 0) + 1
+        now = time.time()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "INSERT INTO revisions(revision, created_at, updated_at, complete, is_active, failed, video_count, error, published_hash, published_at) "
+                "VALUES(?, ?, ?, 0, 0, 0, 0, NULL, NULL, NULL)",
+                (next_revision, now, now),
+            )
+            if base_revision:
+                conn.execute(
+                    """
+                    INSERT INTO catalog_items(
+                        canonical_key, source, video_id, author, author_clean,
+                        published_at, duration_seconds, duration_str, poster, url,
+                        preview_video, title, platform, raw_json, revision
+                    )
+                    SELECT canonical_key, source, video_id, author, author_clean,
+                           published_at, duration_seconds, duration_str, poster, url,
+                           preview_video, title, platform, raw_json, ?
+                    FROM catalog_items WHERE revision = ?
+                    """,
+                    (next_revision, base_revision),
+                )
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO catalog_items(
+                    canonical_key, source, video_id, author, author_clean,
+                    published_at, duration_seconds, duration_str, poster, url,
+                    preview_video, title, platform, raw_json, revision
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                [record[:-1] + (next_revision,) for record in new_records],
+            )
+            count = int(conn.execute("SELECT COUNT(*) AS cnt FROM catalog_items WHERE revision = ?", (next_revision,)).fetchone()["cnt"] or 0)
+            digest = hashlib.sha256()
+            for row in conn.execute(
+                "SELECT canonical_key FROM catalog_items WHERE revision = ? ORDER BY canonical_key ASC",
+                (next_revision,),
+            ):
+                digest.update(str(row["canonical_key"]).encode("utf-8"))
+                digest.update(b"\n")
+            conn.execute("UPDATE revisions SET is_active = 0")
+            conn.execute(
+                "UPDATE revisions SET complete = 1, is_active = 1, video_count = ?, published_hash = ?, published_at = ?, updated_at = ? WHERE revision = ?",
+                (count, digest.hexdigest(), now, now, next_revision),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO source_runs(revision, source, cursor, pages_scanned, items_found, complete, failed, error, end_reason, updated_at) "
+                "VALUES(?, 'archivebate_deep', 0, 0, ?, 1, 0, NULL, 'deep_publish', ?)",
+                (next_revision, len(new_records), now),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return next_revision
+
     def _store_videos_locked(self, videos: List[Dict[str, Any]]) -> int:
         if not videos:
             return 0
@@ -372,7 +442,10 @@ class DeepArchivebateService:
         now = time.time()
         new_records: List[Tuple[Any, ...]] = []
         for video in videos:
-            record = extract_item_metadata(video, 0)
+            try:
+                record = extract_item_metadata(video, 0)
+            except (TypeError, ValueError):
+                continue
             source = str(record[1] or "archivebate")
             if source != "archivebate":
                 continue
@@ -393,22 +466,9 @@ class DeepArchivebateService:
         if not new_records:
             return 0
 
-        targets = self._target_revisions_locked()
-        for revision in targets:
-            revision_records = [rec[:-1] + (revision,) for rec in new_records]
-            conn.executemany(
-                """
-                INSERT OR IGNORE INTO catalog_items(
-                    canonical_key, source, video_id, author, author_clean,
-                    published_at, duration_seconds, duration_str, poster, url,
-                    preview_video, title, platform, raw_json, revision
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                revision_records,
-            )
-            cnt = int(conn.execute("SELECT COUNT(*) AS cnt FROM catalog_items WHERE revision = ?", (revision,)).fetchone()["cnt"] or 0)
-            conn.execute("UPDATE revisions SET video_count = ?, updated_at = ? WHERE revision = ?", (cnt, now, revision))
-        self._last_targets = targets
+        published = self._publish_deep_revision_locked(new_records)
+        if published is not None:
+            self._last_targets = (published,)
         return len(new_records)
 
     def crawl_step(self, scraper=None) -> bool:
@@ -433,7 +493,18 @@ class DeepArchivebateService:
             self._progress["current_model"] = username
 
         try:
-            batch = self._profile_batch(scraper, username, page)
+            result = self._profile_batch(scraper, username, page)
+            if not result.ok:
+                error_text = result.error or result.status
+                with self._lock:
+                    conn = self._get_conn()
+                    conn.execute(
+                        "UPDATE archivebate_models SET retry_count=COALESCE(retry_count, 0)+1, retry_at=?, last_error=?, updated_at=? WHERE model_key=?",
+                        (time.time() + (result.retry_after or 1.0), error_text, time.time(), model_key),
+                    )
+                    self._progress["last_error"] = error_text
+                return True
+            batch = result.items
             now = time.time()
             with self._lock:
                 conn = self._get_conn()
@@ -448,7 +519,8 @@ class DeepArchivebateService:
                             UPDATE archivebate_models
                             SET pages_scanned=pages_scanned+1, videos_found=videos_found+?,
                                 last_signature=?, repeated_signatures=?, empty_streak=0,
-                                crawl_complete=1, end_reason='repeated_page', last_error=NULL, updated_at=?
+                                crawl_complete=1, end_reason='repeated_page', last_error=NULL,
+                                retry_count=0, retry_at=NULL, updated_at=?
                             WHERE model_key=?
                             """,
                             (new_count, signature, repeated, now, model_key),
@@ -459,7 +531,7 @@ class DeepArchivebateService:
                             UPDATE archivebate_models
                             SET next_page=?, pages_scanned=pages_scanned+1, videos_found=videos_found+?,
                                 last_signature=?, repeated_signatures=?, empty_streak=0,
-                                last_error=NULL, updated_at=?
+                                last_error=NULL, retry_count=0, retry_at=NULL, updated_at=?
                             WHERE model_key=?
                             """,
                             (page + 1, new_count, signature, repeated, now, model_key),
@@ -543,6 +615,8 @@ class DeepArchivebateService:
 
     def start(self, scraper) -> bool:
         with self._lock:
+            if self._closed:
+                return False
             if self._thread and self._thread.is_alive():
                 return False
             self._scraper = scraper
@@ -555,7 +629,9 @@ class DeepArchivebateService:
         self._stop.set()
         thread = self._thread
         if wait and thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=5.0)
+            thread.join(timeout=10.0)
+
+    shutdown = close
 
 
 deep_archivebate_service = DeepArchivebateService()

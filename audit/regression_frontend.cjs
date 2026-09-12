@@ -1,13 +1,19 @@
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const vm=require('node:vm');
-const app=fs.readFileSync('static/app.js','utf8');
 const scheduled=[],children=[];
-const ctx={AbortController,state:{},dom:{videoGrid:{set innerHTML(v){children.length=0},appendChild(f){children.push(...f.children)}}},deduplicateVideos:x=>x,createVideoCard:v=>v.id,document:{createDocumentFragment:()=>({children:[],appendChild(v){this.children.push(v)}})},updateCheckpointUI(){},checkAndHighlightCheckpoint(){},window:{requestIdleCallback:true},requestIdleCallback:cb=>scheduled.push(cb),setTimeout:cb=>scheduled.push(cb)};
+const ctx={AbortController,state:{mode:'home',groupByAuthor:false,gridCardMap:new Map(),gridGeneration:0},dom:{videoGrid:{children,childNodes:children,set innerHTML(v){if(v==='')children.length=0},appendChild(f){(f.children||[]).forEach(v=>children.push(v))},querySelectorAll(){return[]}}},document:{createDocumentFragment:()=>({children:[],childNodes:[],appendChild(v){this.children.push(v);this.childNodes.push(v)}})},updateCheckpointUI(){},checkAndHighlightCheckpoint(){},window:null,setTimeout:cb=>{const timer={cb};scheduled.push(timer);return timer},clearTimeout() {}};
+ctx.window=ctx;
+ctx.ArchivebateAppContext={state:ctx.state,dom:ctx.dom};
+ctx.createVideoCard=(v,idx)=>({_videoData:{...v},_cardIndex:idx,classList:{add(){},remove(){},toggle(){}},querySelectorAll(){return[]},remove(){const i=children.indexOf(this);if(i>=0)children.splice(i,1)},_updateCard(next,nextIdx){Object.assign(this._videoData,next);this._cardIndex=nextIdx}});
 vm.createContext(ctx);
-vm.runInContext(app.slice(app.indexOf('function renderVideoGrid('),app.indexOf('// STOPNIOWE DOKŁADANIE')),ctx);
-ctx.renderVideoGrid(Array.from({length:64},(_,id)=>({id:'old'+id})));
-ctx.renderVideoGrid([{id:'new'}]);scheduled.forEach(cb=>cb());assert.deepEqual(children,['new']);
+vm.runInContext(fs.readFileSync('static/video-grid.js','utf8'),ctx);
+ctx.ArchivebateVideoGrid.init({createVideoCard:ctx.createVideoCard});
+ctx.renderVideoGrid(Array.from({length:64},(_,id)=>({id:'old'+id,source:'archivebate'})));
+ctx.renderVideoGrid([{id:'new',source:'archivebate'}]);scheduled.splice(0).forEach(timer=>timer.cb());assert.deepEqual(children.map(card=>card._videoData.id),['new']);
+const firstCard=children[0];
+ctx.reconcilePage([{id:'new',source:'archivebate',views:'updated'}]);
+assert.equal(children[0],firstCard);assert.equal(firstCard._videoData.views,'updated');
 (async()=>{
  let active=0,peak=0,reads=0;
  const perf={window:{},fetch:async()=>{active++;peak=Math.max(peak,active);return{arrayBuffer:async()=>{reads++;await new Promise(r=>setTimeout(r,3));active--;}}}};
@@ -87,7 +93,12 @@ ctx.renderVideoGrid([{id:'new'}]);scheduled.forEach(cb=>cb());assert.deepEqual(c
     };
 
     vm.createContext(gridCtx);
-    vm.runInContext(app.slice(app.indexOf('function renderVideoGrid('), app.indexOf('// STOPNIOWE DOKŁADANIE')), gridCtx);
+    gridCtx.window = gridCtx;
+    gridCtx.ArchivebateAppContext = { state: gridCtx.state, dom: gridCtx.dom };
+    gridCtx.setTimeout = cb => { scheduled.push(cb); return cb; };
+    gridCtx.clearTimeout = () => {};
+    vm.runInContext(fs.readFileSync('static/video-grid.js', 'utf8'), gridCtx);
+    gridCtx.ArchivebateVideoGrid.init({ createVideoCard: gridCtx.createVideoCard });
 
     // Inicjalna strona: 10 kart
     const initialVideos = Array.from({ length: 10 }, (_, i) => ({ id: `card_${i}`, source: 'archivebate', poster: '/thumb.jpg' }));
@@ -152,7 +163,8 @@ ctx.renderVideoGrid([{id:'new'}]);scheduled.forEach(cb=>cb());assert.deepEqual(c
 
   const gridSource = fs.readFileSync('static/video-grid.js', 'utf8');
   assert.doesNotMatch(gridSource, /requestIdleCallback\(appendNextChunk/, 'long-grid completion must not depend on idle callbacks');
-  assert.match(gridSource, /setTimeout\(appendNextChunk, 0\)/, 'long-grid chunks must have a deterministic scheduler');
+  assert.match(gridSource, /function scheduleChunk|setTimeout\(\(\) =>/, 'long-grid chunks must have a deterministic scheduler');
+  assert.match(gridSource, /scheduleChunk\(appendNextChunk\)/, 'long-grid chunks must use the shared scheduler');
   assert.match(gridSource, /INITIAL_BATCH = 16/, 'first paint must stay bounded to a small synchronous card batch');
   const viewsPerfSource = fs.readFileSync('static/video-views.js', 'utf8');
   assert.match(viewsPerfSource, /HOME_PAGE_CACHE_LIMIT = 3/, 'home pagination needs a bounded three-page cache');

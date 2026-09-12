@@ -104,19 +104,32 @@
     }
 
     vid.addEventListener('play', () => {
-      if (dom.modalCtrlPlayBtn) dom.modalCtrlPlayBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
+      if (dom.modalCtrlPlayBtn) {
+        dom.modalCtrlPlayBtn.innerHTML = '<i class="fa-solid fa-pause"></i>';
+        dom.modalCtrlPlayBtn.setAttribute?.('aria-label', 'Pauza (Spacja)');
+        dom.modalCtrlPlayBtn.setAttribute?.('aria-pressed', 'true');
+      }
       if (dom.modalCenterPlay) dom.modalCenterPlay.style.display = 'none';
       resetModalIdleTimer();
     });
 
     vid.addEventListener('pause', () => {
-      if (dom.modalCtrlPlayBtn) dom.modalCtrlPlayBtn.innerHTML = '<i class="fa-solid fa-play"></i>';
+      if (dom.modalCtrlPlayBtn) {
+        dom.modalCtrlPlayBtn.innerHTML = '<i class="fa-solid fa-play"></i>';
+        dom.modalCtrlPlayBtn.setAttribute?.('aria-label', 'Odtwórz film (Spacja)');
+        dom.modalCtrlPlayBtn.setAttribute?.('aria-pressed', 'false');
+      }
       if (dom.modalCenterPlay) dom.modalCenterPlay.style.display = 'flex';
       if (dom.modalControlsBar) dom.modalControlsBar.classList.remove('idle');
       clearTimeout(modalIdleTimeout);
     });
 
     if (dom.modalCenterPlay) dom.modalCenterPlay.addEventListener('click', toggleModalPlay);
+    if (dom.modalCenterPlay) dom.modalCenterPlay.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      toggleModalPlay();
+    });
     vid.addEventListener('click', toggleModalPlay);
     if (dom.modalCtrlPlayBtn) dom.modalCtrlPlayBtn.addEventListener('click', toggleModalPlay);
 
@@ -130,6 +143,18 @@
       dom.modalCtrlNextVideoBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         playNextVideo();
+      });
+    }
+    if (dom.modalCtrlPrevAuthorBtn) {
+      dom.modalCtrlPrevAuthorBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        g.ArchivebateVideoModal?.playPrevAuthorVideo?.();
+      });
+    }
+    if (dom.modalCtrlNextAuthorBtn) {
+      dom.modalCtrlNextAuthorBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        g.ArchivebateVideoModal?.playNextAuthorVideo?.();
       });
     }
     if (dom.modalNavPrevArrow) {
@@ -156,6 +181,15 @@
       });
     }
 
+    const updateTimelineAria = () => {
+      if (!dom.modalTimelineContainer?.setAttribute) return;
+      const duration = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 0;
+      const current = duration ? Math.max(0, Math.min(duration, Number(vid.currentTime) || 0)) : 0;
+      const percent = duration ? (current / duration) * 100 : 0;
+      dom.modalTimelineContainer.setAttribute('aria-valuenow', String(Math.round(percent)));
+      dom.modalTimelineContainer.setAttribute('aria-valuetext', `${formatPlayerTime(current)} / ${formatPlayerTime(duration)}`);
+    };
+
     vid.addEventListener('timeupdate', () => {
       if (!isDraggingModalTimeline && vid.duration) {
         const percent = (vid.currentTime / vid.duration) * 100;
@@ -165,6 +199,7 @@
           dom.modalCtrlTimeDisplay.innerText = `${formatPlayerTime(vid.currentTime)} / ${formatPlayerTime(vid.duration)}`;
         }
       }
+      updateTimelineAria();
     });
 
     vid.addEventListener('progress', () => {
@@ -308,6 +343,20 @@
         try { dom.modalTimelineContainer.setPointerCapture(e.pointerId); } catch (_) {}
         seekModalFromEvent(e);
       });
+      dom.modalTimelineContainer.addEventListener('keydown', (e) => {
+        const duration = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 0;
+        if (!duration) return;
+        let nextTime = null;
+        if (e.key === 'ArrowLeft') nextTime = Math.max(0, (Number(vid.currentTime) || 0) - 5);
+        else if (e.key === 'ArrowRight') nextTime = Math.min(duration, (Number(vid.currentTime) || 0) + 5);
+        else if (e.key === 'Home') nextTime = 0;
+        else if (e.key === 'End') nextTime = duration;
+        if (nextTime === null) return;
+        e.preventDefault();
+        e.stopPropagation();
+        vid.currentTime = nextTime;
+        updateTimelineAria();
+      });
     }
 
     window.addEventListener('pointerup', () => {
@@ -326,6 +375,7 @@
         if (dom.modalTimelineProgress) dom.modalTimelineProgress.style.width = `${pos * 100}%`;
         if (dom.modalTimelineThumb) dom.modalTimelineThumb.style.left = `${pos * 100}%`;
       }
+      updateTimelineAria();
       updateTimelinePreview(e);
     }
 
@@ -344,10 +394,14 @@
     // PiP
     if (dom.modalCtrlPipBtn) {
       dom.modalCtrlPipBtn.addEventListener('click', async () => {
-        if (document.pictureInPictureElement) {
-          await document.exitPictureInPicture();
-        } else if (document.pictureInPictureEnabled) {
-          await vid.requestPictureInPicture();
+        try {
+          if (document.pictureInPictureElement) {
+            await document.exitPictureInPicture();
+          } else if (document.pictureInPictureEnabled && typeof vid.requestPictureInPicture === 'function') {
+            await vid.requestPictureInPicture();
+          }
+        } catch (_) {
+          // PiP może być zablokowany przez przeglądarkę lub politykę dokumentu.
         }
       });
     }
@@ -375,6 +429,11 @@
 
       const code = e.code;
       const key = e.key;
+
+      const isTimelineKey = dom.modalTimelineContainer && (
+        e.target === dom.modalTimelineContainer || e.target?.closest?.('#modalTimelineContainer')
+      );
+      if (isTimelineKey && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(key || code)) return;
 
       if (code === 'Space' || key === ' ') {
         e.preventDefault();

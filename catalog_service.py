@@ -7,13 +7,15 @@ import re
 import sqlite3
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from cache_store import DATA_DIR, FEED_CACHE_DIR, atomic_write_json, read_json_cache
 from camwhores import deduplicate_videos, video_identity
+from fetch_contract import FetchResult, coerce_fetch_result
 from scraper import parse_date_to_sort_seconds
+from video_identity import VideoKey
 
 PAGE_SIZE = 280
 DEFAULT_CATALOG_DB = DATA_DIR / "catalog.db"
@@ -24,31 +26,47 @@ MAX_PAGES_PER_SOURCE = {"archivebate": 1_000_000, "camwhores": 100_000}
 CAMWHORES_EMPTY_END_THRESHOLD = 5
 ARCHIVEBATE_EMPTY_END_THRESHOLD = 5
 TRANSIENT_SOURCE_RETRY_DELAYS = (2.0, 8.0)
+GROUP_MEMBER_INLINE_LIMIT = 50
+
+
+def _normalize_favorite_keys(values: Optional[List[Any]]) -> List[VideoKey]:
+    result: List[VideoKey] = []
+    for value in values or []:
+        if isinstance(value, dict):
+            source = value.get("source")
+            provider_id = value.get("provider_id") or value.get("id")
+            key = VideoKey.from_value(provider_id, source=source)
+        elif isinstance(value, str) and ":id:" in value:
+            source, provider_id = value.split(":id:", 1)
+            key = VideoKey.from_value(provider_id, source=source)
+        else:
+            # Bare IDs are intentionally not guessed: they can collide between providers.
+            key = None
+        if key and key not in result:
+            result.append(key)
+    return result
 
 
 def canonical_identity_key(video: Dict[str, Any]) -> str:
     """Computes a stable, canonical string key from video identity."""
-    ident = video_identity(video)
-    if not ident:
-        raw_id = str(video.get("id") or "").strip()
-        source = video.get("source") or "archivebate"
-        if raw_id:
-            return f"{source}:id:{raw_id}"
-        canonical = json.dumps(video, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-        return f"{source}:hash:{digest}"
-    source, kind, val = ident
-    return f"{source}:{kind}:{val}"
+    key = VideoKey.from_video(video, require_source=True)
+    if key:
+        return key.as_string()
+    # Hashes are useful for diagnostics/non-persistent callers only. The import boundary below
+    # rejects this fallback, so an ambiguous item can never become a catalog row.
+    canonical = json.dumps(video, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"unscoped:hash:{digest}"
 
 
 def extract_item_metadata(video: Dict[str, Any], revision: int) -> Tuple[str, str, str, str, str, float, float, str, str, str, str, str, str, str, int]:
     """Extracts minimal normalized metadata tuple for SQLite storage."""
-    canon_key = canonical_identity_key(video)
-    ident = video_identity(video)
-    source = ident[0] if ident else (video.get("source") or "archivebate")
-    video_id = str(video.get("id") or "")
-    if source == "camwhores" and video_id.startswith("cw_"):
-        video_id = video_id[3:]
+    key = VideoKey.from_video(video, require_source=True)
+    if not key:
+        raise ValueError("catalog item requires explicit source and provider ID or URL")
+    canon_key = key.as_string()
+    source = key.source
+    video_id = key.provider_id
 
     author = str(video.get("username") or video.get("author") or "Model").strip()
     author_clean = re.sub(r"[^a-z0-9]", "", author.lower())
@@ -112,6 +130,10 @@ class CatalogService:
         # use a separate thread-local SQLite connection so WAL can actually
         # provide concurrent readers while the background indexer is writing.
         self._read_local = threading.local()
+        self._reader_guard = threading.Condition(threading.RLock())
+        self._reader_connections: Dict[int, sqlite3.Connection] = {}
+        self._active_readers = 0
+        self._closing = False
         self._conn: Optional[sqlite3.Connection] = None
         self._indexing_thread: Optional[threading.Thread] = None
         self._indexing_stop = threading.Event()
@@ -167,7 +189,46 @@ class CatalogService:
             conn.execute("PRAGMA cache_size = -32000")
             conn.execute("PRAGMA temp_store = MEMORY")
             self._read_local.conn = conn
+            with self._reader_guard:
+                if self._closing:
+                    conn.close()
+                    self._read_local.conn = None
+                    raise RuntimeError("catalog is shutting down")
+                self._reader_connections[threading.get_ident()] = conn
         return conn
+
+    @contextmanager
+    def _read_snapshot(self):
+        """Pin revision metadata, count and page rows to one SQLite read snapshot."""
+        if str(self.db_path) == ":memory:":
+            with self._lock:
+                yield self._get_conn()
+            return
+        with self._reader_guard:
+            if self._closing:
+                raise RuntimeError("catalog is shutting down")
+            self._active_readers += 1
+        try:
+            conn = self._get_read_conn()
+        except Exception:
+            with self._reader_guard:
+                self._active_readers = max(0, self._active_readers - 1)
+                self._reader_guard.notify_all()
+            raise
+        try:
+            conn.execute("BEGIN")
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            with self._reader_guard:
+                self._active_readers = max(0, self._active_readers - 1)
+                self._reader_guard.notify_all()
 
     def _read_guard(self):
         # In-memory SQLite databases cannot be shared by opening a second
@@ -245,6 +306,11 @@ class CatalogService:
                 source_columns = {row["name"] for row in conn.execute("PRAGMA table_info(source_runs)")}
                 if "end_reason" not in source_columns:
                     conn.execute("ALTER TABLE source_runs ADD COLUMN end_reason TEXT")
+                revision_columns = {row["name"] for row in conn.execute("PRAGMA table_info(revisions)")}
+                if "published_hash" not in revision_columns:
+                    conn.execute("ALTER TABLE revisions ADD COLUMN published_hash TEXT")
+                if "published_at" not in revision_columns:
+                    conn.execute("ALTER TABLE revisions ADD COLUMN published_at REAL")
                 # Archivebate has an upstream pagination boundary at page 1001. Depending on the
                 # request, that boundary has been observed as either HTTP 5xx or HTTP 200 with no
                 # video cards. Older builds persisted the latter as a clean EOF. Reclassify only
@@ -365,14 +431,23 @@ class CatalogService:
                 conn.execute("ROLLBACK")
                 raise
 
-    def close(self):
-        reader = getattr(self._read_local, "conn", None)
-        if reader is not None:
+    def close(self, timeout: float = 10.0):
+        """Drain active read snapshots and close every registered reader/writer connection."""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._reader_guard:
+            self._closing = True
+            while self._active_readers and time.monotonic() < deadline:
+                self._reader_guard.wait(timeout=min(0.25, max(0.0, deadline - time.monotonic())))
+            if self._active_readers:
+                raise RuntimeError("catalog readers did not drain before shutdown")
+            readers = list(self._reader_connections.values())
+            self._reader_connections.clear()
+        for reader in readers:
             try:
                 reader.close()
             except Exception:
                 pass
-            self._read_local.conn = None
+        self._read_local.conn = None
         with self._lock:
             if self._conn:
                 try:
@@ -381,42 +456,52 @@ class CatalogService:
                     pass
                 self._conn = None
 
+    def begin_shutdown(self) -> None:
+        with self._reader_guard:
+            self._closing = True
+
+    def is_shutting_down(self) -> bool:
+        with self._reader_guard:
+            return bool(self._closing)
+
+    @staticmethod
+    def _select_revision_from_conn(conn: sqlite3.Connection) -> Optional[int]:
+        """Select a published/active revision using the caller's read snapshot."""
+        row_comp = conn.execute(
+            "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 "
+            "ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        if row_comp:
+            return int(row_comp["revision"])
+        row_active = conn.execute(
+            "SELECT revision FROM revisions WHERE is_active = 1 AND failed = 0 "
+            "ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        if row_active:
+            return int(row_active["revision"])
+        row_any = conn.execute(
+            "SELECT revision FROM revisions WHERE failed = 0 "
+            "ORDER BY video_count DESC, revision DESC LIMIT 1"
+        ).fetchone()
+        if not row_any:
+            row_any = conn.execute("SELECT revision FROM revisions ORDER BY revision DESC LIMIT 1").fetchone()
+        return int(row_any["revision"]) if row_any else None
+
     def get_active_revision(self) -> Optional[int]:
         """Return the newest published snapshot, or the best partial revision if none exists."""
-        with self._read_guard():
-            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
-            # Revision numbers are the publication order. Never let a later updated_at timestamp
-            # on an older resumed revision make it win over a newer completed snapshot.
-            row_comp = conn.execute(
-                "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 "
-                "ORDER BY revision DESC LIMIT 1"
-            ).fetchone()
-            if row_comp:
-                return int(row_comp["revision"])
-            # With no published snapshot, an explicitly active partial revision is still useful.
-            row_active = conn.execute(
-                "SELECT revision FROM revisions WHERE is_active = 1 AND failed = 0 "
-                "ORDER BY revision DESC LIMIT 1"
-            ).fetchone()
-            if row_active:
-                return int(row_active["revision"])
-            row_any = conn.execute(
-                "SELECT revision FROM revisions WHERE failed = 0 "
-                "ORDER BY video_count DESC, revision DESC LIMIT 1"
-            ).fetchone()
-            if not row_any:
-                row_any = conn.execute("SELECT revision FROM revisions ORDER BY revision DESC LIMIT 1").fetchone()
-            return int(row_any["revision"]) if row_any else None
+        if str(self.db_path) == ":memory:":
+            with self._lock:
+                return self._select_revision_from_conn(self._get_conn())
+        with self._read_snapshot() as conn:
+            return self._select_revision_from_conn(conn)
 
     def get_latest_revision_number(self) -> int:
-        with self._read_guard():
-            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
+        with self._read_snapshot() as conn:
             row = conn.execute("SELECT MAX(revision) AS max_rev FROM revisions").fetchone()
             return int(row["max_rev"] or 0)
 
     def is_revision_complete(self, revision: int) -> bool:
-        with self._read_guard():
-            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
+        with self._read_snapshot() as conn:
             row = conn.execute("SELECT complete, failed FROM revisions WHERE revision = ?", (revision,)).fetchone()
             return bool(row and row["complete"] and not row["failed"])
 
@@ -430,8 +515,7 @@ class CatalogService:
                 "updated_at": 0.0,
                 "indexing_progress": self._indexing_progress,
             }
-        with self._read_guard():
-            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
+        with self._read_snapshot() as conn:
             row = conn.execute("SELECT * FROM revisions WHERE revision = ?", (rev,)).fetchone()
             if not row:
                 return {
@@ -449,6 +533,8 @@ class CatalogService:
                 "updated_at": float(row["updated_at"]),
                 "failed": bool(row["failed"]),
                 "error": row["error"],
+                "published_hash": row["published_hash"] if "published_hash" in row.keys() else None,
+                "published_at": float(row["published_at"]) if "published_at" in row.keys() and row["published_at"] else None,
                 "state": "failed" if row["failed"] else ("complete" if row["complete"] else "building"),
                 "indexing_progress": self._indexing_progress,
             }
@@ -458,14 +544,26 @@ class CatalogService:
         if not items:
             return
         deduped = deduplicate_videos(items)
-        records = [extract_item_metadata(v, revision) for v in deduped]
+        records = []
+        for value in deduped:
+            try:
+                records.append(extract_item_metadata(value, revision))
+            except (TypeError, ValueError):
+                # Invalid/source-less identities are observable in fetch diagnostics but never
+                # become durable catalog rows.
+                continue
+        if not records:
+            return
         with self._lock:
             conn = self._get_conn()
+            existing = conn.execute("SELECT complete, failed FROM revisions WHERE revision = ?", (revision,)).fetchone()
+            if existing and bool(existing["complete"]) and not bool(existing["failed"]):
+                raise RuntimeError(f"published revision {revision} is immutable")
             conn.execute("BEGIN IMMEDIATE")
             try:
                 now = time.time()
                 conn.execute(
-                    "INSERT OR IGNORE INTO revisions(revision, created_at, updated_at, complete, video_count) VALUES(?, ?, ?, 0, 0)",
+                    "INSERT OR IGNORE INTO revisions(revision, created_at, updated_at, complete, video_count, published_hash, published_at) VALUES(?, ?, ?, 0, 0, NULL, NULL)",
                     (revision, now, now),
                 )
                 conn.executemany(
@@ -497,15 +595,15 @@ class CatalogService:
                         # Preserve the completed data, but an older snapshot can never become active.
                         conn.execute(
                             "UPDATE revisions SET complete = 1, is_active = 0, failed = 0, error = NULL, "
-                            "updated_at = ?, video_count = ? WHERE revision = ?",
-                            (now, cnt, revision),
+                            "updated_at = ?, video_count = ?, published_hash = ?, published_at = ? WHERE revision = ?",
+                            (now, cnt, self._revision_digest(conn, revision), now, revision),
                         )
                     else:
                         conn.execute("UPDATE revisions SET is_active = 0")
                         conn.execute(
                             "UPDATE revisions SET complete = 1, is_active = 1, failed = 0, error = NULL, "
-                            "updated_at = ?, video_count = ? WHERE revision = ?",
-                            (now, cnt, revision),
+                            "updated_at = ?, video_count = ?, published_hash = ?, published_at = ? WHERE revision = ?",
+                            (now, cnt, self._revision_digest(conn, revision), now, revision),
                         )
                 else:
                     conn.execute("UPDATE revisions SET updated_at = ?, video_count = ? WHERE revision = ?", (now, cnt, revision))
@@ -514,6 +612,17 @@ class CatalogService:
                 conn.execute("ROLLBACK")
                 raise
 
+    def _revision_digest(self, conn: sqlite3.Connection, revision: int) -> str:
+        rows = conn.execute(
+            "SELECT canonical_key FROM catalog_items WHERE revision = ? ORDER BY canonical_key ASC",
+            (revision,),
+        ).fetchall()
+        digest = hashlib.sha256()
+        for row in rows:
+            digest.update(str(row["canonical_key"]).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
     def publish_revision(self, revision: int) -> bool:
         """Atomically publish a revision unless a newer successful snapshot already exists."""
         with self._lock:
@@ -521,6 +630,16 @@ class CatalogService:
             now = time.time()
             conn.execute("BEGIN IMMEDIATE")
             try:
+                current = conn.execute(
+                    "SELECT complete, failed, is_active FROM revisions WHERE revision = ?",
+                    (revision,),
+                ).fetchone()
+                if not current:
+                    conn.execute("ROLLBACK")
+                    return False
+                if bool(current["complete"]) and not bool(current["failed"]):
+                    conn.execute("COMMIT")
+                    return bool(current["is_active"])
                 cnt = conn.execute("SELECT COUNT(*) AS total FROM catalog_items WHERE revision = ?", (revision,)).fetchone()["total"]
                 newer = conn.execute(
                     "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 AND revision > ? "
@@ -532,15 +651,15 @@ class CatalogService:
                     # Keep its rows for diagnostics/history, but never roll the live feed backwards.
                     conn.execute(
                         "UPDATE revisions SET complete = 1, is_active = 0, failed = 0, error = NULL, "
-                        "updated_at = ?, video_count = ? WHERE revision = ?",
-                        (now, cnt, revision),
+                        "updated_at = ?, video_count = ?, published_hash = ?, published_at = ? WHERE revision = ?",
+                        (now, cnt, self._revision_digest(conn, revision), now, revision),
                     )
                     conn.execute("COMMIT")
                     return False
                 conn.execute("UPDATE revisions SET is_active = 0")
                 conn.execute(
-                    "UPDATE revisions SET complete = 1, is_active = 1, failed = 0, error = NULL, updated_at = ?, video_count = ? WHERE revision = ?",
-                    (now, cnt, revision),
+                    "UPDATE revisions SET complete = 1, is_active = 1, failed = 0, error = NULL, updated_at = ?, video_count = ?, published_hash = ?, published_at = ? WHERE revision = ?",
+                    (now, cnt, self._revision_digest(conn, revision), now, revision),
                 )
                 conn.execute("COMMIT")
                 return True
@@ -556,6 +675,43 @@ class CatalogService:
                 (error_msg, time.time(), revision),
             )
 
+    def _empty_query_page(self, page: int, page_size: int) -> Dict[str, Any]:
+        return {
+            "catalog_revision": 0,
+            "page": page,
+            "page_size": page_size,
+            "video_count": 0,
+            "group_count": 0,
+            "page_count": 1,
+            "items": [],
+            "videos": [],
+            "catalog_complete": False,
+            "updated_at": 0.0,
+            "indexing_progress": self._indexing_progress,
+            "count": 0,
+            "target_count": page_size,
+            "known_count": 0,
+            "has_more": False,
+            "complete": False,
+            "last_page": 1,
+            "total_videos": 0,
+            "total_is_estimate": True,
+            "snapshot_id": "0",
+            "revision": 0,
+            "source_error": {},
+            "retryable": False,
+            "catalog_limited": False,
+            "limited_sources": {},
+            "projection": {
+                "scope": "catalog",
+                "revision": 0,
+                "preferences_version": None,
+                "identity": "source:provider_id",
+                "accuracy": "partial",
+            },
+            "counts": {"base_count": 0, "visible_count": 0, "hidden_by_block": 0, "hidden_by_filter": 0},
+        }
+
     def query_page(
         self,
         page: int = 1,
@@ -566,46 +722,19 @@ class CatalogService:
         revision: Optional[int] = None,
         blocked_models: Optional[List[str]] = None,
         favorite_authors: Optional[List[str]] = None,
-        favorite_ids: Optional[List[str]] = None,
+        favorite_ids: Optional[List[Any]] = None,
         enrich_fn: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
     ) -> Dict[str, Any]:
         """Unified filtered query for count and items."""
         ps = page_size or self.page_size
-        rev = revision if revision is not None else self.get_active_revision()
-
-        if rev is None:
-            return {
-                "catalog_revision": 0,
-                "page": page,
-                "page_size": ps,
-                "video_count": 0,
-                "group_count": 0,
-                "page_count": 1,
-                "items": [],
-                "videos": [],
-                "catalog_complete": False,
-                "updated_at": 0.0,
-                "indexing_progress": self._indexing_progress,
-                "count": 0,
-                "target_count": ps,
-                "known_count": 0,
-                "has_more": False,
-                "complete": False,
-                "last_page": 1,
-                "total_videos": 0,
-                "total_is_estimate": True,
-                "snapshot_id": "0",
-                "revision": 0,
-                "source_error": {},
-                "retryable": False,
-                "catalog_limited": False,
-                "limited_sources": {},
-            }
+        requested_revision = revision
 
         # File-backed reads must not queue behind the background writer.
         # WAL gives us a consistent committed snapshot on the dedicated reader.
-        with self._read_guard():
-            conn = self._get_conn() if str(self.db_path) == ":memory:" else self._get_read_conn()
+        with self._read_snapshot() as conn:
+            rev = requested_revision if requested_revision is not None else self._select_revision_from_conn(conn)
+            if rev is None:
+                return self._empty_query_page(page, ps)
             rev_info = conn.execute("SELECT * FROM revisions WHERE revision = ?", (rev,)).fetchone()
             is_failed = bool(rev_info["failed"]) if rev_info else False
             is_complete = bool(rev_info["complete"]) and not is_failed if rev_info else False
@@ -631,14 +760,17 @@ class CatalogService:
             }
             catalog_limited = bool(limited_sources)
 
-            # Build dynamic WHERE clause
-            where_clauses = ["revision = ?"]
-            params: List[Any] = [rev]
+            # Build source/base scope first. All projection counts use the same read transaction.
+            base_where_clauses = ["revision = ?"]
+            base_params: List[Any] = [rev]
 
             if source == "only-archivebate":
-                where_clauses.append("source = 'archivebate'")
+                base_where_clauses.append("source = 'archivebate'")
             elif source == "only-camwhores":
-                where_clauses.append("source = 'camwhores'")
+                base_where_clauses.append("source = 'camwhores'")
+
+            where_clauses = list(base_where_clauses)
+            params: List[Any] = list(base_params)
 
             if blocked_models:
                 clean_b = [re.sub(r"[^a-z0-9]", "", b.lower()) for b in blocked_models if b]
@@ -648,41 +780,53 @@ class CatalogService:
                     where_clauses.append(f"author_clean NOT IN ({placeholders})")
                     params.extend(clean_b)
 
+            post_block_where_sql = " AND ".join(where_clauses)
+            post_block_params = list(params)
+
             if author_filter == "exclude_fav":
                 clean_fav = [re.sub(r"[^a-z0-9]", "", a.lower()) for a in (favorite_authors or []) if a]
                 clean_fav = [a for a in clean_fav if a]
-                fav_ids = [str(fid) for fid in (favorite_ids or []) if fid]
+                fav_keys = _normalize_favorite_keys(favorite_ids)
                 conds = []
                 if clean_fav:
                     placeholders = ",".join("?" for _ in clean_fav)
                     conds.append(f"author_clean NOT IN ({placeholders})")
                     params.extend(clean_fav)
-                if fav_ids:
-                    placeholders = ",".join("?" for _ in fav_ids)
-                    conds.append(f"video_id NOT IN ({placeholders})")
-                    params.extend(fav_ids)
+                if fav_keys:
+                    placeholders = " OR ".join("(source = ? AND video_id = ?)" for _ in fav_keys)
+                    conds.append(f"NOT ({placeholders})")
+                    for key in fav_keys:
+                        params.extend([key.source, key.provider_id])
                 if conds:
                     where_clauses.append(" AND ".join(conds))
 
             elif author_filter == "only_fav":
                 clean_fav = [re.sub(r"[^a-z0-9]", "", a.lower()) for a in (favorite_authors or []) if a]
                 clean_fav = [a for a in clean_fav if a]
-                fav_ids = [str(fid) for fid in (favorite_ids or []) if fid]
+                fav_keys = _normalize_favorite_keys(favorite_ids)
                 conds = []
                 if clean_fav:
                     placeholders = ",".join("?" for _ in clean_fav)
                     conds.append(f"author_clean IN ({placeholders})")
                     params.extend(clean_fav)
-                if fav_ids:
-                    placeholders = ",".join("?" for _ in fav_ids)
-                    conds.append(f"video_id IN ({placeholders})")
-                    params.extend(fav_ids)
+                if fav_keys:
+                    placeholders = " OR ".join("(source = ? AND video_id = ?)" for _ in fav_keys)
+                    conds.append(f"({placeholders})")
+                    for key in fav_keys:
+                        params.extend([key.source, key.provider_id])
                 if conds:
                     where_clauses.append(f"({' OR '.join(conds)})")
                 else:
                     where_clauses.append("1 = 0")
 
             where_sql = " AND ".join(where_clauses)
+            base_where_sql = " AND ".join(base_where_clauses)
+            base_count = int(conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM catalog_items WHERE {base_where_sql}", base_params
+            ).fetchone()["cnt"] or 0)
+            post_block_count = int(conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM catalog_items WHERE {post_block_where_sql}", post_block_params
+            ).fetchone()["cnt"] or 0)
 
             # Execute unified count and page query
             if not group_authors:
@@ -711,20 +855,27 @@ class CatalogService:
                 cnt_row = conn.execute(f"SELECT COUNT(*) AS cnt FROM catalog_items WHERE {where_sql}", params).fetchone()
                 total_videos = int(cnt_row["cnt"])
 
-                # Query group leaders
+                # Query group leaders. The window rank makes the leader deterministic;
+                # MAX(published_at) with a non-aggregated raw_json could otherwise return
+                # an older row when two videos share an author.
+                group_key_sql = "CASE WHEN author_clean = '' OR author_clean = 'model' THEN canonical_key ELSE author_clean END"
                 grp_sql = f"""
-                    WITH grp AS (
-                        SELECT raw_json, canonical_key, author_clean, MAX(published_at) AS pub, COUNT(*) AS grp_cnt
+                    WITH ranked AS (
+                        SELECT raw_json, canonical_key, author_clean, published_at AS pub,
+                               COUNT(*) OVER (PARTITION BY {group_key_sql}) AS grp_cnt,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY {group_key_sql}
+                                   ORDER BY published_at DESC, canonical_key ASC
+                               ) AS leader_rank
                         FROM catalog_items
-                        WHERE {where_sql} AND author_clean != '' AND author_clean != 'model'
-                        GROUP BY author_clean
-                        UNION ALL
-                        SELECT raw_json, canonical_key, author_clean, published_at AS pub, 1 AS grp_cnt
-                        FROM catalog_items
-                        WHERE {where_sql} AND (author_clean = '' OR author_clean = 'model')
+                        WHERE {where_sql}
+                    ), grp AS (
+                        SELECT raw_json, canonical_key, author_clean, pub, grp_cnt
+                        FROM ranked
+                        WHERE leader_rank = 1
                     )
                 """
-                grp_count_row = conn.execute(grp_sql + " SELECT COUNT(*) AS cnt FROM grp", params + params).fetchone()
+                grp_count_row = conn.execute(grp_sql + " SELECT COUNT(*) AS cnt FROM grp", params).fetchone()
                 total_groups = int(grp_count_row["cnt"])
                 page_count = max(1, math.ceil(total_groups / ps))
 
@@ -736,7 +887,7 @@ class CatalogService:
                         ORDER BY pub DESC, canonical_key ASC
                         LIMIT ? OFFSET ?
                     """,
-                    params + params + [ps, offset],
+                    params + [ps, offset],
                 ).fetchall()
 
                 # Fetch grouped members for every leader on this page in one query.
@@ -755,11 +906,19 @@ class CatalogService:
                     member_placeholders = ",".join("?" for _ in grouped_authors)
                     member_rows = conn.execute(
                         f"""
-                        SELECT author_clean, raw_json FROM catalog_items
-                        WHERE {where_sql} AND author_clean IN ({member_placeholders})
-                        ORDER BY author_clean ASC, published_at DESC, canonical_key ASC
+                        SELECT author_clean, raw_json FROM (
+                            SELECT author_clean, raw_json,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY author_clean
+                                       ORDER BY published_at DESC, canonical_key ASC
+                                   ) AS member_rank
+                            FROM catalog_items
+                            WHERE {where_sql} AND author_clean IN ({member_placeholders})
+                        )
+                        WHERE member_rank <= ?
+                        ORDER BY author_clean ASC, member_rank ASC
                         """,
-                        params + grouped_authors,
+                        params + grouped_authors + [GROUP_MEMBER_INLINE_LIMIT],
                     ).fetchall()
                     for mr in member_rows:
                         member_author = str(mr["author_clean"] or "")
@@ -773,8 +932,10 @@ class CatalogService:
                     if g_cnt > 1 and author_clean and author_clean != "model":
                         v["is_grouped"] = True
                         v["group_count"] = g_cnt
-                        members = member_map.get(author_clean, [dict(v)])
-                        v["grouped_videos"] = enrich_fn(members) if enrich_fn else members
+                        members = member_map.get(author_clean, [dict(v)]) if g_cnt <= GROUP_MEMBER_INLINE_LIMIT else []
+                        v["grouped_videos"] = enrich_fn(members) if enrich_fn and members else members
+                        v["group_members_lazy"] = g_cnt > GROUP_MEMBER_INLINE_LIMIT
+                        v["group_members_url"] = f"/api/catalog/groups/{author_clean}/members" if g_cnt > GROUP_MEMBER_INLINE_LIMIT else None
                     else:
                         v["is_grouped"] = False
                         v["group_count"] = 1
@@ -814,6 +975,145 @@ class CatalogService:
             "retryable": bool(source_error) and not is_complete,
             "catalog_limited": catalog_limited,
             "limited_sources": limited_sources,
+            "projection": {
+                "scope": "catalog",
+                "revision": rev,
+                "preferences_version": None,
+                "identity": "source:provider_id",
+                "accuracy": "exact" if is_complete else "partial",
+                "source": source,
+                "grouped": bool(group_authors),
+            },
+            "counts": {
+                "base_count": base_count,
+                "visible_count": total_videos,
+                "hidden_by_block": max(0, base_count - post_block_count),
+                "hidden_by_filter": max(0, post_block_count - total_videos),
+                "accuracy": "exact" if is_complete else "partial",
+            },
+        }
+
+    def query_group_members(
+        self,
+        author_key: str,
+        page: int = 1,
+        page_size: Optional[int] = None,
+        source: str = "all",
+        revision: Optional[int] = None,
+        blocked_models: Optional[List[str]] = None,
+        enrich_fn: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
+    ) -> Dict[str, Any]:
+        """Lazy, bounded member page for a group summary."""
+        ps = max(1, min(int(page_size or self.page_size), 200))
+        clean_author = re.sub(r"[^a-z0-9]", "", str(author_key or "").lower())
+        requested_revision = revision
+        if not clean_author:
+            return {"catalog_revision": 0, "items": [], "count": 0, "total": 0, "page": page, "page_count": 1, "complete": False}
+        with self._read_snapshot() as conn:
+            rev = requested_revision if requested_revision is not None else self._select_revision_from_conn(conn)
+            if rev is None:
+                return {"catalog_revision": 0, "items": [], "count": 0, "total": 0, "page": page, "page_count": 1, "complete": False}
+            clauses = ["revision = ?", "author_clean = ?"]
+            params: List[Any] = [rev, clean_author]
+            if source == "only-archivebate":
+                clauses.append("source = 'archivebate'")
+            elif source == "only-camwhores":
+                clauses.append("source = 'camwhores'")
+            clean_blocked = [re.sub(r"[^a-z0-9]", "", str(value or "").lower()) for value in (blocked_models or [])]
+            clean_blocked = [value for value in clean_blocked if value]
+            if clean_blocked:
+                placeholders = ",".join("?" for _ in clean_blocked)
+                clauses.append(f"author_clean NOT IN ({placeholders})")
+                params.extend(clean_blocked)
+            where = " AND ".join(clauses)
+            total = int(conn.execute(f"SELECT COUNT(*) AS cnt FROM catalog_items WHERE {where}", params).fetchone()["cnt"] or 0)
+            rows = conn.execute(
+                f"SELECT raw_json FROM catalog_items WHERE {where} ORDER BY published_at DESC, canonical_key ASC LIMIT ? OFFSET ?",
+                params + [ps, max(0, (page - 1) * ps)],
+            ).fetchall()
+            items = [json.loads(row["raw_json"]) for row in rows]
+            if enrich_fn:
+                items = enrich_fn(items)
+            rev_row = conn.execute("SELECT complete, failed, published_hash FROM revisions WHERE revision = ?", (rev,)).fetchone()
+        page_count = max(1, math.ceil(total / ps))
+        return {
+            "catalog_revision": rev,
+            "revision": rev,
+            "author_key": clean_author,
+            "page": page,
+            "page_size": ps,
+            "items": items,
+            "count": len(items),
+            "total": total,
+            "page_count": page_count,
+            "last_page": page_count,
+            "has_more": page < page_count,
+            "complete": bool(rev_row and rev_row["complete"] and not rev_row["failed"]),
+            "projection": {"scope": "catalog_group_members", "revision": rev, "identity": "source:provider_id"},
+        }
+
+    def search_local(
+        self,
+        query: str,
+        page: int = 1,
+        page_size: Optional[int] = None,
+        source: str = "all",
+        revision: Optional[int] = None,
+        blocked_models: Optional[List[str]] = None,
+        enrich_fn: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
+    ) -> Dict[str, Any]:
+        """Search the local catalog without silently falling back to remote media."""
+        ps = max(1, min(int(page_size or self.page_size), 200))
+        needle = str(query or "").strip().lower()
+        requested_revision = revision
+        if not needle:
+            return {"scope": "local_catalog", "catalog_revision": 0, "items": [], "count": 0, "total": 0, "page": page, "page_count": 1}
+        with self._read_snapshot() as conn:
+            rev = requested_revision if requested_revision is not None else self._select_revision_from_conn(conn)
+            if rev is None:
+                return {"scope": "local_catalog", "catalog_revision": 0, "items": [], "count": 0, "total": 0, "page": page, "page_count": 1}
+            # Treat the query as text, not as a SQL LIKE pattern. A literal '%' or '_'
+            # in a model/title must not widen the result set unexpectedly.
+            like_needle = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses = ["revision = ?", "lower(raw_json) LIKE ? ESCAPE '\\'"]
+            params: List[Any] = [rev, f"%{like_needle}%"]
+            if source == "only-archivebate":
+                clauses.append("source = 'archivebate'")
+            elif source == "only-camwhores":
+                clauses.append("source = 'camwhores'")
+            clean_blocked = [re.sub(r"[^a-z0-9]", "", str(value or "").lower()) for value in (blocked_models or [])]
+            clean_blocked = [value for value in clean_blocked if value]
+            if clean_blocked:
+                placeholders = ",".join("?" for _ in clean_blocked)
+                clauses.append(f"author_clean NOT IN ({placeholders})")
+                params.extend(clean_blocked)
+            where = " AND ".join(clauses)
+            total = int(conn.execute(f"SELECT COUNT(*) AS cnt FROM catalog_items WHERE {where}", params).fetchone()["cnt"] or 0)
+            rows = conn.execute(
+                f"SELECT raw_json FROM catalog_items WHERE {where} ORDER BY published_at DESC, canonical_key ASC LIMIT ? OFFSET ?",
+                params + [ps, max(0, (page - 1) * ps)],
+            ).fetchall()
+            items = [json.loads(row["raw_json"]) for row in rows]
+            if enrich_fn:
+                items = enrich_fn(items)
+            rev_row = conn.execute("SELECT complete, failed FROM revisions WHERE revision = ?", (rev,)).fetchone()
+        page_count = max(1, math.ceil(total / ps))
+        return {
+            "scope": "local_catalog",
+            "catalog_revision": rev,
+            "revision": rev,
+            "query": needle,
+            "page": page,
+            "page_size": ps,
+            "items": items,
+            "count": len(items),
+            "total": total,
+            "page_count": page_count,
+            "last_page": page_count,
+            "has_more": page < page_count,
+            "catalog_complete": bool(rev_row and rev_row["complete"] and not rev_row["failed"]),
+            "network_media_may_be_required": False,
+            "projection": {"scope": "local_catalog", "revision": rev, "identity": "source:provider_id"},
         }
 
     def import_cached_raw_pages(self, raw_cache_dir: Optional[Path] = None) -> int:
@@ -1057,6 +1357,9 @@ class CatalogService:
         cursor progress durable across process/PC restarts instead of depending on the six-hour raw
         cache window. A completed active revision is reused only when there is nothing to resume.
         """
+        with self._reader_guard:
+            if self._closing:
+                raise RuntimeError("catalog is shutting down")
         with self._lock:
             if self._indexing_thread and self._indexing_thread.is_alive():
                 return self._indexing_progress.get("revision", 0)
@@ -1234,13 +1537,17 @@ class CatalogService:
 
                 batch = None
                 fetch_error = None
+                fetch_outcome = None
                 # A single 5xx is not proof of a pagination boundary. Retry the exact page
                 # several times before deciding whether this is transient or a stable source cap.
                 for attempt in range(1, 5):
                     try:
-                        batch = fetchers[source](page)
-                        if not isinstance(batch, list):
-                            raise RuntimeError(f"Source {source} returned non-list on page {page}")
+                        fetch_outcome = coerce_fetch_result(fetchers[source](page), source=source, page=page)
+                        if not fetch_outcome.ok:
+                            raise RuntimeError(
+                                f"{fetch_outcome.status}: {fetch_outcome.error or 'source fetch failed'}"
+                            )
+                        batch = fetch_outcome.items
                         # Archivebate's page-1001 boundary is inconsistent: it can be 5xx or a
                         # successful but empty document. Probe an empty post-1000 page repeatedly
                         # before classifying it, so one transient empty response cannot stop the crawl.

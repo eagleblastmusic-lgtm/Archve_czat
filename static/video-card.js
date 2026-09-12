@@ -165,6 +165,20 @@
     }
   }
 
+  function escapeHtml(value) {
+    if (global.ArchivebateDOM && typeof global.ArchivebateDOM.escapeHtml === 'function') {
+      return global.ArchivebateDOM.escapeHtml(value);
+    }
+    return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+  }
+
+  function safeUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    if (/^https?:\/\//i.test(raw) || /^\/(?!\/)/.test(raw) || raw === '#') return escapeHtml(raw);
+    return '';
+  }
+
   function createVideoCard(v, idx) {
     const isCamwhores = v.source === 'camwhores' || String(v.id).startsWith('cw_') || (v.platform && v.platform.toLowerCase().includes('camwhores'));
     const isFav = !!v.is_favorite;
@@ -188,15 +202,24 @@
     const canonicalPoster = thumbnailUrlForVideo(v) || directPoster;
     const displayPoster = canonicalPoster;
     const backupPoster = directPoster;
+    const safeId = escapeHtml(v.id);
+    const safeUsername = escapeHtml(v.username || 'Model');
+    const safeDate = escapeHtml(v.date || 'Niedawno');
+    const safeViews = escapeHtml(v.views || '');
+    const safeDuration = escapeHtml(v.duration || '');
+    const safePlatform = escapeHtml(v.platform || 'Archive');
+    const safeGroupCount = escapeHtml(groupCount);
+    const safeDisplayPoster = safeUrl(displayPoster);
+    const safeBackupPoster = safeUrl(backupPoster);
 
     const eagerThumb = idx < 8;
     const thumbLoadAttrs = eagerThumb
-      ? `src="${displayPoster}" loading="eager" fetchpriority="${idx < 4 ? 'high' : 'auto'}"`
-      : `data-src="${displayPoster}" loading="lazy" fetchpriority="low"`;
+      ? `src="${safeDisplayPoster}" loading="eager" fetchpriority="${idx < 4 ? 'high' : 'auto'}"`
+      : `data-src="${safeDisplayPoster}" loading="lazy" fetchpriority="low"`;
 
     card.innerHTML = `
       <div class="thumbnail-wrapper">
-        <img class="thumbnail-img" ${thumbLoadAttrs} data-fallback="${backupPoster || ''}" alt="${v.username}" decoding="async">
+        <img class="thumbnail-img" ${thumbLoadAttrs} data-fallback="${safeBackupPoster}" alt="${safeUsername}" decoding="async">
         ${isCamwhores ? `<img class="hover-preview-frame" style="display: none; position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: 2; pointer-events: none;" alt="Preview">` : ''}
         <video class="hover-preview-video" muted playsinline preload="none"></video>
         
@@ -207,47 +230,47 @@
           <div class="card-scrub-thumb"></div>
         </div>
 
-        <span class="badge-platform ${isCamwhores ? 'badge-camwhores' : ''}">${isCamwhores ? '<i class="fa-solid fa-tv"></i> Camwhores' : (v.platform || 'Archive')}</span>
-        ${v.views ? `<span class="badge-views"><i class="fa-solid fa-eye"></i> ${v.views}</span>` : ''}
-        ${v.duration && v.duration !== 'N/A' ? `<span class="badge-duration">${v.duration}</span>` : ''}
+        <span class="badge-platform ${isCamwhores ? 'badge-camwhores' : ''}">${isCamwhores ? '<i class="fa-solid fa-tv"></i> Camwhores' : safePlatform}</span>
+        ${v.views ? `<span class="badge-views"><i class="fa-solid fa-eye"></i> ${safeViews}</span>` : ''}
+        ${v.duration && v.duration !== 'N/A' ? `<span class="badge-duration">${safeDuration}</span>` : ''}
         ${isGrouped && groupCount > 1 ? `
-          <span class="badge-group-count" title="Ten autor ma ${groupCount} filmów na liście. Kliknij, aby rozwinąć listę!">
-            <i class="fa-solid fa-layer-group"></i> ${groupCount} filmów
+          <span class="badge-group-count" title="Ten autor ma ${escapeHtml(groupCount)} filmów na liście. Kliknij, aby rozwinąć listę!">
+            <i class="fa-solid fa-layer-group"></i> ${safeGroupCount} filmów
           </span>
         ` : ''}
         
         <!-- Szybki przycisk ulubione -->
-        <button class="card-fav-btn ${isFav ? 'active' : ''}" title="${isFav ? 'Usuń z ulubionych' : 'Dodaj do ulubionych'}">
+        <button type="button" class="card-fav-btn ${isFav ? 'active' : ''}" aria-label="${isFav ? 'Usuń z ulubionych' : 'Dodaj do ulubionych'}" aria-pressed="${isFav ? 'true' : 'false'}" title="${isFav ? 'Usuń z ulubionych' : 'Dodaj do ulubionych'}">
           <i class="${isFav ? 'fa-solid' : 'fa-regular'} fa-heart"></i>
         </button>
       </div>
 
       <div class="card-details">
         <div class="card-header-info">
-          <a href="#" class="model-profile-link ${(isFavoriteAuthor(v.username) || v.has_favorite_video) ? 'is-favorite-author' : ''}" data-username="${v.username}">
-            <i class="fa-solid fa-circle-user"></i> ${v.username}${(isFavoriteAuthor(v.username) || v.has_favorite_video) ? '<i class="fa-solid fa-star fav-author-star" title="Masz film tej modelki w ulubionych"></i>' : ''}
+          <a href="#" class="model-profile-link ${(isFavoriteAuthor(v.username) || v.has_favorite_video) ? 'is-favorite-author' : ''}" data-username="${safeUsername}">
+            <i class="fa-solid fa-circle-user"></i> ${safeUsername}${(isFavoriteAuthor(v.username) || v.has_favorite_video) ? '<i class="fa-solid fa-star fav-author-star" title="Masz film tej modelki w ulubionych"></i>' : ''}
           </a>
-          ${isGrouped && groupCount > 1 ? `<span class="author-group-pill" title="Zgrupowano ${groupCount} nagrań tego twórcy"><i class="fa-solid fa-clone"></i> Grupa (${groupCount})</span>` : ''}
-          <span class="card-date-badge" data-video-id="${v.id}" title="Kliknij na datę, aby ustawić punkt kontrolny (checkpoint)"><i class="fa-regular fa-calendar-days"></i> ${v.date || 'Niedawno'}</span>
+          ${isGrouped && groupCount > 1 ? `<span class="author-group-pill" title="Zgrupowano ${safeGroupCount} nagrań tego twórcy"><i class="fa-solid fa-clone"></i> Grupa (${safeGroupCount})</span>` : ''}
+          <button type="button" class="card-date-badge" data-video-id="${safeId}" aria-label="Ustaw checkpoint dla filmu z datą ${safeDate}" title="Kliknij na datę, aby ustawić punkt kontrolny (checkpoint)"><i class="fa-regular fa-calendar-days"></i> ${safeDate}</button>
         </div>
 
         <div class="card-tags-row">
-          ${(v.tags || []).slice(0, 3).map(t => `<span class="card-tag-badge" data-tag="${t.toLowerCase()}">#${t}</span>`).join('')}
+          ${(v.tags || []).slice(0, 3).map(t => `<button type="button" class="card-tag-badge" data-tag="${escapeHtml(String(t).toLowerCase())}" aria-label="Filtruj tag ${escapeHtml(t)}">#${escapeHtml(t)}</button>`).join('')}
         </div>
 
         <div class="card-actions-row">
           <button class="btn-card primary play-btn">
             <i class="fa-solid fa-play"></i> Odtwórz
           </button>
-          <button class="btn-card profile-btn" data-username="${v.username}" title="Zobacz profil i nagrania modelki ${v.username}">
-            <i class="fa-solid fa-folder${isGrouped && groupCount > 1 ? '-open' : ''}"></i> ${isGrouped && groupCount > 1 ? `${groupCount} filmów` : 'Filmy'}
+          <button class="btn-card profile-btn" data-username="${safeUsername}" title="Zobacz profil i nagrania modelki ${safeUsername}">
+            <i class="fa-solid fa-folder${isGrouped && groupCount > 1 ? '-open' : ''}"></i> ${isGrouped && groupCount > 1 ? `${safeGroupCount} filmów` : 'Filmy'}
           </button>
           ${isGrouped && groupCount > 1 ? `
-            <button class="btn-card expand-group-btn" title="Rozwiń podgląd wszystkich ${groupCount} filmów tej grupy">
+            <button type="button" class="btn-card expand-group-btn" aria-label="Rozwiń grupę ${escapeHtml(groupCount)} filmów" title="Rozwiń podgląd wszystkich ${escapeHtml(groupCount)} filmów tej grupy">
               <i class="fa-solid fa-chevron-down"></i>
             </button>
           ` : ''}
-          <button class="btn-card danger block-model-btn" data-username="${v.username}" title="Zablokuj modelkę: usuń ten profil z katalogu programu i ukryj wszystkie jej nagrania">
+          <button type="button" class="btn-card danger block-model-btn" data-username="${safeUsername}" aria-label="Zablokuj profil ${safeUsername}" title="Zablokuj modelkę: ukryj wszystkie jej nagrania">
             <i class="fa-solid fa-ban"></i>
           </button>
         </div>
@@ -671,6 +694,107 @@
       const expandBtn = card.querySelector('.expand-group-btn');
       const drawer = card.querySelector('.grouped-videos-drawer');
 
+      const appendLazyGroupRow = (gv, gIdx) => {
+        const row = document.createElement('div');
+        row.className = 'grouped-item-row';
+        row.title = `${gv.title || gv.username} (${gv.duration || 'N/A'}) - LPM: odtwórz, Kółko myszy: nowa karta`;
+        const gThumb = thumbnailUrlForVideo(gv) || gv.poster_direct || '';
+        const gBackup = gv.poster_direct || '';
+        const safeGThumb = safeUrl(gThumb);
+        const safeGBackup = safeUrl(gBackup);
+        const safeGUser = escapeHtml(gv.username || 'Model');
+        const safeGDate = escapeHtml(gv.date || 'Wideo');
+        const safeGDuration = escapeHtml(gv.duration || '');
+        const safeGPlatform = escapeHtml(gv.platform || (gv.source === 'camwhores' ? 'Camwhores' : 'Archive'));
+        const safeGViews = escapeHtml(gv.views || '');
+        row.innerHTML = `
+          <img class="grouped-item-thumb" src="${safeGThumb}" data-fallback="${safeGBackup}" alt="${safeGUser}" loading="lazy">
+          <div class="grouped-item-info">
+            <div class="grouped-item-title">${escapeHtml(gIdx + 1)}. ${safeGDate} • ${safeGDuration}</div>
+            <div class="grouped-item-meta">
+              <span>${safeGPlatform}</span>
+              ${gv.views ? `<span>• <i class="fa-solid fa-eye"></i> ${safeGViews}</span>` : ''}
+            </div>
+          </div>
+          <div class="grouped-item-play-btn"><i class="fa-solid fa-play"></i></div>
+        `;
+        const groupedImage = row.querySelector('.grouped-item-thumb');
+        groupedImage?.addEventListener('error', () => {
+          if (groupedImage.dataset.retried || !groupedImage.dataset.fallback) {
+            groupedImage.style.opacity = '0.3';
+            return;
+          }
+          groupedImage.dataset.retried = '1';
+          groupedImage.src = groupedImage.dataset.fallback;
+        });
+        row.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          state.lastClickedGridVideo = v;
+          state.lastClickedGridIndex = idx;
+          openVideoModal(gv);
+        });
+        row.addEventListener('auxclick', (ev) => {
+          if (ev.button !== 1) return;
+          ev.preventDefault();
+          ev.stopPropagation();
+          if (global.tabManager && typeof global.tabManager.openTab === 'function') {
+            global.tabManager.openTab({
+              title: gv.username ? `${gv.username} (Wideo)` : 'Odtwarzacz',
+              icon: 'fa-solid fa-play',
+              type: 'watch',
+              video: gv,
+              inBackground: true
+            });
+          }
+        });
+        row.addEventListener('mousedown', (ev) => {
+          if (ev.button === 1) ev.preventDefault();
+        });
+        drawer.appendChild(row);
+      };
+
+      const loadLazyGroupMembers = () => {
+        if (!v.group_members_url || !global.ArchivebateAPI?.getJSON) return;
+        const loadGeneration = (card._groupMembersGeneration || 0) + 1;
+        card._groupMembersGeneration = loadGeneration;
+        const status = document.createElement('div');
+        status.className = 'grouped-members-status';
+        status.textContent = 'Ładowanie nagrań grupy…';
+        drawer.appendChild(status);
+
+        const loadPage = async (page) => {
+          const target = new URL(v.group_members_url, window.location.href);
+          target.searchParams.set('page', String(page));
+          target.searchParams.set('per_page', '50');
+          if (v.revision) target.searchParams.set('revision', String(v.revision));
+          const data = await global.ArchivebateAPI.getJSON(`${target.pathname}${target.search}`, { timeoutMs: 12000 });
+          if (loadGeneration !== card._groupMembersGeneration) return;
+          if (!data || !Array.isArray(data.items)) throw new Error('Nieprawidłowa odpowiedź grupy.');
+          status.remove();
+          data.items.forEach((member, offset) => appendLazyGroupRow(member, ((page - 1) * 50) + offset));
+          drawer.querySelector('.grouped-load-more')?.remove();
+          if (data.has_more) {
+            const more = document.createElement('button');
+            more.type = 'button';
+            more.className = 'grouped-load-more btn-card';
+            more.textContent = 'Pokaż następne nagrania';
+            more.addEventListener('click', (event) => {
+              event.stopPropagation();
+              more.disabled = true;
+              loadPage(Number(data.page || page) + 1).catch(showError);
+            });
+            drawer.appendChild(more);
+          }
+        };
+        const showError = (error) => {
+          if (loadGeneration !== card._groupMembersGeneration) return;
+          status.textContent = error?.message || 'Nie udało się pobrać nagrań grupy.';
+          status.classList.add('error');
+        };
+        loadPage(1).catch(showError);
+      };
+
       const toggleDrawer = (e) => {
         if (e) {
           e.stopPropagation();
@@ -687,26 +811,44 @@
           if (drawer.children.length === 0) {
             const header = document.createElement('div');
             header.className = 'grouped-drawer-header';
-            header.innerHTML = `<span><i class="fa-solid fa-layer-group"></i> ${groupCount} filmów twórcy (${v.username})</span><span style="font-size: 10px; opacity: 0.7;">LPM: odtwórz | Kółko: nowa karta</span>`;
+            header.innerHTML = `<span><i class="fa-solid fa-layer-group"></i> ${escapeHtml(groupCount)} filmów twórcy (${safeUsername})</span><span style="font-size: 10px; opacity: 0.7;">LPM: odtwórz | Kółko: nowa karta</span>`;
             drawer.appendChild(header);
 
-            groupedVideosList.forEach((gv, gIdx) => {
+            if (v.group_members_lazy && v.group_members_url) {
+              loadLazyGroupMembers();
+            } else groupedVideosList.forEach((gv, gIdx) => {
               const row = document.createElement('div');
               row.className = 'grouped-item-row';
               row.title = `${gv.title || gv.username} (${gv.duration || 'N/A'}) - LPM: odtwórz, Kółko myszy: nowa karta`;
               const gThumb = thumbnailUrlForVideo(gv) || gv.poster_direct || '';
               const gBackup = gv.poster_direct || '';
+              const safeGThumb = safeUrl(gThumb);
+              const safeGBackup = safeUrl(gBackup);
+              const safeGUser = escapeHtml(gv.username || 'Model');
+              const safeGDate = escapeHtml(gv.date || 'Wideo');
+              const safeGDuration = escapeHtml(gv.duration || '');
+              const safeGPlatform = escapeHtml(gv.platform || (gv.source === 'camwhores' ? 'Camwhores' : 'Archive'));
+              const safeGViews = escapeHtml(gv.views || '');
               row.innerHTML = `
-                <img class="grouped-item-thumb" src="${gThumb}" alt="${gv.username}" loading="lazy" onerror="if(this.dataset.retried){this.style.opacity=0.3;}else{this.dataset.retried='1';this.src='${gBackup}';}">
+                <img class="grouped-item-thumb" src="${safeGThumb}" data-fallback="${safeGBackup}" alt="${safeGUser}" loading="lazy">
                 <div class="grouped-item-info">
-                  <div class="grouped-item-title">${gIdx + 1}. ${gv.date || 'Wideo'} • ${gv.duration || ''}</div>
+                  <div class="grouped-item-title">${gIdx + 1}. ${safeGDate} • ${safeGDuration}</div>
                   <div class="grouped-item-meta">
-                    <span>${gv.platform || (gv.source === 'camwhores' ? 'Camwhores' : 'Archive')}</span>
-                    ${gv.views ? `<span>• <i class="fa-solid fa-eye"></i> ${gv.views}</span>` : ''}
+                    <span>${safeGPlatform}</span>
+                    ${gv.views ? `<span>• <i class="fa-solid fa-eye"></i> ${safeGViews}</span>` : ''}
                   </div>
                 </div>
                 <div class="grouped-item-play-btn"><i class="fa-solid fa-play"></i></div>
               `;
+              const groupedImage = row.querySelector('.grouped-item-thumb');
+              groupedImage?.addEventListener('error', () => {
+                if (groupedImage.dataset.retried || !groupedImage.dataset.fallback) {
+                  groupedImage.style.opacity = '0.3';
+                  return;
+                }
+                groupedImage.dataset.retried = '1';
+                groupedImage.src = groupedImage.dataset.fallback;
+              });
 
               row.addEventListener('click', (ev) => {
                 ev.stopPropagation();
@@ -778,6 +920,8 @@
       const fb = card.querySelector('.card-fav-btn');
       if (fb) {
         fb.classList.toggle('active', isNowFav);
+        fb.setAttribute('aria-label', isNowFav ? 'Usuń z ulubionych' : 'Dodaj do ulubionych');
+        fb.setAttribute('aria-pressed', isNowFav ? 'true' : 'false');
         fb.title = isNowFav ? 'Usuń z ulubionych' : 'Dodaj do ulubionych';
         const fIcon = fb.querySelector('i');
         if (fIcon) {
@@ -805,23 +949,24 @@
       const nowGroupCount = newV.group_count || newV._groupCount || (newV.grouped_videos ? newV.grouped_videos.length : (newV._groupedVideos ? newV._groupedVideos.length : 1));
       card.classList.toggle('is-grouped-card', isNowGrouped && nowGroupCount > 1);
       const gBadge = card.querySelector('.badge-group-count');
+      const safeNowGroupCount = escapeHtml(nowGroupCount);
       if (gBadge && nowGroupCount > 1) {
-        gBadge.innerHTML = `<i class="fa-solid fa-layer-group"></i> ${nowGroupCount} filmów`;
+        gBadge.innerHTML = `<i class="fa-solid fa-layer-group"></i> ${safeNowGroupCount} filmów`;
         gBadge.title = `Ten autor ma ${nowGroupCount} filmów na liście. Kliknij, aby rozwinąć listę!`;
       }
       const aPill = card.querySelector('.author-group-pill');
       if (aPill && nowGroupCount > 1) {
-        aPill.innerHTML = `<i class="fa-solid fa-clone"></i> Grupa (${nowGroupCount})`;
+        aPill.innerHTML = `<i class="fa-solid fa-clone"></i> Grupa (${safeNowGroupCount})`;
       }
       const pBtn = card.querySelector('.profile-btn');
       if (pBtn) {
-        pBtn.innerHTML = `<i class="fa-solid fa-folder${isNowGrouped && nowGroupCount > 1 ? '-open' : ''}"></i> ${isNowGrouped && nowGroupCount > 1 ? `${nowGroupCount} filmów` : 'Filmy'}`;
+        pBtn.innerHTML = `<i class="fa-solid fa-folder${isNowGrouped && nowGroupCount > 1 ? '-open' : ''}"></i> ${isNowGrouped && nowGroupCount > 1 ? `${safeNowGroupCount} filmów` : 'Filmy'}`;
       }
 
       // Wyświetlenia, długość, data
       const vwBadge = card.querySelector('.badge-views');
       if (vwBadge && newV.views && vwBadge.innerText !== String(newV.views)) {
-        vwBadge.innerHTML = `<i class="fa-solid fa-eye"></i> ${newV.views}`;
+        vwBadge.innerHTML = `<i class="fa-solid fa-eye"></i> ${escapeHtml(newV.views)}`;
       }
       const dBadge = card.querySelector('.badge-duration');
       if (dBadge && newV.duration && newV.duration !== 'N/A' && dBadge.innerText !== newV.duration) {
@@ -830,7 +975,8 @@
       const dtBadge = card.querySelector('.card-date-badge');
       if (dtBadge && newV.date && dtBadge.dataset.origDate !== newV.date) {
         dtBadge.dataset.origDate = newV.date;
-        dtBadge.innerHTML = `<i class="fa-regular fa-calendar-days"></i> ${newV.date}`;
+        dtBadge.setAttribute('aria-label', `Ustaw checkpoint dla filmu z datą ${escapeHtml(newV.date)}`);
+        dtBadge.innerHTML = `<i class="fa-regular fa-calendar-days"></i> ${escapeHtml(newV.date)}`;
       }
 
       // Miniatura: stabilność img.src

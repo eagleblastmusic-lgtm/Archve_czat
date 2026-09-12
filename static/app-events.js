@@ -307,6 +307,15 @@
       });
     }
 
+    if (dom.searchScopeSelect) {
+      dom.searchScopeSelect.addEventListener('change', () => {
+        const query = String(dom.searchInput?.value || '').trim();
+        if (query.length >= 2 && state.mode === 'search') {
+          performSearch(query, 1);
+        }
+      });
+    }
+
     if (dom.clearSearchBtn) {
       dom.clearSearchBtn.addEventListener('click', () => {
         if (dom.searchInput) dom.searchInput.value = '';

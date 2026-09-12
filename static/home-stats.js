@@ -48,6 +48,12 @@
       : 'Gotowe';
   }
 
+  function hasActiveFeedProjection() {
+    if (state.mode !== 'home') return false;
+    const revision = Number(state.lastAppliedFeedRevision);
+    return Number.isFinite(revision) && revision >= 0;
+  }
+
   async function update() {
     const generation = ++requestGeneration;
     try {
@@ -55,39 +61,46 @@
       if (!res.ok) throw new Error(`stats HTTP ${res.status}`);
       const data = await res.json();
       if (generation !== requestGeneration) return;
+      const finiteCount = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString('pl-PL') : '--';
 
       if (dom.statGlobalVideos) {
-        dom.statGlobalVideos.innerText = '5 500 000+';
+        dom.statGlobalVideos.innerText = data.external_catalog_estimate == null ? '--' : Number(data.external_catalog_estimate).toLocaleString('pl-PL');
       }
-      if (dom.statCatalogVideos) {
-        const totalVids = data.catalog_videos !== undefined ? data.catalog_videos : 0;
-        dom.statCatalogVideos.innerText = totalVids.toLocaleString('pl-PL');
+      // /api/stats is intentionally unscoped. Once the current feed has
+      // applied a revision, its filtered count is authoritative for the
+      // visible home projection and must not be replaced by the global count.
+      // video-views.js updates that value when each feed batch is committed.
+      const feedProjectionActive = hasActiveFeedProjection();
+      if (dom.statCatalogVideos && !feedProjectionActive) {
+        dom.statCatalogVideos.innerText = finiteCount(data.catalog_videos);
       }
-      if (dom.statCatalogVideosLbl) {
-        const totalPages = data.catalog_pages || (data.catalog_videos ? Math.ceil(data.catalog_videos / 280) : 0);
+      if (dom.statCatalogVideosLbl && !feedProjectionActive) {
+        const totalPages = Number.isFinite(Number(data.catalog_pages))
+          ? Number(data.catalog_pages)
+          : (Number.isFinite(Number(data.catalog_videos)) ? Math.ceil(Number(data.catalog_videos) / 280) : null);
         dom.statCatalogVideosLbl.innerText = formatCatalogStatus(data, totalPages);
       }
       if (dom.statPageVideos) {
         dom.statPageVideos.innerText = String(state.videos?.length || 0);
       }
-      if (dom.statGlobalProfiles && data.total_models) {
-        dom.statGlobalProfiles.innerText = `${data.total_models.toLocaleString('pl-PL')}`;
+      if (dom.statGlobalProfiles && data.total_models !== undefined && data.total_models !== null) {
+        dom.statGlobalProfiles.innerText = finiteCount(data.total_models);
         if (dom.scannedModelsCount) {
-          dom.scannedModelsCount.innerText = `${data.total_models} profili`;
+          dom.scannedModelsCount.innerText = `${finiteCount(data.total_models)} profili`;
         }
       }
       if (dom.statUserLibrary) {
-        const favs = data.favorites_count || 0;
-        const hist = data.history_count || 0;
-        dom.statUserLibrary.innerText = `${favs} ulub. • ${hist} hist.`;
+        const favs = finiteCount(data.favorites_count);
+        const hist = finiteCount(data.history_count);
+        dom.statUserLibrary.innerText = favs === '--' || hist === '--' ? '--' : `${favs} ulub. • ${hist} hist.`;
       }
       if (dom.statBlockedInfo) {
-        const authors = data.blocked_authors_count || 0;
-        dom.statBlockedInfo.innerText = `${authors} autorów`;
+        const authors = finiteCount(data.blocked_authors_count);
+        dom.statBlockedInfo.innerText = authors === '--' ? '--' : `${authors} autorów`;
       }
       if (dom.statBlockedVideosLbl) {
-        const vids = data.blocked_videos_total || 0;
-        dom.statBlockedVideosLbl.innerText = `${vids.toLocaleString('pl-PL')} filmów usuniętych z katalogu`;
+        const vids = finiteCount(data.blocked_videos_total);
+        dom.statBlockedVideosLbl.innerText = vids === '--' ? 'Zakres ukrycia: --' : `szacunkowo ukryto ${vids} filmów`;
       }
 
       scheduleCatalogPoll(data);

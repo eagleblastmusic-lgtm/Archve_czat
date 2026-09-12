@@ -23,8 +23,8 @@ assert catalog.MAX_PAGES_PER_SOURCE["archivebate"] > 1000
 with tempfile.TemporaryDirectory() as tmp:
     db = Path(tmp) / "catalog.db"
     service = catalog.CatalogService(db)
-    service.import_items([{"id": "old", "username": "old"}], revision=6, complete=True)
-    service.import_items([{"id": "partial", "username": "partial"}], revision=7, complete=False)
+    service.import_items([{"id": "old", "source": "archivebate", "username": "old"}], revision=6, complete=True)
+    service.import_items([{"id": "partial", "source": "archivebate", "username": "partial"}], revision=7, complete=False)
     with service._lock:
         conn = service._get_conn()
         conn.execute(
@@ -40,7 +40,7 @@ with tempfile.TemporaryDirectory() as tmp:
     def fetch(page):
         calls.append(page)
         if page == 1001:
-            return [{"id": "after_1000", "username": "resume"}]
+            return [{"id": "after_1000", "source": "archivebate", "username": "resume"}]
         if 1002 <= page <= 1006:
             return []
         raise AssertionError(f"unexpected page {page}")
@@ -65,7 +65,7 @@ with tempfile.TemporaryDirectory() as tmp:
 with tempfile.TemporaryDirectory() as tmp:
     db = Path(tmp) / "catalog.db"
     service = catalog.CatalogService(db)
-    service.import_items([{"id": "legacy", "username": "legacy"}], revision=9, complete=False)
+    service.import_items([{"id": "legacy", "source": "archivebate", "username": "legacy"}], revision=9, complete=False)
     with service._lock:
         conn = service._get_conn()
         conn.execute(

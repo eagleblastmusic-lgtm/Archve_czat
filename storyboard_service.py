@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import count
 from pathlib import Path
-from queue import PriorityQueue
+from queue import Empty, PriorityQueue
 from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
@@ -44,6 +44,8 @@ _states: Dict[str, Dict[str, object]] = {}
 _jobs = PriorityQueue(maxsize=64)
 _sequence = count()
 _worker_started = False
+_worker_thread: Optional[threading.Thread] = None
+_worker_stop = threading.Event()
 _leases: Dict[str, Dict[str, float]] = {}
 
 
@@ -533,8 +535,14 @@ def demand(video_id: str, consumer: str, active: bool = True):
 
 
 def _run_jobs():
-    while True:
-        job = _jobs.get()
+    while not _worker_stop.is_set():
+        try:
+            job = _jobs.get(timeout=0.25)
+        except Empty:
+            continue
+        if _worker_stop.is_set():
+            _jobs.task_done()
+            break
         if len(job) >= 7 and job[5] == "segment":
             _, _, video_id, duration, source_url, _, segment_index = job
             k_seg = f"{_key(video_id)}:seg_{segment_index}"
@@ -588,7 +596,7 @@ def _run_jobs():
 
 
 def start(video_id: str, duration: float, source_url: str, force: bool = False) -> dict:
-    global _worker_started
+    global _worker_started, _worker_thread
     duration = float(duration or 0)
     if not video_id or duration <= 0 or not math.isfinite(duration):
         return {"status": "error", "error": "Invalid ID or duration"}
@@ -619,16 +627,21 @@ def start(video_id: str, duration: float, source_url: str, force: bool = False) 
                 del _states[old_key]
         _states[k] = state
         _jobs.put_nowait((0 if quality == "quick" else 1, next(_sequence), video_id, duration, source_url, quality))
+        if _worker_stop.is_set() and not (_worker_thread and _worker_thread.is_alive()):
+            _worker_stop.clear()
+        if _worker_stop.is_set():
+            return {"status": "error", "error": "Storyboard service is shutting down"}
         if not _worker_started:
             _worker_started = True
-            threading.Thread(target=_run_jobs, daemon=True, name="storyboard-worker").start()
+            _worker_thread = threading.Thread(target=_run_jobs, daemon=True, name="storyboard-worker")
+            _worker_thread.start()
         return dict(state)
 
 
 def start_segment(
     video_id: str, duration: float, segment_index: int, source_url: str, force: bool = False, priority: int = 0
 ) -> dict:
-    global _worker_started
+    global _worker_started, _worker_thread
     duration = float(duration or 0)
     segment_index = int(segment_index)
     if not video_id or duration <= 0 or not math.isfinite(duration) or segment_index < 0:
@@ -648,7 +661,35 @@ def start_segment(
         state = {"status": "building", "type": "segment", "segment_index": segment_index}
         _states[k_seg] = state
         _jobs.put_nowait((priority, next(_sequence), video_id, duration, source_url, "segment", segment_index))
+        if _worker_stop.is_set() and not (_worker_thread and _worker_thread.is_alive()):
+            _worker_stop.clear()
+        if _worker_stop.is_set():
+            return {"status": "error", "error": "Storyboard service is shutting down"}
         if not _worker_started:
             _worker_started = True
-            threading.Thread(target=_run_jobs, daemon=True, name="storyboard-worker").start()
+            _worker_thread = threading.Thread(target=_run_jobs, daemon=True, name="storyboard-worker")
+            _worker_thread.start()
         return dict(state)
+
+
+def shutdown(timeout: float = 10.0) -> None:
+    """Stop the storyboard worker and drain queued jobs before process teardown."""
+    global _worker_started, _worker_thread
+    _worker_stop.set()
+    thread = _worker_thread
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=max(0.0, timeout))
+    if thread and thread.is_alive():
+        raise RuntimeError("storyboard worker did not drain before shutdown")
+    while True:
+        try:
+            _jobs.get_nowait()
+        except Empty:
+            break
+        else:
+            _jobs.task_done()
+    _worker_started = False
+    _worker_thread = None
+
+
+close = shutdown

@@ -437,221 +437,37 @@ function createVideoCard(v, idx) {
   return vc && vc.createVideoCard ? vc.createVideoCard(v, idx) : null;
 }
 
-// Video Grid Core Adapters & Fallback Slice for regression_frontend.cjs
+// Video Grid Core Adapters. The implementation lives in video-grid.js so the
+// production page has one renderer lifecycle, one generation counter and one
+// keyed card registry. These adapters keep the legacy global call surface.
+function videoGridModule() {
+  const g = typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : globalThis);
+  return g.ArchivebateVideoGrid || (typeof require === 'function' ? (require('./static/video-grid.js') || g.ArchivebateVideoGrid) : null);
+}
+
 function deduplicateVideos(videos) {
-  const seen = new Map();
-  const result = [];
-  for (const video of videos || []) {
-    if (!video || typeof video !== 'object') continue;
-    let id = String(video.id || '').trim();
-    const source = id.startsWith('cw_') || video.source === 'camwhores' ? 'camwhores' : (video.source || 'archivebate');
-    if (source === 'camwhores') id = id.replace(/^cw_/, '');
-    const url = String(video.url || '').trim().split('#')[0].replace(/\/$/, '');
-    const key = id ? `${source}:id:${id}` : url ? `${source}:url:${url}` : null;
-    if (key && seen.has(key)) {
-      const old = seen.get(key);
-      for (const [field, value] of Object.entries(video)) if (!old[field] && value) old[field] = value;
-      continue;
-    }
-    const item = {...video};
-    result.push(item);
-    if (key) seen.set(key, item);
-  }
-  return result;
+  const grid = videoGridModule();
+  return grid && typeof grid.deduplicateVideos === 'function' ? grid.deduplicateVideos(videos) : [];
+}
+
+function getVideoKey(video) {
+  const grid = videoGridModule();
+  return grid && typeof grid.getVideoKey === 'function' ? grid.getVideoKey(video) : null;
 }
 
 function renderVideoGrid(videos, options = {}) {
-  if (options && options.reconcile) {
-    return reconcilePage(videos, options);
-  }
-  return replaceView(videos, options);
-}
-
-function getVideoKey(v) {
-  if (!v || typeof v !== 'object') return null;
-  const isGrouped = Boolean(
-    (typeof state !== 'undefined' && state?.groupByAuthor) ||
-    v.is_grouped || v._isGrouped ||
-    (v.group_count && v.group_count > 1) ||
-    (v._groupCount && v._groupCount > 1) ||
-    (Array.isArray(v.grouped_videos) && v.grouped_videos.length > 1) ||
-    (Array.isArray(v._groupedVideos) && v._groupedVideos.length > 1)
-  );
-  if (isGrouped) {
-    const rawU = String(v.username || '').trim();
-    const normU = rawU.toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (normU && normU !== 'model') {
-      return `group:author:${normU}`;
-    }
-  }
-  let id = String(v.id !== undefined && v.id !== null ? v.id : '').trim();
-  const source = (id.startsWith('cw_') || v.source === 'camwhores' || (v.platform && String(v.platform).toLowerCase().includes('camwhores')))
-    ? 'camwhores'
-    : (v.source || 'archivebate');
-  if (source === 'camwhores') id = id.replace(/^cw_/, '');
-  if (id) return `${source}:id:${id}`;
-  const url = String(v.url || '').trim().split('#')[0].replace(/\/$/, '');
-  if (url) return `${source}:url:${url}`;
-  return null;
+  const grid = videoGridModule();
+  return grid && typeof grid.renderVideoGrid === 'function' ? grid.renderVideoGrid(videos, options) : undefined;
 }
 
 function replaceView(videos, options = {}) {
-  if (!dom.videoGrid) return;
-
-  state.gridController?.abort();
-  state.gridController = typeof AbortController !== 'undefined' ? new AbortController() : null;
-
-  dom.videoGrid.querySelectorAll?.('video')?.forEach?.(video => {
-    try {
-      video.pause?.();
-      video.removeAttribute?.('src');
-      video.load?.();
-    } catch (_) {}
-  });
-
-  const generation = state.gridGeneration = (state.gridGeneration || 0) + 1;
-  if (typeof lazyThumbObserver !== 'undefined') lazyThumbObserver?.disconnect?.();
-
-  dom.videoGrid.innerHTML = '';
-  state.gridCardMap = new Map();
-  state.lastAppliedFeedRevision = -1;
-  state.lastAppliedFeedUpdatedAt = 0;
-  state.lastAppliedFeedVideoCount = -1;
-  state.lastAppliedVideosCount = 0;
-
-  if (!videos || videos.length === 0) return;
-
-  videos = deduplicateVideos(videos);
-  const shouldGroup = state.groupByAuthor && state.mode === 'search';
-  const displayVideos = shouldGroup && typeof groupVideosByAuthor === 'function' ? groupVideosByAuthor(videos) : videos;
-
-  const INITIAL_BATCH = 32;
-  const CHUNK_SIZE = 32;
-  const initial = displayVideos.slice(0, INITIAL_BATCH);
-  const firstFragment = document.createDocumentFragment();
-
-  initial.forEach((v, idx) => {
-    const card = createVideoCard(v, idx);
-    const key = getVideoKey(v);
-    if (key && state.gridCardMap) state.gridCardMap.set(key, card);
-    firstFragment.appendChild(card);
-  });
-  dom.videoGrid.appendChild(firstFragment);
-  updateCheckpointUI?.();
-  checkAndHighlightCheckpoint?.();
-
-  let cursor = INITIAL_BATCH;
-  const appendNextChunk = () => {
-    if (generation !== state.gridGeneration || cursor >= displayVideos.length) return;
-    const end = Math.min(cursor + CHUNK_SIZE, displayVideos.length);
-    const fragment = document.createDocumentFragment();
-    for (let i = cursor; i < end; i += 1) {
-      const v = displayVideos[i];
-      const card = createVideoCard(v, i);
-      const key = getVideoKey(v);
-      if (key && state.gridCardMap) state.gridCardMap.set(key, card);
-      fragment.appendChild(card);
-    }
-    dom.videoGrid.appendChild(fragment);
-    cursor = end;
-
-    if (cursor < displayVideos.length) {
-      if ('requestIdleCallback' in window) {
-        requestIdleCallback(appendNextChunk, { timeout: 250 });
-      } else {
-        setTimeout(appendNextChunk, 16);
-      }
-    } else {
-      updateCheckpointUI?.();
-      checkAndHighlightCheckpoint?.();
-    }
-  };
-
-  if (cursor < displayVideos.length) {
-    if ('requestIdleCallback' in window) {
-      requestIdleCallback(appendNextChunk, { timeout: 200 });
-    } else {
-      setTimeout(appendNextChunk, 16);
-    }
-  }
+  const grid = videoGridModule();
+  return grid && typeof grid.replaceView === 'function' ? grid.replaceView(videos, options) : undefined;
 }
 
 function reconcilePage(videos, options = {}) {
-  if (!dom.videoGrid) return;
-  if (!videos || !Array.isArray(videos)) return;
-
-  if (videos.length === 0 && state.gridCardMap && state.gridCardMap.size > 0) {
-    return;
-  }
-
-  videos = deduplicateVideos(videos);
-  const shouldGroup = state.groupByAuthor && state.mode === 'search';
-  const displayVideos = shouldGroup && typeof groupVideosByAuthor === 'function' ? groupVideosByAuthor(videos) : videos;
-
-  if (displayVideos.length === 0 && (!state.gridCardMap || state.gridCardMap.size === 0)) {
-    if (options && options.complete) {
-      dom.videoGrid.innerHTML = '';
-    }
-    return;
-  }
-
-  if (!state.gridCardMap) {
-    state.gridCardMap = new Map();
-  }
-
-  if (displayVideos.length > 0) {
-    const skeletons = dom.videoGrid.querySelectorAll?.('.skeleton-card');
-    if (skeletons && skeletons.length > 0) {
-      skeletons.forEach(sk => sk.remove?.());
-    }
-  }
-
-  const incomingKeys = new Set();
-  const fragment = document.createDocumentFragment();
-  let appendedCount = 0;
-
-  displayVideos.forEach((v, idx) => {
-    const key = getVideoKey(v);
-    if (!key) return;
-    incomingKeys.add(key);
-
-    if (state.gridCardMap.has(key)) {
-      const existingCard = state.gridCardMap.get(key);
-      if (existingCard && typeof existingCard._updateCard === 'function') {
-        existingCard._updateCard(v, idx);
-      } else if (existingCard && typeof existingCard === 'object') {
-        existingCard._videoData = Object.assign(existingCard._videoData || {}, v);
-      }
-    } else {
-      const card = createVideoCard(v, idx);
-      if (card && typeof card === 'object') {
-        card._cardKey = key;
-      }
-      state.gridCardMap.set(key, card);
-      fragment.appendChild(card);
-      appendedCount++;
-    }
-  });
-
-  if (options && (options.complete || options.allowRemoval)) {
-    for (const [oldKey, oldCard] of state.gridCardMap.entries()) {
-      if (!incomingKeys.has(oldKey)) {
-        if (oldCard && typeof oldCard.remove === 'function') {
-          oldCard.remove();
-        }
-        state.gridCardMap.delete(oldKey);
-      }
-    }
-  }
-
-  if (appendedCount > 0 && fragment.childNodes && fragment.childNodes.length > 0) {
-    dom.videoGrid.appendChild(fragment);
-  } else if (appendedCount > 0 && fragment.children && fragment.children.length > 0) {
-    dom.videoGrid.appendChild(fragment);
-  }
-
-  updateCheckpointUI?.();
-  checkAndHighlightCheckpoint?.();
+  const grid = videoGridModule();
+  return grid && typeof grid.reconcilePage === 'function' ? grid.reconcilePage(videos, options) : undefined;
 }
 
 // STOPNIOWE DOKŁADANIE KAFELKÓW W CZASIE RZECZYWISTYM ("PO KOLEI") Z ZERO-FLASH GATE
@@ -718,10 +534,10 @@ function showSkeletons() {
 }
 
 // TOAST
-function showToast(message, type = 'info', existingToast = null) {
+function showToast(message, type = 'info', existingToast = null, actions = []) {
   const g = typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : globalThis);
   const t = g.ArchivebateToast || (typeof require === 'function' ? (require('./static/toast.js') || g.ArchivebateToast) : null);
-  return t && typeof t.show === 'function' ? t.show(message, type, existingToast) : undefined;
+  return t && typeof t.show === 'function' ? t.show(message, type, existingToast, actions) : undefined;
 }
 
 // Modal Player Controls Adapter

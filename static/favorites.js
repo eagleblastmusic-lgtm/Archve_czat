@@ -6,6 +6,13 @@
   const dom = context.dom || {};
 
   let showToast;
+  const pendingMutations = new Set();
+
+  function videoKey(video) {
+    const source = String(video?.source || (String(video?.id || '').startsWith('cw_') ? 'camwhores' : '')).toLowerCase();
+    const providerId = String(video?.provider_id || video?.id || '').replace(/^cw_/, '').trim();
+    return source && providerId ? `${source}:id:${providerId}` : null;
+  }
 
   function init(dependencies = {}) {
     showToast = dependencies.showToast;
@@ -23,7 +30,8 @@
       const u = String(link?.dataset.username || card.dataset.username || '').toLowerCase().trim();
       const vidId = card.dataset.videoId;
       const isModelFav = state.favoriteAuthors && state.favoriteAuthors.has(u);
-      const vid = state.videos.find(v => String(v.id) === String(vidId));
+      const cardKey = videoKey({ source: card.dataset.source, id: vidId });
+      const vid = (Array.isArray(state.videos) ? state.videos : []).find(v => videoKey(v) === cardKey);
       const isVidFav = vid ? !!vid.is_favorite : (card.querySelector('.card-fav-btn.active') !== null);
       const shouldHighlight = isModelFav || isVidFav;
 
@@ -69,13 +77,15 @@
   }
 
   async function toggleVideo(video, buttonEl = null) {
+    const key = videoKey(video);
+    if (!key || pendingMutations.has(key)) return Boolean(video?.is_favorite);
+    pendingMutations.add(key);
+    if (buttonEl) buttonEl.disabled = true;
     try {
-      const res = await fetch('/api/account/favorites/toggle', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(video)
-      });
-      const data = await res.json();
+      const data = await global.ArchivebateAPI.postJSON('/api/account/favorites/toggle', video);
+      if (!data || typeof data.is_favorite !== 'boolean' || data.local_committed !== true) {
+        throw new Error('invalid mutation response');
+      }
       const isFav = data.is_favorite;
 
       state.favoritesCount = data.total_favorites;
@@ -83,6 +93,8 @@
       dom.statFavCount.innerText = state.favoritesCount;
 
       if (buttonEl) {
+        buttonEl.setAttribute?.('aria-label', isFav ? 'Usuń z ulubionych' : 'Dodaj do ulubionych');
+        buttonEl.setAttribute?.('aria-pressed', isFav ? 'true' : 'false');
         if (isFav) {
           buttonEl.classList.add('active');
           buttonEl.innerHTML = '<i class="fa-solid fa-heart"></i>';
@@ -92,9 +104,9 @@
         }
       }
 
-      const vid = state.videos.find(v => v.id === video.id);
+      const vid = (Array.isArray(state.videos) ? state.videos : []).find(v => videoKey(v) === key);
       if (vid) vid.is_favorite = isFav;
-      if (state.currentVideoDetails && String(state.currentVideoDetails.id) === String(video.id)) {
+      if (state.currentVideoDetails && videoKey(state.currentVideoDetails) === key) {
         state.currentVideoDetails.is_favorite = isFav;
       }
 
@@ -103,7 +115,7 @@
       }
       updateAllAuthorNameColors();
 
-      if (data.sync_state === 'remote_failed') {
+      if (data.remote_state === 'failed' || data.remote_state === 'unknown' || data.sync_state === 'remote_failed') {
         showToast('Zmiana zapisana lokalnie, ale synchronizacja z kontem zdalnym nie powiodła się.', 'warning');
       } else if (data.sync_state === 'local_only') {
         showToast((isFav ? 'Dodano' : 'Usunięto') + ' lokalnie (tryb anonimowy).', 'info');
@@ -112,12 +124,17 @@
       }
       return isFav;
     } catch (e) {
-      showToast('Błąd aktualizacji ulubionych', 'error');
+      showToast(e?.message || 'Błąd aktualizacji ulubionych', 'error');
       return false;
+    } finally {
+      pendingMutations.delete(key);
+      if (buttonEl) buttonEl.disabled = false;
     }
   }
 
   function updateModalButton(isFav) {
+    dom.modalFavBtn?.setAttribute?.('aria-pressed', isFav ? 'true' : 'false');
+    dom.modalFavBtn?.setAttribute?.('aria-label', isFav ? 'Usuń z ulubionych' : 'Dodaj do ulubionych');
     if (isFav) {
       dom.modalFavBtn.classList.add('active');
       dom.modalFavBtn.innerHTML = '<i class="fa-solid fa-heart" style="color:#ef4444;"></i> Usuń z ulubionych';

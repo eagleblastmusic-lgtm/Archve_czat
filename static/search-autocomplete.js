@@ -81,7 +81,7 @@
     hide() {
       if (dom.searchAutocompleteDropdown) {
         dom.searchAutocompleteDropdown.style.display = 'none';
-        dom.searchAutocompleteDropdown.innerHTML = '';
+        dom.searchAutocompleteDropdown.replaceChildren();
       }
       this.activeIdx = -1;
       this.currentSuggestions = [];
@@ -116,33 +116,42 @@
 
     render(query, suggestions) {
       const rawClean = query.toLowerCase().replace(/^#/, '');
-      const html = suggestions.map((s, idx) => {
+      dom.searchAutocompleteDropdown.replaceChildren();
+      suggestions.forEach((s, idx) => {
         const isTag = s.type === 'tag';
         const isFav = !!s.is_favorite;
-        const icon = isTag
-          ? '<i class="fa-solid fa-hashtag"></i>'
-          : (isFav ? '<i class="fa-solid fa-star"></i>' : '<i class="fa-solid fa-circle-user"></i>');
         const badgeText = isFav ? 'Ulubiona' : (isTag ? 'Tag' : (s.gender || 'Modelka'));
         const badgeClass = isFav ? 'fav' : (isTag ? 'tag' : '');
 
-        const disp = s.display || s.value;
+        const disp = String(s.display || s.value || '');
         const lowerDisp = disp.toLowerCase();
         const matchIdx = lowerDisp.indexOf(rawClean);
-        let formattedText = disp;
-        if (matchIdx >= 0) {
-          formattedText = `${disp.substring(0, matchIdx)}<span class="autocomplete-match">${disp.substring(matchIdx, matchIdx + rawClean.length)}</span>${disp.substring(matchIdx + rawClean.length)}`;
+        const item = document.createElement('div');
+        item.className = `autocomplete-item ${isFav ? 'is-fav' : ''} ${isTag ? 'is-tag' : ''}`;
+        item.dataset.index = String(idx);
+        const iconBox = document.createElement('div');
+        iconBox.className = 'autocomplete-icon';
+        const icon = document.createElement('i');
+        icon.className = isTag ? 'fa-solid fa-hashtag' : (isFav ? 'fa-solid fa-star' : 'fa-solid fa-circle-user');
+        icon.setAttribute('aria-hidden', 'true');
+        iconBox.appendChild(icon);
+        const textBox = document.createElement('span');
+        textBox.className = 'autocomplete-text';
+        if (matchIdx >= 0 && rawClean.length > 0) {
+          textBox.append(document.createTextNode(disp.substring(0, matchIdx)));
+          const match = document.createElement('span');
+          match.className = 'autocomplete-match';
+          match.textContent = disp.substring(matchIdx, matchIdx + rawClean.length);
+          textBox.append(match, document.createTextNode(disp.substring(matchIdx + rawClean.length)));
+        } else {
+          textBox.textContent = disp;
         }
-
-        return `
-          <div class="autocomplete-item ${isFav ? 'is-fav' : ''} ${isTag ? 'is-tag' : ''}" data-index="${idx}">
-            <div class="autocomplete-icon">${icon}</div>
-            <span class="autocomplete-text">${formattedText}</span>
-            <span class="autocomplete-badge ${badgeClass}">${badgeText}</span>
-          </div>
-        `;
-      }).join('');
-
-      dom.searchAutocompleteDropdown.innerHTML = html;
+        const badge = document.createElement('span');
+        badge.className = `autocomplete-badge ${badgeClass}`;
+        badge.textContent = String(badgeText || '');
+        item.append(iconBox, textBox, badge);
+        dom.searchAutocompleteDropdown.appendChild(item);
+      });
       dom.searchAutocompleteDropdown.style.display = 'flex';
     },
 

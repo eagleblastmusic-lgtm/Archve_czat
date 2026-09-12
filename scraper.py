@@ -7,6 +7,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
+from fetch_contract import FetchResult
 from client import ArchivebateSession
 from storage import storage
 
@@ -227,6 +228,20 @@ class ArchivebateScraper:
     def __init__(self, session: ArchivebateSession):
         self.session = session
         self._cache: Dict[str, Any] = {}
+        self._projection_cache: Dict[str, Any] = {}
+
+    def _preferences_version(self) -> int:
+        try:
+            from storage import storage
+            return storage.preferences_version
+        except Exception:
+            return 0
+
+    def invalidate_projection_cache(self) -> None:
+        self._projection_cache.clear()
+        for key in list(self._cache):
+            if str(key).startswith(("search:", "search_meta:")):
+                self._cache.pop(key, None)
 
     def parse_video_card(self, section_html: str) -> Optional[Dict[str, Any]]:
         """Parsuje pojedynczy kafelek wideo z plakatami JPG oraz wideo podglądu MP4."""
@@ -318,6 +333,7 @@ class ArchivebateScraper:
 
             card_dict = {
                 "id": video_id,
+                "source": "archivebate",
                 "url": watch_url,
                 "thumbnail": poster_img,
                 "poster": poster_img,
@@ -391,7 +407,7 @@ class ArchivebateScraper:
         target_count: int = 280
     ) -> List[Dict[str, Any]]:
         """Pobiera kafelki wideo ze strony głównej z gwarancją stałej liczby 280 unikalnych nagrań z uwzględnieniem filtrów."""
-        cache_key = f"home:{source}:{author_filter}:{page}"
+        cache_key = f"home:pv{self._preferences_version()}:{source}:{author_filter}:{page}"
         now = time.time()
         if not hasattr(self, "_home_cache"):
             self._home_cache = {}
@@ -601,18 +617,26 @@ class ArchivebateScraper:
         return sorted_vids
 
 
-    def get_archivebate_model_videos(self, username: str, page: int = 1) -> List[Dict[str, Any]]:
+    def get_archivebate_model_videos(self, username: str, page: int = 1, typed: bool = False):
         """Pobiera filmy konkretnej modelki wyłącznie z Archivebate (szybkie, bez zbędnego Camwhores)."""
         cache_key = f"ab_model:{username}:{page}"
         now = time.time()
         if cache_key in self._cache:
             entry = self._cache[cache_key]
             if now - entry["time"] < 300:
+                if typed:
+                    return FetchResult.success(entry["data"], source="archivebate", page=page) if entry["data"] else FetchResult.empty(source="archivebate", page=page, end_reason="cached_empty")
                 return entry["data"]
 
         url = f"https://archivebate.com/profile/{username}?page={page}"
         try:
             r = self.session.session.get(url, timeout=5)
+            if r.status_code >= 500:
+                result = FetchResult.error_result(f"Archivebate HTTP {r.status_code}", source="archivebate", page=page)
+                return result if typed else []
+            if r.status_code >= 400:
+                result = FetchResult.error_result(f"Archivebate HTTP {r.status_code}", retryable=False, source="archivebate", page=page)
+                return result if typed else []
             html = r.text
             self._sync_csrf(html, url)
             for m in re.finditer(r'wire:id="([^"]+)" wire:initial-data="([^"]+)"', html):
@@ -631,15 +655,26 @@ class ArchivebateScraper:
                                     v["username"] = username
                                 vids.append(v)
                         self._cache[cache_key] = {"data": vids, "time": now}
-                        return vids
+                        result = FetchResult.success(vids, source="archivebate", page=page) if vids else FetchResult.empty(source="archivebate", page=page, end_reason="profile_page_empty")
+                        return result if typed else vids
             sections = re.findall(r'<section class="video_item">.*?</section>', html, re.DOTALL)
             vids = [self.parse_video_card(s) for s in sections if self.parse_video_card(s)]
             self._cache[cache_key] = {"data": vids, "time": now}
-            return vids
-        except Exception:
-            return []
+            if vids:
+                result = FetchResult.success(vids, source="archivebate", page=page)
+            elif sections or "wire:id=" in html or "video_item" in html:
+                result = FetchResult.empty(source="archivebate", page=page, end_reason="profile_page_empty")
+            else:
+                result = FetchResult.error_result("Archivebate profile response was not recognizable", retryable=False, source="archivebate", page=page)
+            return result if typed else vids
+        except requests.Timeout as exc:
+            result = FetchResult.error_result(exc, status="timeout", source="archivebate", page=page)
+            return result if typed else []
+        except Exception as exc:
+            result = FetchResult.error_result(exc, source="archivebate", page=page)
+            return result if typed else []
 
-    def _fetch_search_profiles(self, clean_q: str, page: int = 1) -> Tuple[List[Dict[str, Any]], int, int]:
+    def _fetch_search_profiles(self, clean_q: str, page: int = 1, strict: bool = False) -> Tuple[List[Dict[str, Any]], int, int]:
         """Szybkie pobieranie pasujących profili bezpośrednim zapytaniem z obsługą stron i metadanych.
         Zwraca: (profiles, total_models, last_page)
         """
@@ -656,6 +691,8 @@ class ArchivebateScraper:
         seen_users = set()
         total_models = 0
         last_page = 1
+        valid_response = False
+        last_error = None
         try:
             r = self.session.session.get(
                 f"https://archivebate.com/api/v1/search?query={clean_q}&page={page}",
@@ -663,6 +700,7 @@ class ArchivebateScraper:
                 timeout=5
             )
             if r.status_code == 200:
+                valid_response = True
                 resp_json = r.json()
                 meta = resp_json.get("meta", {})
                 total_models = meta.get("total", 0)
@@ -672,8 +710,8 @@ class ArchivebateScraper:
                     if u and u not in seen_users:
                         seen_users.add(u)
                         profiles.append(p)
-        except Exception:
-            pass
+        except Exception as exc:
+            last_error = exc
 
         # Jeśli dla page 1 profili jest mało (< 12), sprawdzamy warianty ze spacją i myślnikiem
         if page == 1 and len(profiles) < 12:
@@ -691,13 +729,35 @@ class ArchivebateScraper:
                             if u and u not in seen_users:
                                 seen_users.add(u)
                                 profiles.append(p)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    last_error = exc
 
         if total_models == 0:
             total_models = len(profiles)
 
+        if strict and not valid_response:
+            raise RuntimeError(str(last_error or "Archivebate search returned no successful response"))
+
         return profiles, total_models, last_page
+
+    def fetch_search_profiles_result(self, clean_q: str, page: int = 1) -> FetchResult:
+        try:
+            profiles, total_models, last_page = self._fetch_search_profiles(clean_q, page=page, strict=True)
+            return FetchResult.success(
+                profiles,
+                source="archivebate",
+                page=page,
+                meta={"total_models": total_models, "last_page": last_page},
+            ) if profiles else FetchResult.empty(
+                source="archivebate",
+                page=page,
+                end_reason="confirmed_empty",
+                meta={"total_models": total_models, "last_page": last_page},
+            )
+        except requests.Timeout as exc:
+            return FetchResult.error_result(exc, status="timeout", source="archivebate", page=page)
+        except Exception as exc:
+            return FetchResult.error_result(exc, source="archivebate", page=page)
 
     def _estimate_search_meta(self, query: str, clean_q: str, total_ab_models: int, source: str = "all") -> Tuple[int, int]:
         """Szacuje całkowitą liczbę filmów oraz stron dla danego zapytania z uwzględnieniem wybranego źródła."""
@@ -738,8 +798,9 @@ class ArchivebateScraper:
 
         grouped_search = group_authors in (True, "1", "true", "True")
         grouped_archivebate_page_size = 40
-        cache_key = f"search:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}:p{page}"
-        meta_cache_key = f"search_meta:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}"
+        prefs_version = self._preferences_version()
+        cache_key = f"search:pv{prefs_version}:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}:p{page}"
+        meta_cache_key = f"search_meta:pv{prefs_version}:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}"
         now = time.time()
 
         # Sprawdzenie pamięci podręcznej strony
@@ -941,8 +1002,9 @@ class ArchivebateScraper:
 
         grouped_search = group_authors in (True, "1", "true", "True")
         grouped_archivebate_page_size = 40
-        cache_key = f"search:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}:p1"
-        meta_cache_key = f"search_meta:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}"
+        prefs_version = self._preferences_version()
+        cache_key = f"search:pv{prefs_version}:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}:p1"
+        meta_cache_key = f"search_meta:pv{prefs_version}:{clean_q.lower()}:{source}:{author_filter}:g{group_authors}"
         now = time.time()
 
         # Jeśli wynik strony 1 jest w pamięci RAM, zwróć go natychmiast
@@ -1365,18 +1427,23 @@ class ArchivebateScraper:
 
         return sort_videos_newest_first(all_videos)
 
-    def toggle_remote_save(self, video_id: str) -> bool:
-        """Wysyła żądanie toggleSave do Archivebate dla podanego ID wideo."""
+    def toggle_remote_save(self, video_id: str) -> dict:
+        """Send toggleSave and report confirmed/failed/unknown instead of a false success."""
         try:
             watch_url = f"https://archivebate.com/watch/{video_id}"
             r = self.session.session.get(watch_url, timeout=10)
+            if r.status_code >= 400:
+                return {"status": "failed", "error": f"Archivebate HTTP {r.status_code}"}
             for m in re.finditer(r'wire:id="([^"]+)" wire:initial-data="([^"]+)"', r.text):
                 raw_data = m.group(2).replace('&quot;', '"')
                 data = json.loads(raw_data)
                 name = data['fingerprint']['name']
                 if 'save-video' in name:
-                    self.session.call_livewire(name, data['fingerprint'], data['serverMemo'], "toggleSave")
-                    return True
+                    response = self.session.call_livewire(name, data['fingerprint'], data['serverMemo'], "toggleSave")
+                    if response:
+                        return {"status": "confirmed", "provider": "archivebate"}
+                    return {"status": "unknown", "error": "provider did not return a mutation response"}
+            return {"status": "failed", "error": "save-video component not found"}
         except Exception as e:
             logger.error(f"Błąd toggle_remote_save: {e}")
-        return False
+            return {"status": "unknown", "error": str(e)}

@@ -108,11 +108,20 @@ with patch.object(requests.Session, 'request', side_effect=AssertionError('Exter
         assert missing_resolve.call_count == 1
 
     # 3. Koordynacja odtwarzacza (/api/playback/status)
-    res_busy = client.post('/api/playback/status', json={'is_busy': True, 'buffered_seconds': 1.5})
+    mutation_headers = {'x-archivebate-mutation-token': main.LOCAL_MUTATION_TOKEN}
+    res_busy = client.post(
+        '/api/playback/status',
+        json={'is_busy': True, 'buffered_seconds': 1.5},
+        headers=mutation_headers,
+    )
     assert res_busy.status_code == 200 and res_busy.json()['playback_busy'] is True
     assert main.is_playback_active() is True
 
-    res_idle = client.post('/api/playback/status', json={'is_busy': False, 'buffered_seconds': 8.0})
+    res_idle = client.post(
+        '/api/playback/status',
+        json={'is_busy': False, 'buffered_seconds': 8.0},
+        headers=mutation_headers,
+    )
     assert res_idle.status_code == 200 and res_idle.json()['playback_busy'] is False
     assert main.is_playback_active() is False
 

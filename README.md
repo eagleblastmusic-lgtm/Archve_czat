@@ -9,6 +9,9 @@ Nowoczesna aplikacja desktopowo-webowa GUI do przeglądania i wyszukiwania mater
 - **Pasek szybkich tagów:** klikalne pigułki/tagi ułatwiające filtrowanie.
 - **Wbudowany odtwarzacz wideo:** modal z odtwarzaczem Mixdrop iframe, opcją pobierania i bezpośrednim linkiem.
 - **Przeglądanie profili:** szybkie przejście do wszystkich archiwalnych nagrań wybranej modelki.
+- **Mój katalog:** jawnie wybrane wyszukiwanie lokalnych metadanych z opublikowanej rewizji SQLite — bez pobierania stron, obrazów ani strumieni.
+- **Bezpieczne konto i diagnostyka:** eksport/odtworzenie danych użytkownika, kopia ostatniego poprawnego stanu oraz redagowany panel diagnostyczny.
+- **Zadania w tle:** panel konta pokazuje wspólny status synchronizacji, szybkiego skanu profili i głębokiego odkrywania Archivebate oraz pozwala sterować tym ostatnim.
 
 ## 🚀 Jak uruchomić?
 
@@ -67,11 +70,23 @@ Pierwsza budowa wymaga FFmpeg i transferu; globalna kolejka ogranicza liczbę
 procesów, a praca ustępuje aktywnemu odtwarzaczowi. Historia jest zapisywana po
 rozpoczęciu odtwarzania.
 
+Zakres wyszukiwania wybiera się osobno w polu „Online” albo „Mój katalog”.
+Wyniki lokalne są ograniczone do jednej spójnej, opublikowanej rewizji indeksu
+i pokazują stan katalogu; nie uruchamiają strumienia SSE ani odświeżania źródeł.
+Operacje blokowania profilu są potwierdzane przez backend i odwracalne przez
+„Cofnij”. Panel diagnostyczny pokazuje wyłącznie informacje potrzebne do
+rozwiązywania problemów, bez haseł, tokenów, ciasteczek i adresów zdalnych.
+
 Testy offline (bez zewnętrznych źródeł i modyfikacji biblioteki użytkownika):
 
 ```text
 python audit/regression_checks.py
+python audit/regression_next_generation.py
+python audit/regression_audit_fixes.py
+python audit/regression_package_b.py
 node audit/regression_frontend.cjs
+node audit/regression_accessibility.cjs
+node audit/regression_local_search.cjs
 node audit/regression_storyboard_client.cjs
 node audit/regression_storyboard_cross_tab.cjs
 node audit/regression_catalog_partial_frontend.cjs

@@ -3,14 +3,16 @@ import re
 import json
 import math
 import hashlib
+import secrets
 import requests
 import threading
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from html import escape as html_escape
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from fastapi import FastAPI, Query, Request, HTTPException, Body, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -19,7 +21,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 from client import ArchivebateSession
 from scraper import ArchivebateScraper, POPULAR_TAGS, extract_video_tags
-from storage import storage
+from storage import InvalidVideoIdentity, StoreRecoveryRequired, storage
 from camwhores import camwhores_scraper
 from config import get_archivebate_credentials
 from cache_store import (
@@ -27,6 +29,7 @@ from cache_store import (
     atomic_write_json, read_json_cache, cache_age_seconds, safe_cache_key,
     is_safe_remote_url, trim_cache_directory,
 )
+from video_identity import VideoKey
 from storyboard_service import (
     start as start_storyboard,
     get_status as get_storyboard_status,
@@ -48,6 +51,69 @@ STREAM_CACHE_DIR = str(STREAM_CACHE_DIR)
 STORYBOARD_CACHE_DIR = str(STORYBOARD_CACHE_DIR)
 
 _account_sync_lock = threading.Lock()
+LOCAL_MUTATION_TOKEN = os.getenv("ARCHIVEBATE_MUTATION_TOKEN") or secrets.token_urlsafe(32)
+ALLOWED_LOCAL_ORIGINS = {
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+    "http://127.0.0.1",
+    "http://localhost",
+}
+ALLOWED_LOCAL_HOSTS = {"127.0.0.1", "localhost", "testserver"}
+
+
+def _video_key_string(video: dict) -> Optional[str]:
+    key = VideoKey.from_video(video, require_source=True)
+    return key.as_string() if key else None
+
+
+def _is_allowed_local_origin(origin: str, request: Request) -> bool:
+    if origin in ALLOWED_LOCAL_ORIGINS:
+        return True
+    try:
+        parsed = urlsplit(origin)
+        request_host = (request.url.hostname or "").lower()
+        request_port = request.url.port or 80
+        origin_port = parsed.port or 80
+        return (
+            parsed.scheme == "http"
+            and not parsed.username
+            and not parsed.password
+            and parsed.hostname
+            and parsed.hostname.lower() == request_host
+            and parsed.hostname.lower() in ALLOWED_LOCAL_HOSTS
+            and origin_port == request_port
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
+
+
+def _public_store_health() -> dict:
+    """Expose storage health without leaking local filesystem paths."""
+    health = dict(storage.health())
+    health.pop("store_path", None)
+    return health
+
+
+def _redact_diagnostic_value(value):
+    """Keep operational diagnostics useful without returning provider URLs or secrets."""
+    sensitive_keys = {"email", "password", "token", "cookies", "session", "url", "source_url", "profile_url"}
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text.lower() in sensitive_keys or key_text.lower().endswith("_token"):
+                redacted[key] = "[redacted]"
+            else:
+                redacted[key] = _redact_diagnostic_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_diagnostic_value(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(r"https?://[^\s\"']+", "[redacted-url]", value)
+    return value
 
 
 def _account_counts() -> dict:
@@ -55,11 +121,13 @@ def _account_counts() -> dict:
         "email": session.email,
         "logged_in": session.is_logged_in,
         "account_configured": bool(session.email and session.password),
-        "favorites_count": len(storage.get_favorites()),
-        "history_count": len(storage.get_history()),
-        "following_count": len(storage.get_following()),
+        "favorites_count": len(storage.get_favorites(include_blocked=False)),
+        "history_count": len(storage.get_history(include_blocked=False)),
+        "following_count": len(storage.get_following(include_blocked=False)),
         "last_synced": storage.data.get("last_synced"),
         "favorite_authors": storage.get_favorite_authors(),
+        "preferences_version": storage.preferences_version,
+        "store_health": _public_store_health(),
     }
 
 
@@ -79,9 +147,16 @@ def sync_account_data() -> dict:
                 **_account_counts(),
             }
 
-        watchlater = scraper.get_account_section_videos("watchlater", max_pages=15, strict=True)
-        history = scraper.get_account_section_videos("history", max_pages=15, strict=True)
-        following = scraper.get_account_section_videos("following", max_pages=15, strict=True)
+        def mark_archivebate_source(items):
+            return [
+                {**item, "source": item.get("source") or "archivebate"}
+                for item in (items or [])
+                if isinstance(item, dict)
+            ]
+
+        watchlater = mark_archivebate_source(scraper.get_account_section_videos("watchlater", max_pages=15, strict=True))
+        history = mark_archivebate_source(scraper.get_account_section_videos("history", max_pages=15, strict=True))
+        following = mark_archivebate_source(scraper.get_account_section_videos("following", max_pages=15, strict=True))
         storage.merge_remote_data(watchlater, history, following)
         print(f"[Archivebate Browser] Zsynchronizowano: {len(watchlater)} ulubionych, {len(history)} historii, {len(following)} obserwowanych.")
         return {
@@ -132,11 +207,46 @@ async def lifespan(app: FastAPI):
             print(f"[Archivebate Browser] Błąd inicjalizacji: {e}")
     threading.Thread(target=background_startup, daemon=True).start()
     yield
+    # Shutdown is a real lifecycle boundary: stop producers, drain workers, then close readers.
+    try:
+        from fast_scan import quick_scan_supervisor
+        quick_scan_supervisor.shutdown(timeout=10.0)
+    except Exception as exc:
+        print(f"[Quick scan] Błąd zamykania: {exc}")
     try:
         from deep_archivebate import deep_archivebate_service
-        deep_archivebate_service.stop(wait=False)
-    except Exception:
-        pass
+        deep_archivebate_service.close()
+    except Exception as exc:
+        print(f"[Deep Archivebate] Błąd zamykania: {exc}")
+    try:
+        from catalog_service import catalog_service
+        catalog_service.begin_shutdown()
+        catalog_service._indexing_stop.set()
+        worker = getattr(catalog_service, "_indexing_thread", None)
+        if worker and worker.is_alive() and worker is not threading.current_thread():
+            worker.join(timeout=10.0)
+        catalog_service.close(timeout=10.0)
+    except Exception as exc:
+        print(f"[Catalog] Błąd zamykania: {exc}")
+    try:
+        storage.close()
+    except Exception as exc:
+        print(f"[Storage] Błąd zamykania: {exc}")
+    try:
+        from model_tags import model_tag_manager
+        model_tag_manager.close(timeout=10.0)
+    except Exception as exc:
+        print(f"[Model tags] Błąd zamykania: {exc}")
+    try:
+        from storyboard_service import shutdown as shutdown_storyboard
+        shutdown_storyboard(timeout=10.0)
+    except Exception as exc:
+        print(f"[Storyboard] Błąd zamykania: {exc}")
+    try:
+        session.close()
+        camwhores_scraper.close()
+    except Exception as exc:
+        print(f"[HTTP clients] Błąd zamykania: {exc}")
     print("[Archivebate Browser] Zamykanie aplikacji.")
 
 app = FastAPI(title="Archivebate Video Browser", lifespan=lifespan)
@@ -153,8 +263,23 @@ app.add_middleware(
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Range", "Accept"],
+    allow_headers=["Content-Type", "Range", "Accept", "X-Archivebate-Mutation-Token", "X-CSRF-TOKEN"],
 )
+
+
+@app.middleware("http")
+async def local_mutation_security_gate(request: Request, call_next):
+    """Require same-local-origin and a per-process mutation token for state changes."""
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        host = (request.headers.get("host") or "").split(":", 1)[0].strip().lower()
+        origin = request.headers.get("origin")
+        if host not in ALLOWED_LOCAL_HOSTS:
+            return JSONResponse({"success": False, "error": "foreign_host"}, status_code=403)
+        if origin and not _is_allowed_local_origin(origin, request):
+            return JSONResponse({"success": False, "error": "foreign_origin"}, status_code=403)
+        if request.headers.get("x-archivebate-mutation-token") != LOCAL_MUTATION_TOKEN:
+            return JSONResponse({"success": False, "error": "mutation_token_required"}, status_code=403)
+    return await call_next(request)
 
 class NoCacheStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
@@ -196,6 +321,8 @@ def _versioned_html(path):
         name=match.group(1)
         return '/static/'+name+'?v='+(_asset_digest(name) or 'missing')
     html=re.sub(r'/static/([a-zA-Z0-9_.-]+\.(?:js|css))(?:\?v=[^"\s>]+)?',version,html)
+    token_meta = f'<meta name="archivebate-mutation-token" content="{html_escape(LOCAL_MUTATION_TOKEN, quote=True)}">'
+    html = html.replace("</head>", f"{token_meta}</head>", 1)
     return HTMLResponse(html,headers={'Cache-Control':'no-cache'})
 
 
@@ -232,22 +359,26 @@ def _enrich_videos(videos: list, author_filter: str = "all", source: str = "all"
 
     fav_authors_raw = storage.get_favorite_authors()
     fav_authors_clean = set(re.sub(r'[^a-z0-9]', '', a.lower()) for a in fav_authors_raw)
-    favorite_ids = {str(item.get("id")) for item in storage.data.get("favorites", []) if isinstance(item, dict)}
+    favorite_keys = {
+        f"{value['source']}:id:{value['provider_id']}"
+        for value in storage.get_favorite_keys()
+        if value.get("source") and value.get("provider_id")
+    }
 
     if author_filter == "exclude_fav":
         videos = [
             v for v in videos
-            if isinstance(v, dict) and re.sub(r'[^a-z0-9]', '', str(v.get("username", "")).lower()) not in fav_authors_clean and str(v.get("id")) not in favorite_ids
+            if isinstance(v, dict) and re.sub(r'[^a-z0-9]', '', str(v.get("username", "")).lower()) not in fav_authors_clean and _video_key_string(v) not in favorite_keys
         ]
     elif author_filter == "only_fav":
         videos = [
             v for v in videos
-            if isinstance(v, dict) and (re.sub(r'[^a-z0-9]', '', str(v.get("username", "")).lower()) in fav_authors_clean or str(v.get("id")) in favorite_ids)
+            if isinstance(v, dict) and (re.sub(r'[^a-z0-9]', '', str(v.get("username", "")).lower()) in fav_authors_clean or _video_key_string(v) in favorite_keys)
         ]
 
     for v in videos:
         if isinstance(v, dict) and "id" in v:
-            v["is_favorite"] = str(v["id"]) in favorite_ids
+            v["is_favorite"] = _video_key_string(v) in favorite_keys
             u_clean = re.sub(r'[^a-z0-9]', '', str(v.get("username", "")).lower())
             v["has_favorite_video"] = u_clean in fav_authors_clean
             v["tags"] = v.get("tags") or extract_video_tags(v)
@@ -532,11 +663,13 @@ async def get_status():
     """
     status = session.get_status()
     status["account_configured"] = bool(session.email and session.password)
-    status["favorites_count"] = len(storage.data.get("favorites", []))
-    status["history_count"] = len(storage.data.get("history", []))
-    status["following_count"] = len(storage.data.get("following", []))
+    status["favorites_count"] = len(storage.get_favorites(include_blocked=False))
+    status["history_count"] = len(storage.get_history(include_blocked=False))
+    status["following_count"] = len(storage.get_following(include_blocked=False))
     status["last_synced"] = storage.data.get("last_synced")
     status["favorite_authors"] = storage.get_favorite_authors()
+    status["preferences_version"] = storage.preferences_version
+    status["store_health"] = _public_store_health()
     return status
 
 @app.post("/api/relogin")
@@ -569,10 +702,10 @@ async def get_account_summary():
 @app.get("/api/account/favorites")
 async def get_account_favorites(page: int = Query(1, ge=1), per_page: int = Query(280, ge=1, le=1000)):
     """Zwraca listę ulubionych wideo z obsługą stron."""
-    favs = storage.get_favorites()
+    favs = storage.get_favorites(include_blocked=False)
     if len(favs) == 0 and not storage.data.get("last_synced"):
         await _ensure_account_synced()
-        favs = storage.get_favorites()
+        favs = storage.get_favorites(include_blocked=False)
 
     total = len(favs)
     last_page = max(1, math.ceil(total / per_page))
@@ -584,7 +717,9 @@ async def get_account_favorites(page: int = Query(1, ge=1), per_page: int = Quer
         "page": page,
         "last_page": last_page,
         "count": len(sliced),
-        "videos": _enrich_videos(sliced)
+        "videos": _enrich_videos(sliced),
+        "preferences_version": storage.preferences_version,
+        "projection": {"scope": "account_favorites", "accuracy": "exact", "blocked": "hidden"},
     }
 
 def invalidate_feed_cache(filter_pattern: Optional[str] = None):
@@ -592,6 +727,8 @@ def invalidate_feed_cache(filter_pattern: Optional[str] = None):
     try:
         if hasattr(scraper, "_home_cache"):
             scraper._home_cache.clear()
+        if hasattr(scraper, "invalidate_projection_cache"):
+            scraper.invalidate_projection_cache()
         if os.path.exists(FEED_CACHE_DIR):
             for fname in os.listdir(FEED_CACHE_DIR):
                 if fname.endswith(".json") and not fname.startswith(("raw_v1_", "snapshot_v1_")):
@@ -606,36 +743,71 @@ def invalidate_feed_cache(filter_pattern: Optional[str] = None):
 @app.post("/api/account/favorites/toggle")
 def toggle_favorite(video: dict = Body(...)):
     """Commituje lokalnie i jawnie raportuje wynik efektu zdalnego."""
+    key = VideoKey.from_video(video, require_source=True)
+    if not key:
+        raise HTTPException(status_code=422, detail="Film wymaga jednoznacznego source i provider_id")
     try:
         is_fav = storage.toggle_favorite(video)
+    except (InvalidVideoIdentity, StoreRecoveryRequired) as exc:
+        raise HTTPException(status_code=503, detail=f"Nie udało się trwale zapisać ulubionych: {exc}") from exc
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Nie udało się trwale zapisać ulubionych: {exc}")
+        raise HTTPException(status_code=503, detail=f"Nie udało się trwale zapisać ulubionych: {exc}") from exc
 
-    v_id = str(video.get("id") or "")
-    remote_required = bool(session.email and session.password and v_id)
+    v_id = key.provider_id
+    remote_required = bool(session.email and session.password and key.source == "archivebate")
     remote_synced = None
+    remote_state = "local_only"
+    remote_error = None
     if remote_required:
-        remote_synced = bool(scraper.toggle_remote_save(v_id))
-    sync_state = "local_only" if not remote_required else ("synced" if remote_synced else "remote_failed")
+        try:
+            storage.set_remote_intent(video, is_fav, status="pending")
+        except Exception as exc:
+            remote_state = "unknown"
+            remote_error = f"Nie zapisano kolejki synchronizacji: {exc}"
+            raw_result = None
+        if remote_state == "local_only":
+            try:
+                raw_result = scraper.toggle_remote_save(v_id)
+                if isinstance(raw_result, dict):
+                    candidate = str(raw_result.get("status") or "unknown")
+                    remote_state = candidate if candidate in {"confirmed", "failed", "unknown"} else "unknown"
+                    remote_error = raw_result.get("error")
+                else:
+                    remote_state = "confirmed" if raw_result is True else "failed"
+            except Exception as exc:
+                remote_state = "unknown"
+                remote_error = str(exc)
+        remote_synced = True if remote_state == "confirmed" else (False if remote_state == "failed" else None)
+        try:
+            storage.set_remote_status(video, remote_state, remote_error)
+        except Exception as exc:
+            remote_error = remote_error or str(exc)
+            remote_state = "unknown"
+            remote_synced = None
+    sync_state = remote_state
     invalidate_feed_cache("fav")
     return {
-        "success": bool(not remote_required or remote_synced),
+        "success": bool(not remote_required or remote_state == "confirmed"),
         "local_committed": True,
         "remote_synced": remote_synced,
+        "remote_state": remote_state,
+        "remote_error": remote_error,
         "sync_state": sync_state,
         "id": v_id,
+        "source": key.source,
         "is_favorite": is_fav,
-        "total_favorites": len(storage.get_favorites()),
-        "favorite_authors": storage.get_favorite_authors()
+        "total_favorites": len(storage.get_favorites(include_blocked=False)),
+        "favorite_authors": storage.get_favorite_authors(),
+        "preferences_version": storage.preferences_version,
     }
 
 @app.get("/api/account/history")
 async def get_account_history(page: int = Query(1, ge=1), per_page: int = Query(280, ge=1, le=1000)):
     """Zwraca historię oglądanych wideo z obsługą stron."""
-    hist = storage.get_history()
+    hist = storage.get_history(include_blocked=False)
     if len(hist) == 0 and not storage.data.get("last_synced"):
         await _ensure_account_synced()
-        hist = storage.get_history()
+        hist = storage.get_history(include_blocked=False)
 
     total = len(hist)
     last_page = max(1, math.ceil(total / per_page))
@@ -647,7 +819,9 @@ async def get_account_history(page: int = Query(1, ge=1), per_page: int = Query(
         "page": page,
         "last_page": last_page,
         "count": len(sliced),
-        "videos": _enrich_videos(sliced)
+        "videos": _enrich_videos(sliced),
+        "preferences_version": storage.preferences_version,
+        "projection": {"scope": "account_history", "accuracy": "exact", "blocked": "hidden"},
     }
 
 @app.post("/api/account/history/record")
@@ -655,26 +829,30 @@ def record_history(video: dict = Body(...)):
     """Zapisuje obejrzenie filmu w historii."""
     try:
         storage.record_history(video)
+    except (InvalidVideoIdentity, StoreRecoveryRequired) as exc:
+        raise HTTPException(status_code=503, detail=f"Nie udało się trwale zapisać historii: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Nie udało się trwale zapisać historii: {exc}")
-    return {"success": True, "total_history": len(storage.get_history())}
+    return {"success": True, "total_history": len(storage.get_history(include_blocked=False)), "preferences_version": storage.preferences_version}
 
 @app.post("/api/account/history/clear")
 def clear_history():
     """Czyści lokalną historię oglądania."""
     try:
         storage.clear_history()
+    except (InvalidVideoIdentity, StoreRecoveryRequired) as exc:
+        raise HTTPException(status_code=503, detail=f"Nie udało się trwale wyczyścić historii: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Nie udało się trwale wyczyścić historii: {exc}")
-    return {"success": True, "total_history": 0}
+    return {"success": True, "total_history": 0, "preferences_version": storage.preferences_version}
 
 @app.get("/api/account/following")
 async def get_account_following(page: int = Query(1, ge=1), per_page: int = Query(280, ge=1, le=1000)):
     """Zwraca wideo z obserwowanych kanałów z obsługą stron."""
-    foll = storage.get_following()
+    foll = storage.get_following(include_blocked=False)
     if len(foll) == 0 and not storage.data.get("last_synced"):
         await _ensure_account_synced()
-        foll = storage.get_following()
+        foll = storage.get_following(include_blocked=False)
 
     total = len(foll)
     last_page = max(1, math.ceil(total / per_page))
@@ -686,7 +864,9 @@ async def get_account_following(page: int = Query(1, ge=1), per_page: int = Quer
         "page": page,
         "last_page": last_page,
         "count": len(sliced),
-        "videos": _enrich_videos(sliced)
+        "videos": _enrich_videos(sliced),
+        "preferences_version": storage.preferences_version,
+        "projection": {"scope": "account_following", "accuracy": "exact", "blocked": "hidden"},
     }
 
 @app.post("/api/account/sync")
@@ -898,7 +1078,7 @@ def get_catalog_stats(source: str = "all", author_filter: str = "all", revision:
     revision_to_use = revision if revision is not None else _available_catalog_revision(catalog_service)
     blocked_models = storage.get_blocked_models()
     fav_authors = storage.get_favorite_authors()
-    fav_ids = [str(item.get("id")) for item in storage.get_favorites()]
+    fav_ids = storage.get_favorite_keys()
 
     res = catalog_service.query_page(
         page=1,
@@ -914,23 +1094,19 @@ def get_catalog_stats(source: str = "all", author_filter: str = "all", revision:
 
     total_vids = res["video_count"]
     last_page = res["page_count"]
-
-    base_res = catalog_service.query_page(
-        page=1,
-        page_size=HOME_PAGE_SIZE,
-        source=source,
-        author_filter="all",
-        group_authors=False,
-        revision=revision_to_use
-    )
-    base_videos = base_res["video_count"]
-    deducted = max(0, base_videos - total_vids)
+    counts = res.get("counts", {})
+    base_videos = int(counts.get("base_count", total_vids))
+    hidden_by_block = int(counts.get("hidden_by_block", 0))
 
     return {
         "total_videos": total_vids,
         "last_page": last_page,
         "base_catalog_videos": base_videos,
-        "blocked_videos": deducted,
+        "blocked_videos": hidden_by_block,
+        "hidden_by_block": hidden_by_block,
+        "hidden_by_filter": int(counts.get("hidden_by_filter", 0)),
+        "counts": counts,
+        "accuracy": counts.get("accuracy", "partial"),
         "catalog_complete": res["catalog_complete"],
         "catalog_limited": res.get("catalog_limited", False),
         "limited_sources": res.get("limited_sources", {}),
@@ -979,7 +1155,7 @@ def get_videos(
             revision=rev_to_use,
             blocked_models=storage.get_blocked_models(),
             favorite_authors=storage.get_favorite_authors(),
-            favorite_ids=[str(item.get("id")) for item in storage.get_favorites()],
+            favorite_ids=storage.get_favorite_keys(),
             enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0")
         )
         catalog_stats = get_catalog_stats(source=source, author_filter=author_filter, revision=rev_to_use)
@@ -989,7 +1165,10 @@ def get_videos(
             "last_page": res["page_count"],
             "total_videos": res["video_count"],
             "base_catalog_videos": catalog_stats.get("base_catalog_videos", res["video_count"]),
-            "blocked_videos": catalog_stats.get("blocked_videos", 0),
+            "blocked_videos": catalog_stats.get("hidden_by_block", catalog_stats.get("blocked_videos", 0)),
+            "hidden_by_block": catalog_stats.get("hidden_by_block", 0),
+            "hidden_by_filter": catalog_stats.get("hidden_by_filter", 0),
+            "accuracy": catalog_stats.get("accuracy", "partial"),
             "count": len(res["items"]),
             "target_count": HOME_PAGE_SIZE,
             "source": source,
@@ -1048,7 +1227,10 @@ def get_videos(
         "video_count": catalog_stats["total_videos"],
         "group_count": len(final_videos),
         "base_catalog_videos": catalog_stats["base_catalog_videos"],
-        "blocked_videos": catalog_stats["blocked_videos"],
+        "blocked_videos": catalog_stats.get("hidden_by_block", catalog_stats.get("blocked_videos", 0)),
+        "hidden_by_block": catalog_stats.get("hidden_by_block", 0),
+        "hidden_by_filter": catalog_stats.get("hidden_by_filter", 0),
+        "accuracy": catalog_stats.get("accuracy", "partial"),
         "count": len(final_videos),
         "target_count": HOME_PAGE_SIZE,
         "source": source,
@@ -1072,7 +1254,7 @@ def get_videos(
 
 def _feed_snapshot(source, author_filter, group_authors, snapshot_id=None, force=False):
     from feed_service import get_snapshot
-    preferences = {"blocked": sorted(storage.get_blocked_models()), "favorites": sorted(str(v.get("id")) for v in storage.get_favorites())}
+    preferences = {"blocked": sorted(storage.get_blocked_models()), "favorites": sorted(storage.get_favorite_keys()), "preferences_version": storage.preferences_version}
     spec = {"source": source, "author_filter": author_filter, "group_authors": group_authors, "preferences": preferences}
     fetchers = {}
     if source != "only-camwhores": fetchers["archivebate"] = lambda page: scraper._fetch_single_ab_home_page(page, strict=True)
@@ -1115,7 +1297,7 @@ def progressive_feed(
         is_grouped = group_authors in (True, "1", "true", "True")
         blocked_models = storage.get_blocked_models()
         fav_authors = storage.get_favorite_authors()
-        fav_ids = [str(item.get("id")) for item in storage.get_favorites()]
+        fav_ids = storage.get_favorite_keys()
 
         result = catalog_service.query_page(
             page=page,
@@ -1134,6 +1316,49 @@ def progressive_feed(
         return result
 
     return _feed_snapshot(source, author_filter, group_authors, snapshot_id, force_refresh).read(page)
+
+
+@app.get("/api/catalog/groups/{author_key}/members")
+def get_catalog_group_members(
+    author_key: str,
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    source: str = Query("all"),
+    revision: Optional[int] = Query(None),
+):
+    from catalog_service import catalog_service
+    rev = _coerce_optional_revision(revision)
+    result = catalog_service.query_group_members(
+        author_key,
+        page=page,
+        page_size=per_page,
+        source=source,
+        revision=rev,
+        blocked_models=storage.get_blocked_models(),
+        enrich_fn=lambda items: _enrich_videos(items, source=source),
+    )
+    return result
+
+
+@app.get("/api/search/local")
+def search_local_catalog(
+    q: str = Query(..., min_length=1, max_length=200),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(200, ge=1, le=200),
+    source: str = Query("all"),
+    revision: Optional[int] = Query(None),
+):
+    from catalog_service import catalog_service
+    rev = _coerce_optional_revision(revision)
+    return catalog_service.search_local(
+        q,
+        page=page,
+        page_size=per_page,
+        source=source,
+        revision=rev,
+        blocked_models=storage.get_blocked_models(),
+        enrich_fn=lambda items: _enrich_videos(items, source=source),
+    )
 
 
 @app.get("/api/feed/stream")
@@ -1160,7 +1385,7 @@ def progressive_feed_stream(
                 revision=rev_to_check,
                 blocked_models=storage.get_blocked_models(),
                 favorite_authors=storage.get_favorite_authors(),
-                favorite_ids=[str(item.get("id")) for item in storage.get_favorites()],
+                favorite_ids=storage.get_favorite_keys(),
                 enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0")
             )
             data["type"] = "complete"
@@ -1199,7 +1424,7 @@ def progressive_feed_stream(
                     revision=current_rev,
                     blocked_models=storage.get_blocked_models(),
                     favorite_authors=storage.get_favorite_authors(),
-                    favorite_ids=[str(item.get("id")) for item in storage.get_favorites()],
+                    favorite_ids=storage.get_favorite_keys(),
                     enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0"),
                 )
                 progress = data.get("indexing_progress") or {}
@@ -1985,17 +2210,22 @@ def storyboard_segment_image(
 @app.post("/api/scan/start")
 async def start_quick_scan():
     """Uruchamia szybki skan profili w tle."""
-    import threading
-    from fast_scan import run_full_quick_scan
-    threading.Thread(target=run_full_quick_scan, daemon=True).start()
-    return {"status": "started", "message": "Skanowanie profili uruchomione w tle."}
+    from fast_scan import quick_scan_supervisor
+    return {**quick_scan_supervisor.start(), "message": "Skanowanie profili uruchomione w tle."}
+
+
+@app.post("/api/scan/stop")
+async def stop_quick_scan():
+    from fast_scan import quick_scan_supervisor
+    return quick_scan_supervisor.stop()
 
 @app.get("/api/scan/status")
 async def get_scan_status():
     """Zwraca aktualną liczbę zaindeksowanych profili."""
     from model_tags import model_tag_manager
     count = len(model_tag_manager._db)
-    return {"status": "ok", "indexed_models_count": count}
+    from fast_scan import quick_scan_supervisor
+    return {"indexed_models_count": count, **quick_scan_supervisor.status()}
 
 # ============================================================
 # ZARZĄDZANIE CZARNĄ LISTĄ PROFILI (BLOKOWANIE / USUWANIE)
@@ -2059,19 +2289,14 @@ def estimate_model_total_videos(username: str) -> int:
 
 @app.post("/api/model/{username}/block")
 async def block_model_endpoint(username: str, count: Optional[int] = Query(None)):
-    """Blokuje profil modelki, zlicza usunięte filmy i trwale usuwa ją z bazy, aktualizacji i wyszukiwarki."""
-    loop = asyncio.get_running_loop()
+    """Block a profile as a reversible projection; no remote/library records are deleted."""
+    final_count = count if (count and count > 0) else None
     try:
-        # Szybkie, równoległe oszacowanie liczby filmów (z limitem 2.5s)
-        estimated = await asyncio.wait_for(
-            loop.run_in_executor(None, estimate_model_total_videos, username),
-            timeout=2.5
-        )
-    except Exception:
-        estimated = count if (count and count > 0) else 1
-
-    final_count = estimated if (estimated and estimated > 0) else (count if (count and count > 0) else 1)
-    result = await asyncio.to_thread(storage.block_model, username, video_count=final_count)
+        result = await asyncio.to_thread(storage.block_model, username, video_count=final_count)
+    except (InvalidVideoIdentity, StoreRecoveryRequired) as exc:
+        raise HTTPException(status_code=503, detail=f"Nie udało się trwale zablokować profilu: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Nie udało się trwale zablokować profilu: {exc}") from exc
     invalidate_feed_cache()
     stats = storage.get_blocked_stats()
     catalog_stats = get_catalog_stats()
@@ -2079,16 +2304,24 @@ async def block_model_endpoint(username: str, count: Optional[int] = Query(None)
     return {
         "success": result["success"],
         "username": username,
-        "removed_videos": result["removed_videos"],
+        "removed_videos": 0,
+        "hidden_videos": result.get("hidden_videos", 0),
+        "destructive": False,
         "catalog_videos": catalog_stats["total_videos"],
         "catalog_pages": catalog_stats["last_page"],
-        **stats
+        **stats,
+        "preferences_version": storage.preferences_version,
     }
 
 @app.post("/api/model/{username}/unblock")
 def unblock_model_endpoint(username: str):
     """Odblokowuje wcześniej zablokowany profil modelki."""
-    success = storage.unblock_model(username)
+    try:
+        success = storage.unblock_model(username)
+    except (InvalidVideoIdentity, StoreRecoveryRequired) as exc:
+        raise HTTPException(status_code=503, detail=f"Nie udało się trwale odblokować profilu: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Nie udało się trwale odblokować profilu: {exc}") from exc
     invalidate_feed_cache()
     stats = storage.get_blocked_stats()
     catalog_stats = get_catalog_stats()
@@ -2097,7 +2330,8 @@ def unblock_model_endpoint(username: str):
         "username": username,
         "catalog_videos": catalog_stats["total_videos"],
         "catalog_pages": catalog_stats["last_page"],
-        **stats
+        **stats,
+        "preferences_version": storage.preferences_version,
     }
 
 @app.get("/api/blocked_models")
@@ -2110,12 +2344,18 @@ async def get_blocked_models_endpoint():
         "blocked_model_video_counts": storage.data.get("blocked_model_video_counts", {}),
         "catalog_videos": catalog_stats["total_videos"],
         "catalog_pages": catalog_stats["last_page"],
-        **stats
+        **stats,
+        "preferences_version": storage.preferences_version,
     }
 
 @app.get("/api/stats")
 async def get_system_stats():
-    """Zwraca kompleksowe statystyki wideo i profili dla strony głównej."""
+    """Return stats without running synchronous SQLite/tag work on the event loop."""
+    return await asyncio.to_thread(_collect_system_stats)
+
+
+def _collect_system_stats():
+    """Synchronous implementation kept off the ASGI event loop."""
     from model_tags import model_tag_manager
     total_models = len(model_tag_manager._db)
 
@@ -2128,9 +2368,9 @@ async def get_system_stats():
             genders["Trans"] += 1
 
     blocked_stats = storage.get_blocked_stats()
-    fav_count = len(storage.get_favorites())
-    hist_count = len(storage.data.get("history", []))
-    foll_count = len(storage.data.get("following", []))
+    fav_count = len(storage.get_favorites(include_blocked=False))
+    hist_count = len(storage.get_history(include_blocked=False))
+    foll_count = len(storage.get_following(include_blocked=False))
     catalog_stats = get_catalog_stats()
 
     return {
@@ -2142,16 +2382,140 @@ async def get_system_stats():
         "catalog_videos": catalog_stats["total_videos"],
         "catalog_pages": catalog_stats["last_page"],
         "base_catalog_videos": catalog_stats["base_catalog_videos"],
+        "hidden_by_block": catalog_stats.get("hidden_by_block", 0),
+        "hidden_by_filter": catalog_stats.get("hidden_by_filter", 0),
+        "accuracy": catalog_stats.get("accuracy", "partial"),
         "catalog_complete": catalog_stats.get("catalog_complete", False),
         "catalog_limited": catalog_stats.get("catalog_limited", False),
         "limited_sources": catalog_stats.get("limited_sources", {}),
         "updated_at": catalog_stats.get("updated_at", 0),
-        "archivebate_pages": 1000,
-        "estimated_archivebate_videos": 36000,
         "favorites_count": fav_count,
         "history_count": hist_count,
-        "following_count": foll_count
+        "following_count": foll_count,
+        "preferences_version": storage.preferences_version,
+        "store_health": _public_store_health(),
     }
+
+
+def _git_head_fingerprint() -> str:
+    try:
+        repo = os.path.dirname(__file__)
+        head_path = os.path.join(repo, ".git", "HEAD")
+        with open(head_path, encoding="utf-8") as handle:
+            head = handle.read().strip()
+        if head.startswith("ref: "):
+            ref_path = os.path.join(repo, ".git", head[5:])
+            try:
+                with open(ref_path, encoding="utf-8") as handle:
+                    return handle.read().strip()[:64]
+            except OSError:
+                return head[5:][:120]
+        return head[:64]
+    except OSError:
+        return "unknown"
+
+
+@app.get("/api/diagnostics")
+async def get_diagnostics():
+    """Redacted operational diagnostics; credentials, cookies and remote URLs are excluded."""
+    from catalog_service import catalog_service
+    from deep_archivebate import deep_archivebate_service
+    from fast_scan import quick_scan_supervisor
+    health = _public_store_health()
+    try:
+        configured_port = int(os.getenv("ARCHIVEBATE_PORT") or os.getenv("PORT") or "8000")
+    except ValueError:
+        configured_port = None
+    return {
+        "status": "ok" if health.get("status") == "ready" else health.get("status", "unknown"),
+        "build": {"git_head": _git_head_fingerprint(), "python": os.sys.version.split()[0]},
+        "runtime": {
+            "code_root": os.path.abspath(os.path.dirname(__file__)),
+            "data_root": os.path.abspath(os.path.join(os.path.dirname(__file__), "data")),
+            "configured_port": configured_port,
+        },
+        "process": {"pid": os.getpid()},
+        "storage": _redact_diagnostic_value(health),
+        "catalog": _redact_diagnostic_value({
+            "active_revision": catalog_service.get_active_revision(),
+            "indexing": getattr(catalog_service, "_indexing_progress", {}),
+        }),
+        "jobs": _redact_diagnostic_value({
+            "quick_scan": quick_scan_supervisor.status(),
+            "deep_archivebate": deep_archivebate_service.status(),
+        }),
+    }
+
+
+@app.get("/api/diagnostics/export")
+async def export_diagnostics():
+    return await get_diagnostics()
+
+
+def _lock_is_held(lock: threading.Lock) -> bool:
+    acquired = lock.acquire(blocking=False)
+    if acquired:
+        lock.release()
+        return False
+    return True
+
+
+@app.get("/api/jobs")
+async def get_jobs():
+    """Return one small, read-only view over the existing background services."""
+    from deep_archivebate import deep_archivebate_service
+    from fast_scan import quick_scan_supervisor
+
+    quick = quick_scan_supervisor.status()
+    try:
+        deep = await asyncio.to_thread(deep_archivebate_service.status)
+    except Exception as exc:
+        deep = {"running": False, "status": "unavailable", "error": type(exc).__name__}
+    sync_status = "running" if _lock_is_held(_account_sync_lock) else "idle"
+    quick_status = str(quick.get("status") or "idle")
+    deep_status = "running" if deep.get("running") else str(deep.get("status") or "idle")
+    active = sync_status == "running" or quick_status in {"queued", "running", "cancelling"} or deep_status == "running"
+    failed = quick_status == "failed" or bool(deep.get("last_error")) or deep_status == "unavailable"
+    return {
+        "status": "failed" if failed else ("running" if active else "idle"),
+        "jobs": {
+            "account_sync": {"status": sync_status},
+            "quick_scan": quick,
+            "deep_archivebate": deep,
+        },
+        "updated_at": time.time(),
+    }
+
+
+@app.get("/api/account/export")
+async def export_account_snapshot():
+    return storage.export_snapshot()
+
+
+@app.post("/api/account/restore/preview")
+async def preview_account_restore(snapshot: dict = Body(...)):
+    try:
+        restored = storage.validate_snapshot(snapshot)
+        return {
+            "success": True,
+            "schema_version": restored.get("schema_version"),
+            "favorites": len(restored.get("favorites", [])),
+            "history": len(restored.get("history", [])),
+            "following": len(restored.get("following", [])),
+            "destructive": False,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/account/restore")
+async def restore_account_snapshot(snapshot: dict = Body(...)):
+    try:
+        result = await asyncio.to_thread(storage.restore_snapshot, snapshot)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    invalidate_feed_cache()
+    return {**result, "destructive": False, "store_health": _public_store_health()}
 
 if __name__ == "__main__":
     import uvicorn

@@ -34,6 +34,12 @@
     }
 
     const init = { ...options, signal: controller.signal };
+    const method = String(init.method || 'GET').toUpperCase();
+    if (method !== 'GET' && method !== 'HEAD' && method !== 'OPTIONS') {
+      const token = getMutationToken();
+      init.headers = { ...(init.headers || {}) };
+      if (token) init.headers['X-Archivebate-Mutation-Token'] = token;
+    }
     delete init.timeoutMs;
 
     try {
@@ -54,7 +60,7 @@
       if (controller.signal.aborted) {
         throw new ApiError(timedOut ? 'Przekroczono czas oczekiwania na odpowiedź.' : 'Anulowano żądanie.', timedOut ? 408 : 0, timedOut ? 'timeout' : 'cancelled');
       }
-      if (!navigator.onLine) {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
         throw new ApiError('Brak połączenia z internetem.', 0, 'offline');
       }
       throw new ApiError(err && err.message ? err.message : 'Błąd połączenia.', 0, 'network_error');
@@ -78,5 +84,17 @@
     }, true);
   }
 
-  window.ArchivebateAPI = { ApiError, request, getJSON, postJSON, friendlyMessage };
+  function getMutationToken() {
+    if (typeof document === 'undefined') return '';
+    return document.querySelector('meta[name="archivebate-mutation-token"]')?.content || '';
+  }
+
+  function expectObject(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new ApiError('Serwer zwrócił nieprawidłowy format odpowiedzi.', 0, 'invalid_schema');
+    }
+    return value;
+  }
+
+  window.ArchivebateAPI = { ApiError, request, getJSON, postJSON, friendlyMessage, getMutationToken, expectObject };
 })();

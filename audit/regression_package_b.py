@@ -13,7 +13,6 @@ import copy
 import math
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -26,8 +25,12 @@ import main
 
 
 def run_tests():
-    with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp_dir:
-        db_path = Path(tmp_dir) / "test_catalog.db"
+    # Use unique files directly under audit: the managed Windows Python
+    # runtime can create temp directories whose ACL prevents cleanup.
+    tmp_dir = Path(__file__).parent
+    run_id = f"{os.getpid()}_{time.time_ns()}"
+    db_path = tmp_dir / f"package_b_{run_id}_catalog.db"
+    try:
         cs = CatalogService(db_path=db_path)
 
         # -------------------------------------------------------------
@@ -95,7 +98,7 @@ def run_tests():
         # 3. Background update does NOT change counter before publish
         # -------------------------------------------------------------
         # Partially populate revision 2 with some new items
-        new_batch = [{"id": f"new_{j}", "username": f"new_{j}", "published_at": now + j} for j in range(50)]
+        new_batch = [{"id": f"new_{j}", "source": "archivebate", "username": f"new_{j}", "published_at": now + j} for j in range(50)]
         cs_restarted.import_items(new_batch, revision=2, complete=False)
 
         # Active catalog MUST still return revision 1 (721 videos, 3 pages)
@@ -110,8 +113,11 @@ def run_tests():
         assert res_after_publish["catalog_revision"] == 2
         assert res_after_publish["video_count"] == 50
 
-        # Reset back to revision 1 for subsequent filter tests
-        cs_restarted.publish_revision(1)
+        # A completed revision is immutable and a stale worker cannot downgrade
+        # the live feed back to revision 1.
+        assert cs_restarted.publish_revision(1) is False
+        res_after_downgrade_attempt = cs_restarted.query_page(page=1)
+        assert res_after_downgrade_attempt["catalog_revision"] == 2
 
         # -------------------------------------------------------------
         # 4. Filters and groups: sum consistency
@@ -143,7 +149,7 @@ def run_tests():
         # -------------------------------------------------------------
         # 5. Performance benchmark on 70,000 metadata items
         # -------------------------------------------------------------
-        db_70k = Path(tmp_dir) / "test_70k.db"
+        db_70k = tmp_dir / f"package_b_{run_id}_70k.db"
         cs_70k = CatalogService(db_path=db_70k)
         items_70k = [
             {
@@ -175,11 +181,15 @@ def run_tests():
         # -------------------------------------------------------------
         # 6. HTTP API Contract verification (/api/feed & /api/stats)
         # -------------------------------------------------------------
-        # Inject cs_restarted as main catalog service
-        main.catalog_service = cs_restarted
+        # Use a clean API fixture pinned to the original completed snapshot so
+        # the HTTP contract also covers the three-page jump independently of
+        # the monotonic revision test above.
+        api_catalog = CatalogService(db_path=tmp_dir / f"package_b_{run_id}_api.db")
+        api_catalog.import_items(fixture_721, revision=1, complete=True)
+        main.catalog_service = api_catalog
         import catalog_service as cs_module
         orig_service = cs_module.catalog_service
-        cs_module.catalog_service = cs_restarted
+        cs_module.catalog_service = api_catalog
 
         try:
             client = TestClient(main.app)
@@ -220,7 +230,10 @@ def run_tests():
             cs_module.catalog_service = orig_service
             main.catalog_service = orig_service
             cs_70k.close()
+            api_catalog.close()
             cs_restarted.close()
+    finally:
+        pass
 
 
 if __name__ == "__main__":

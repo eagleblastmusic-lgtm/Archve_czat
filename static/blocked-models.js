@@ -10,6 +10,8 @@
   let updateHomeStats;
   let deduplicateVideos;
   let renderVideoGrid;
+  const pendingBlocks = new Set();
+  let lastBlock = null;
 
   function init(dependencies = {}) {
     showToast = dependencies.showToast;
@@ -41,6 +43,7 @@
           ? card._videoData.username
           : (card && card.dataset ? card.dataset.username : '');
         if (normalizeUsername(username) === norm) {
+          card.remove?.();
           state.gridCardMap.delete(key);
         }
       }
@@ -67,10 +70,10 @@
     if (!username || username.toLowerCase() === 'model') return;
 
     const norm = normalizeUsername(username);
-    clientBlockedAuthors().add(norm);
+    if (!norm || pendingBlocks.has(norm)) return;
+    pendingBlocks.add(norm);
 
-    // 1. Natychmiastowe zniknięcie kafelków z widoku. Po usunięciu elementu
-    // CSS Grid sam przesuwa kolejne karty na zwolnione miejsce — bez reloadu.
+    // Do czasu potwierdzenia API nie usuwamy kart ani rekordów z lokalnej biblioteki.
     let visibleCount = 0;
     document.querySelectorAll('.video-card').forEach(c => {
       const link = c.querySelector('.model-profile-link');
@@ -78,108 +81,177 @@
         const u = normalizeUsername(link.dataset.username || '');
         if (u === norm) {
           visibleCount++;
-          c.style.transition = 'opacity 0.18s ease, transform 0.18s ease';
-          c.style.opacity = '0';
-          c.style.transform = 'scale(0.92)';
-          setTimeout(() => c.remove(), 180);
         }
       }
     });
 
-    // 2. Jeśli odtwarzacz wideo jest otwarty z tą modelką, natychmiast go zamknij
-    if (state.currentVideoDetails && normalizeUsername(state.currentVideoDetails.username) === norm) {
-      closeModal();
-    }
-
-    // 3. Wstępny toast informujący o usuwaniu
-    const progressToast = showToast(`Usuwanie profilu "${username}"...`, 'info');
+    const progressToast = showToast(`Blokowanie profilu "${username}"...`, 'info');
 
     // 4. Wywołanie API
     try {
       const url = `/api/model/${encodeURIComponent(username)}/block?count=${visibleCount}`;
-      const res = await fetch(url, { method: 'POST' });
-      const data = await res.json();
+      const data = await global.ArchivebateAPI.postJSON(url, {});
       if (data && data.success) {
-        const removedVids = data.removed_videos || visibleCount || 0;
-        const msg = removedVids > 0
-          ? `Profil "${username}" zablokowany. Usunięto ${removedVids.toLocaleString('pl-PL')} filmów z katalogu.`
-          : `Profil "${username}" został usunięty i zablokowany w całym programie.`;
+        clientBlockedAuthors().add(norm);
+        if (state.currentVideoDetails && normalizeUsername(state.currentVideoDetails.username) === norm) closeModal();
+        const hiddenVids = data.hidden_videos || visibleCount || 0;
+        const msg = hiddenVids > 0
+          ? `Profil "${username}" zablokowany. Ukryto szacunkowo ${hiddenVids.toLocaleString('pl-PL')} filmów; dane zachowano.`
+          : `Profil "${username}" został zablokowany jako odwracalny filtr.`;
 
-        showToast(msg, 'success', progressToast);
+        lastBlock = {
+          username,
+          norm,
+          expiresAt: Date.now() + 10000,
+          previousVideos: Array.isArray(state.videos) ? state.videos.map(video => ({ ...video })) : null
+        };
+        showToast(`${msg} Możesz cofnąć przez 10 sekund.`, 'success', progressToast, [
+          { label: 'Cofnij', onClick: () => undoLastBlock() }
+        ]);
 
-        // Usuń autora również z bieżącego modelu klienta. Nie przeładowujemy
-        // strony i nie pobieramy ponownie 280 kafelków — siatka po prostu się
-        // domyka po fizycznym usunięciu odpowiednich kart.
         pruneBlockedAuthorFromClientState(norm);
 
         // Zaktualizuj wyłącznie liczniki/statystyki.
         updateCount();
         updateHomeStats();
       } else {
-        restoreOptimisticRemoval(norm);
         showToast(`Nie udało się zablokować profilu "${username}".`, 'error', progressToast);
       }
     } catch (err) {
       console.error('Błąd blokowania modelki:', err);
-      restoreOptimisticRemoval(norm);
-      showToast('Błąd sieciowy podczas blokowania profilu.', 'error', progressToast);
+      showToast(err?.message || 'Błąd sieciowy podczas blokowania profilu.', 'error', progressToast);
+    } finally {
+      pendingBlocks.delete(norm);
     }
   }
 
   async function unblock(username) {
     try {
-      const res = await fetch(`/api/model/${encodeURIComponent(username)}/unblock`, { method: 'POST' });
-      const data = await res.json();
+      const data = await global.ArchivebateAPI.postJSON(`/api/model/${encodeURIComponent(username)}/unblock`, {});
       if (data.success) {
         clientBlockedAuthors().delete(normalizeUsername(username));
         showToast(`Odblokowano profil "${username}". Będzie teraz ponownie widoczny w programie.`, 'success');
         updateCount();
+        return true;
       }
     } catch (e) {
-      showToast('Błąd odblokowywania profilu', 'error');
+      showToast(e?.message || 'Błąd odblokowywania profilu', 'error');
     }
+    return false;
+  }
+
+  async function undoLastBlock() {
+    const pending = lastBlock;
+    if (!pending || pending.expiresAt < Date.now()) {
+      lastBlock = null;
+      showToast('Okno cofnięcia blokady wygasło.', 'info');
+      return false;
+    }
+    lastBlock = null;
+    const restored = await unblock(pending.username);
+    if (restored && pending.previousVideos) {
+      state.videos = pending.previousVideos;
+      renderVideoGrid(state.videos);
+    }
+    return restored;
   }
 
   async function updateCount() {
     try {
-      const res = await fetch('/api/blocked_models');
-      const data = await res.json();
+      const data = await global.ArchivebateAPI.getJSON('/api/blocked_models');
       const count = (data.blocked_models || []).length;
-      const totalVids = data.blocked_videos_total || 0;
-      if (dom.statBlockedCount) dom.statBlockedCount.innerText = count;
+      const totalVids = Number(data.blocked_videos_total);
+      if (dom.statBlockedCount) dom.statBlockedCount.textContent = Number.isFinite(count) ? String(count) : '--';
       const subEl = document.getElementById('statBlockedVideosSub');
       if (subEl) {
-        subEl.innerText = `usunięto ${totalVids.toLocaleString('pl-PL')} filmów`;
+        subEl.textContent = Number.isFinite(totalVids)
+          ? `szacunkowo ukryto ${totalVids.toLocaleString('pl-PL')} filmów`
+          : 'szacunkowo ukryto -- filmów';
       }
     } catch (e) {}
   }
 
   async function showManager() {
     try {
-      const res = await fetch('/api/blocked_models');
-      const data = await res.json();
+      const data = await global.ArchivebateAPI.getJSON('/api/blocked_models');
       const blocked = data.blocked_models || [];
       if (blocked.length === 0) {
-        alert('Nie masz obecnie żadnych zablokowanych profili.');
+        showToast('Nie masz obecnie żadnych zablokowanych profili.', 'info');
         return;
       }
       const totalVids = data.blocked_videos_total || 0;
       const counts = data.blocked_model_video_counts || {};
 
-      const formattedList = blocked.map(b => {
-        const norm = normalizeUsername(b);
-        const cnt = counts[norm] || 0;
-        return cnt > 0 ? `${b} (${cnt.toLocaleString('pl-PL')} filmów)` : b;
-      }).join('\n• ');
-
-      const unblockTarget = prompt(
-        `Aktualnie zablokowane profile (${blocked.length} autorów, łącznie usunięto ${totalVids.toLocaleString('pl-PL')} filmów):\n\n• ` +
-        formattedList +
-        `\n\nWpisz nazwę profilu, który chcesz ODBLOKOWAĆ (lub zostaw puste i Anuluj):`
-      );
-      if (unblockTarget && unblockTarget.trim()) {
-        await unblock(unblockTarget.trim());
-      }
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay';
+      overlay.setAttribute('role', 'dialog');
+      overlay.setAttribute('aria-modal', 'true');
+      overlay.setAttribute('aria-labelledby', 'blockedModelsTitle');
+      overlay.style.display = 'flex';
+      const panel = document.createElement('div');
+      panel.className = 'modal-content';
+      panel.style.cssText = 'max-width:620px;width:min(620px,calc(100vw - 32px));padding:24px;';
+      const heading = document.createElement('h2');
+      heading.id = 'blockedModelsTitle';
+      heading.textContent = 'Zablokowane profile';
+      const summary = document.createElement('p');
+      summary.textContent = `${blocked.length} autorów • szacunkowo ukryto ${totalVids.toLocaleString('pl-PL')} filmów. Dane biblioteki są zachowane.`;
+      summary.style.color = 'var(--text-muted)';
+      const search = document.createElement('input');
+      search.type = 'search';
+      search.placeholder = 'Szukaj profilu…';
+      search.setAttribute('aria-label', 'Szukaj zablokowanego profilu');
+      search.style.cssText = 'width:100%;margin:12px 0;padding:10px;border-radius:8px;';
+      const list = document.createElement('div');
+      list.className = 'blocked-models-manager-list';
+      list.style.cssText = 'display:flex;flex-direction:column;gap:8px;max-height:48vh;overflow:auto;';
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'btn-card';
+      close.textContent = 'Zamknij';
+      close.style.marginTop = '16px';
+      const closeManager = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
+      const onKey = event => { if (event.key === 'Escape') closeManager(); };
+      const render = () => {
+        list.replaceChildren();
+        const query = normalizeUsername(search.value);
+        blocked.filter(name => !query || normalizeUsername(name).includes(query)).forEach(name => {
+          const row = document.createElement('div');
+          row.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 12px;background:rgba(255,255,255,.04);border-radius:8px;';
+          const label = document.createElement('span');
+          const count = counts[normalizeUsername(name)] || 0;
+          label.textContent = count > 0 ? `${name} (${count.toLocaleString('pl-PL')} filmów)` : name;
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'btn-card danger';
+          button.textContent = 'Odblokuj';
+          button.addEventListener('click', async () => {
+            button.disabled = true;
+            if (await unblock(name)) {
+              const index = blocked.indexOf(name);
+              if (index >= 0) blocked.splice(index, 1);
+              render();
+              if (blocked.length === 0) closeManager();
+            } else button.disabled = false;
+          });
+          row.append(label, button);
+          list.appendChild(row);
+        });
+        if (!list.children.length) {
+          const empty = document.createElement('p');
+          empty.textContent = 'Brak profili pasujących do wyszukiwania.';
+          list.appendChild(empty);
+        }
+      };
+      search.addEventListener('input', render);
+      close.addEventListener('click', closeManager);
+      overlay.addEventListener('click', event => { if (event.target === overlay) closeManager(); });
+      panel.append(heading, summary, search, list, close);
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+      document.addEventListener('keydown', onKey);
+      search.focus();
+      render();
     } catch (e) {
       showToast('Błąd pobierania listy zablokowanych profili', 'error');
     }
@@ -190,6 +262,7 @@
     block,
     unblock,
     updateCount,
-    showManager
+    showManager,
+    undoLastBlock
   };
 })(typeof window !== 'undefined' ? window : globalThis);
