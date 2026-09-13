@@ -57,9 +57,20 @@
     navbar.style.top = tabsVisible ? `${tabs.offsetHeight || 38}px` : '0px';
   }
 
+  function ensureDeepProgressLive() {
+    if (typeof document === 'undefined') return;
+    if (document.querySelector('script[data-archivebate-deep-progress-live]')) return;
+    const script = document.createElement('script');
+    script.src = '/static/deep-progress-live.js';
+    script.async = true;
+    script.dataset.archivebateDeepProgressLive = '1';
+    document.head.appendChild(script);
+  }
+
   function init(dependencies = {}) {
     showToast = dependencies.showToast;
     dockMainNavigation();
+    ensureDeepProgressLive();
   }
 
   function isFavoriteAuthor(username) {
@@ -78,6 +89,76 @@
     } else {
       buttonEl.classList.remove('active');
       buttonEl.innerHTML = '<i class="fa-regular fa-heart"></i>';
+    }
+  }
+
+  function normalizedAuthor(value) {
+    return String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  }
+
+  function shouldMatchExcludedFavorite(video, key, author) {
+    if (!video || typeof video !== 'object') return false;
+    if (author && author !== 'model' && author !== 'unknown') {
+      return normalizedAuthor(video.username || video.author) === author;
+    }
+    return videoKey(video) === key;
+  }
+
+  function removeExcludedFavoriteFromCurrentView(video, key) {
+    if (typeof document === 'undefined') return false;
+    if (state.authorFilter !== 'exclude_fav') return false;
+    if (state.mode !== 'home' && state.mode !== 'search') return false;
+
+    const author = normalizedAuthor(video?.username || video?.author);
+    let removed = 0;
+
+    document.querySelectorAll('.video-card').forEach(card => {
+      const cardAuthor = normalizedAuthor(
+        card.dataset?.username || card.querySelector?.('.model-profile-link')?.dataset?.username || ''
+      );
+      const cardKey = videoKey({ source: card.dataset?.source, id: card.dataset?.videoId });
+      const sameAuthor = author && author !== 'model' && author !== 'unknown' && cardAuthor === author;
+      const sameVideo = cardKey === key;
+      if (!sameAuthor && !sameVideo) return;
+
+      if (state.gridCardMap instanceof Map && card._cardKey) state.gridCardMap.delete(card._cardKey);
+      card.remove?.();
+      removed += 1;
+    });
+
+    if (Array.isArray(state.videos)) {
+      state.videos = state.videos.filter(item => !shouldMatchExcludedFavorite(item, key, author));
+    }
+
+    if (state.videoById instanceof Map) {
+      for (const [id, item] of state.videoById.entries()) {
+        if (shouldMatchExcludedFavorite(item, key, author)) state.videoById.delete(id);
+      }
+    }
+
+    if (removed > 0) {
+      const visibleCount = document.querySelectorAll('.video-card').length;
+      state.lastAppliedVideosCount = visibleCount;
+      if (dom.statPageVideos) dom.statPageVideos.textContent = String(visibleCount);
+    }
+    return removed > 0;
+  }
+
+  function refreshExcludedFavoriteView() {
+    if (state.authorFilter !== 'exclude_fav') return;
+    const page = Math.max(1, Number(state.currentPage) || 1);
+
+    if (state.mode === 'home') {
+      const loadHome = global.ArchivebateVideoViews?.loadHomeVideos || global.loadHomeVideos;
+      if (typeof loadHome === 'function') setTimeout(() => loadHome(page), 0);
+      return;
+    }
+
+    if (state.mode === 'search') {
+      const performSearch = global.ArchivebateSearchResults?.performSearch || global.performSearch;
+      if (typeof performSearch === 'function' && state.currentQuery) {
+        setTimeout(() => performSearch(state.currentQuery, page), 0);
+      }
     }
   }
 
@@ -197,6 +278,9 @@
     pendingMutations.add(key);
     if (buttonEl) buttonEl.disabled = true;
     applyFavoriteState(video, key, buttonEl, optimisticIsFav, optimisticCount);
+    const optimisticallyRemoved = optimisticIsFav
+      ? removeExcludedFavoriteFromCurrentView(mutationVideo, key)
+      : false;
 
     try {
       const data = await global.ArchivebateAPI.postJSON('/api/account/favorites/toggle', mutationVideo);
@@ -212,6 +296,9 @@
         updateAllAuthorNameColors();
       }
 
+      if (isFav) removeExcludedFavoriteFromCurrentView(mutationVideo, key);
+      if (isFav || optimisticallyRemoved) refreshExcludedFavoriteView();
+
       if (data.remote_state === 'failed' || data.remote_state === 'unknown' || data.sync_state === 'remote_failed') {
         showToast?.('Zmiana zapisana lokalnie, ale synchronizacja z kontem zdalnym nie powiodła się.', 'warning');
       } else if (data.sync_state === 'local_only') {
@@ -221,7 +308,10 @@
       }
       return isFav;
     } catch (e) {
-      return await reconcileLocalFavorite(video, key, buttonEl, previousIsFav, e);
+      const isFav = await reconcileLocalFavorite(video, key, buttonEl, previousIsFav, e);
+      if (isFav) removeExcludedFavoriteFromCurrentView(mutationVideo, key);
+      if (isFav || optimisticallyRemoved) refreshExcludedFavoriteView();
+      return isFav;
     } finally {
       pendingMutations.delete(key);
       if (buttonEl) buttonEl.disabled = false;
