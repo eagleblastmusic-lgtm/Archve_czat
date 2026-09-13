@@ -72,23 +72,29 @@
     updateAllAuthorNameColors();
   }
 
-  async function reconcileLocalFavorite(video, key, buttonEl, fallbackState, error) {
+  async function reconcileLocalFavorite(video, key, buttonEl, previousState, error) {
     try {
       const snapshot = await global.ArchivebateAPI.getJSON('/api/account/favorites?page=1&per_page=1000', { timeoutMs: 5000 });
       const videos = Array.isArray(snapshot?.videos) ? snapshot.videos : [];
       const isFav = videos.some(item => videoKey(item) === key);
+      const intendedState = !previousState;
       applyFavoriteState(video, key, buttonEl, isFav, Number(snapshot?.total));
-      showToast?.(
-        isFav
-          ? 'Dodano do ulubionych lokalnie. Synchronizacja z kontem może jeszcze trwać.'
-          : 'Usunięto z ulubionych lokalnie. Synchronizacja z kontem może jeszcze trwać.',
-        'warning'
-      );
+
+      if (isFav === intendedState) {
+        showToast?.(
+          isFav
+            ? 'Dodano do ulubionych lokalnie. Synchronizacja z kontem może jeszcze trwać.'
+            : 'Usunięto z ulubionych lokalnie. Synchronizacja z kontem może jeszcze trwać.',
+          'warning'
+        );
+      } else {
+        showToast?.(error?.message || 'Błąd aktualizacji ulubionych', 'error');
+      }
       return isFav;
     } catch (_) {
-      applyFavoriteState(video, key, buttonEl, fallbackState);
+      applyFavoriteState(video, key, buttonEl, previousState);
       showToast?.(error?.message || 'Błąd aktualizacji ulubionych', 'error');
-      return fallbackState;
+      return previousState;
     }
   }
 
