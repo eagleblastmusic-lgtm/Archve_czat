@@ -136,6 +136,47 @@ const load=(c,file)=>vm.runInContext(fs.readFileSync('static/'+file,'utf8'),c);
   const closed=mState.playerController;
   m.ArchivebateVideoModal.close();assert(closed.signal.aborted);
 
+  // Expired-host quarantine is per VIDEO, never per grouped card/author.
+  // If the representative of a 3-video group expires, the group must remain
+  // and the next known member becomes its representative. Lazy groups with no
+  // members loaded locally must also stay visible instead of losing 99 good videos.
+  const prefStorage=new Map();
+  const dead={id:'dead',source:'archivebate',username:'group'};
+  const live1={id:'live1',source:'archivebate',username:'group',poster:'live1.jpg'};
+  const live2={id:'live2',source:'archivebate',username:'group',poster:'live2.jpg'};
+  const grouped={...dead,is_grouped:true,_isGrouped:true,group_count:3,_groupCount:3,
+    grouped_videos:[dead,live1,live2],_groupedVideos:[dead,live1,live2]};
+  const lazyGrouped={id:'lazy-dead',source:'archivebate',username:'lazy',is_grouped:true,_isGrouped:true,
+    group_count:100,_groupCount:100,group_members_lazy:true,group_members_url:'/api/group/lazy'};
+  const solo={id:'solo-dead',source:'archivebate',username:'solo'};
+  const prefState={videos:[grouped,lazyGrouped,solo],gridCardMap:new Map()};
+  const groupCard={dataset:{source:'archivebate',videoId:'dead'},_videoData:grouped,_cardKey:'group:author:group',_cardIndex:0,removed:false,
+    remove(){this.removed=true;},_updateCard(v){this._videoData=v;}};
+  const lazyCard={dataset:{source:'archivebate',videoId:'lazy-dead'},_videoData:lazyGrouped,_cardKey:'group:author:lazy',_cardIndex:1,removed:false,
+    remove(){this.removed=true;},_updateCard(v){this._videoData=v;}};
+  const soloCard={dataset:{source:'archivebate',videoId:'solo-dead'},_videoData:solo,_cardKey:'archivebate:id:solo-dead',removed:false,
+    remove(){this.removed=true;}};
+  const prefCtx={AbortController,console,setTimeout,clearTimeout,ArchivebateAppContext:{state:prefState,dom:{statPageVideos:{textContent:''}}},
+    ArchivebateAPI:{getJSON:async()=>null},ArchivebatePerf:undefined,
+    localStorage:{getItem:k=>prefStorage.get(k)||null,setItem:(k,v)=>prefStorage.set(k,String(v))},
+    document:{querySelectorAll:sel=>sel==='.video-card'?[groupCard,lazyCard,soloCard]:[]},
+    dispatchEvent(){},CustomEvent:class{constructor(type,init){this.type=type;this.detail=init?.detail;}}};
+  prefCtx.window=prefCtx; prefCtx.globalThis=prefCtx;
+  vm.createContext(prefCtx); load(prefCtx,'video-prefetch.js');
+  prefCtx.ArchivebateVideoPrefetch.markUnavailableVideo('dead');
+  assert.equal(groupCard.removed,false,'one expired representative must not remove the whole group');
+  assert.equal(groupCard.dataset.videoId,'live1','next loaded member should be promoted as representative');
+  assert.equal(grouped.group_count,2);
+  assert.equal(grouped.grouped_videos.map(v=>v.id).join(','),'live1,live2');
+  assert.equal(prefState.videos.includes(grouped),true);
+  prefCtx.ArchivebateVideoPrefetch.markUnavailableVideo('lazy-dead');
+  assert.equal(lazyCard.removed,false,'lazy 100-video group must survive an expired representative');
+  assert.equal(lazyGrouped.group_count,99,'only the confirmed dead member is subtracted');
+  assert.equal(prefState.videos.includes(lazyGrouped),true);
+  prefCtx.ArchivebateVideoPrefetch.markUnavailableVideo('solo-dead');
+  assert.equal(soloCard.removed,true,'ordinary expired video card should still disappear');
+  assert.equal(prefState.videos.some(v=>v.id==='solo-dead'),false);
+
   // Stats arriving after a filtered feed must not replace its counts.
   const s=env({mode:'home',lastAppliedFeedRevision:1,videos:[{}]},
     {statPageVideos:element(),statCatalogVideos:{innerText:'7'},statCatalogVideosLbl:{innerText:'filtered'}});
@@ -152,5 +193,5 @@ const load=(c,file)=>vm.runInContext(fs.readFileSync('static/'+file,'utf8'),c);
   ac.abort();assert.equal(await pending,false);assert.equal(cancelled,1);
   assert.equal(await m.ArchivebatePlayerCore.waitForPresentedFrame(frameVideo,undefined,2),false,'Timeout is not a presented frame');
   const presented=m.ArchivebatePlayerCore.waitForPresentedFrame(frameVideo);frame();assert.equal(await presented,true);
-  console.log('PASS: full feed error/retry, bounded 409, full modal immediate start/no reset/forced retry/close, filtered stats, first-frame timeout and cancellation');
+  console.log('PASS: full feed error/retry, bounded 409, full modal immediate start/no reset/forced retry/close, grouped unavailable-video isolation, filtered stats, first-frame timeout and cancellation');
 })().catch(e=>{console.error(e);process.exitCode=1;});
