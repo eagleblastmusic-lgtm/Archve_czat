@@ -43,6 +43,133 @@
   // Pamięć podręczna detali wideo dla natychmiastowego startu po kliknięciu
   const videoDetailsCache = new perf.LRUCache(180);
 
+  // Znane niedostępne nagrania przechowujemy lokalnie i czasowo. Nie oznaczamy
+  // filmu jako martwego po pojedynczym błędzie sieciowym: wymagamy dwóch kolejnych
+  // odpowiedzi `availability=unavailable`, z czego druga omija cache serwera.
+  // TTL chroni przed trwałym ukryciem filmu po chwilowej awarii hostingu.
+  const UNAVAILABLE_STORAGE_KEY = 'archivebate_unavailable_videos_v1';
+  const UNAVAILABLE_TTL_MS = 12 * 60 * 60 * 1000;
+  const unavailableConfirmInflight = new Map();
+
+  function unavailableKey(videoId) {
+    const raw = String(videoId || '').trim();
+    if (!raw || raw.toLowerCase().startsWith('cw_')) return null;
+    return `archivebate:id:${raw}`;
+  }
+
+  function loadUnavailableRegistry() {
+    const registry = new Map();
+    if (typeof localStorage === 'undefined') return registry;
+    try {
+      const parsed = JSON.parse(localStorage.getItem(UNAVAILABLE_STORAGE_KEY) || '{}');
+      const now = Date.now();
+      for (const [key, expiresAt] of Object.entries(parsed || {})) {
+        const expiry = Number(expiresAt);
+        if (Number.isFinite(expiry) && expiry > now) registry.set(key, expiry);
+      }
+    } catch (_) {}
+    return registry;
+  }
+
+  const unavailableRegistry = loadUnavailableRegistry();
+
+  function persistUnavailableRegistry() {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      localStorage.setItem(UNAVAILABLE_STORAGE_KEY, JSON.stringify(Object.fromEntries(unavailableRegistry)));
+    } catch (_) {}
+  }
+
+  function isKnownUnavailableVideo(videoId) {
+    const key = unavailableKey(videoId);
+    if (!key) return false;
+    const expiresAt = Number(unavailableRegistry.get(key));
+    if (!Number.isFinite(expiresAt)) return false;
+    if (expiresAt <= Date.now()) {
+      unavailableRegistry.delete(key);
+      persistUnavailableRegistry();
+      return false;
+    }
+    return true;
+  }
+
+  function forgetUnavailableVideo(videoId) {
+    const key = unavailableKey(videoId);
+    if (!key || !unavailableRegistry.has(key)) return;
+    unavailableRegistry.delete(key);
+    persistUnavailableRegistry();
+  }
+
+  function removeUnavailableCardInstances(videoId) {
+    if (typeof document === 'undefined') return;
+    const raw = String(videoId || '').trim();
+    if (!raw) return;
+
+    document.querySelectorAll('.video-card').forEach(card => {
+      if (String(card?.dataset?.source || '').toLowerCase() !== 'archivebate') return;
+      if (String(card?.dataset?.videoId || '').trim() !== raw) return;
+      const key = card._cardKey;
+      try { card.remove(); } catch (_) {}
+      const state = global.ArchivebateAppContext?.state || global.state;
+      if (key && state?.gridCardMap?.delete) state.gridCardMap.delete(key);
+    });
+
+    const state = global.ArchivebateAppContext?.state || global.state;
+    if (state && Array.isArray(state.videos)) {
+      state.videos = state.videos.filter(video => String(video?.id || '').trim() !== raw);
+      const dom = global.ArchivebateAppContext?.dom || global.dom || {};
+      if (dom.statPageVideos) dom.statPageVideos.textContent = String(state.videos.length);
+    }
+  }
+
+  function markUnavailableVideo(videoId) {
+    const key = unavailableKey(videoId);
+    if (!key) return false;
+    unavailableRegistry.set(key, Date.now() + UNAVAILABLE_TTL_MS);
+    persistUnavailableRegistry();
+    removeUnavailableCardInstances(videoId);
+    try {
+      global.dispatchEvent?.(new CustomEvent('archivebate:video-unavailable', {
+        detail: { videoId: String(videoId), source: 'archivebate' }
+      }));
+    } catch (_) {}
+    return true;
+  }
+
+  function detailsAreUnavailable(details) {
+    return Boolean(
+      details &&
+      details.availability === 'unavailable' &&
+      !details.is_private &&
+      !details.direct_url &&
+      !details.proxy_stream_url
+    );
+  }
+
+  async function confirmUnavailableVideo(videoId, initialDetails, signal = null) {
+    const key = unavailableKey(videoId);
+    if (!key || !detailsAreUnavailable(initialDetails) || signal?.aborted) return initialDetails;
+    if (unavailableConfirmInflight.has(key)) return unavailableConfirmInflight.get(key);
+
+    const request = api.getJSON(
+      `/api/video/details?id=${encodeURIComponent(videoId)}&force_refresh=true`,
+      { timeoutMs: 12000, signal }
+    ).then(fresh => {
+      if (fresh && !signal?.aborted) videoDetailsCache.set(videoId, fresh);
+      if (detailsAreUnavailable(fresh)) {
+        markUnavailableVideo(videoId);
+      } else if (fresh && (fresh.availability === 'available' || fresh.direct_url || fresh.proxy_stream_url)) {
+        forgetUnavailableVideo(videoId);
+      }
+      return fresh || initialDetails;
+    }).catch(() => initialDetails).finally(() => {
+      unavailableConfirmInflight.delete(key);
+    });
+
+    unavailableConfirmInflight.set(key, request);
+    return request;
+  }
+
   // Ładuj obrazy dopiero, gdy karta zbliża się do viewportu. Wcześniej
   // armLazyThumbnail() ustawiał src od razu wszystkim ~280 kartom, co tworzyło
   // duży burst requestów do /api/thumb i opóźniało pierwszy użyteczny ekran.
@@ -84,8 +211,17 @@
 
   function prefetchVideoDetails(videoId, options = {}) {
     if (!videoId) return Promise.resolve(null);
+    if (isKnownUnavailableVideo(videoId)) {
+      removeUnavailableCardInstances(videoId);
+      return Promise.resolve({ id: videoId, availability: 'unavailable', locally_quarantined: true });
+    }
+
     const cached = videoDetailsCache.get(videoId);
-    if (cached) return Promise.resolve(cached);
+    if (cached) {
+      if (detailsAreUnavailable(cached)) void confirmUnavailableVideo(videoId, cached);
+      else if (cached.availability === 'available' || cached.direct_url || cached.proxy_stream_url) forgetUnavailableVideo(videoId);
+      return Promise.resolve(cached);
+    }
 
     const signal = (typeof options === 'object' && options?.signal) ? options.signal : null;
     if (signal?.aborted) return Promise.resolve(null);
@@ -97,6 +233,11 @@
       .then(details => {
         if (details && !signal?.aborted) {
           videoDetailsCache.set(videoId, details);
+          if (detailsAreUnavailable(details)) {
+            void confirmUnavailableVideo(videoId, details, signal);
+          } else if (details.availability === 'available' || details.direct_url || details.proxy_stream_url) {
+            forgetUnavailableVideo(videoId);
+          }
         }
         return details;
       })
@@ -174,6 +315,9 @@
 
   function setVideoDetails(videoId, details) {
     videoDetailsCache.set(videoId, details);
+    if (details && (details.availability === 'available' || details.direct_url || details.proxy_stream_url)) {
+      forgetUnavailableVideo(videoId);
+    }
   }
 
   function isDetailsInflight(videoId) {
@@ -195,7 +339,11 @@
     getVideoDetails,
     setVideoDetails,
     isDetailsInflight,
-    prefetchCandidateStreamChunk
+    prefetchCandidateStreamChunk,
+    isKnownUnavailableVideo,
+    markUnavailableVideo,
+    forgetUnavailableVideo,
+    confirmUnavailableVideo
   };
 
   global.ArchivebateVideoPrefetch = ArchivebateVideoPrefetch;

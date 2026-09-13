@@ -34,7 +34,6 @@
       const ctx = global.ArchivebateAppContext;
       if (ctx && ctx.dom) { ctx.dom[prop] = value; return true; }
       if (global.dom) { global.dom[prop] = value; return true; }
-      target[prop] = value;
       return true;
     }
   });
@@ -126,6 +125,31 @@
     return result;
   }
 
+  function isGroupedVideo(video) {
+    return Boolean(
+      video?.is_grouped || video?._isGrouped ||
+      (video?.group_count && Number(video.group_count) > 1) ||
+      (video?._groupCount && Number(video._groupCount) > 1) ||
+      (Array.isArray(video?.grouped_videos) && video.grouped_videos.length > 1) ||
+      (Array.isArray(video?._groupedVideos) && video._groupedVideos.length > 1)
+    );
+  }
+
+  // Filmy, dla których dwa niezależne odczyty detali potwierdziły brak hostingu,
+  // są lokalnie kwarantannowane przez video-prefetch.js. Pomijamy je jeszcze
+  // przed utworzeniem DOM, więc nie zostawiają pustych miejsc w siatce.
+  function filterKnownUnavailableVideos(videos) {
+    const checker = global.ArchivebateVideoPrefetch?.isKnownUnavailableVideo;
+    if (typeof checker !== 'function') return videos || [];
+    return (videos || []).filter(video => {
+      if (!video || typeof video !== 'object') return false;
+      // Nie usuwaj całej grupy tylko dlatego, że jej reprezentant wygasł;
+      // członkowie grupy mogą nadal być dostępni. Zwykłe kafelki filtrujemy od razu.
+      if (isGroupedVideo(video)) return true;
+      return !checker(video.id);
+    });
+  }
+
   // KLUCZ IDENTYFIKACYJNY DLA KAFELKA LUB GRUPY (STABILNY MIĘDZY REWIZJAMI)
   function getVideoKey(v) {
     if (!v || typeof v !== 'object') return null;
@@ -183,7 +207,7 @@
 
     if (!videos || videos.length === 0) return;
 
-    videos = deduplicateVideos(videos);
+    videos = filterKnownUnavailableVideos(deduplicateVideos(videos));
     const shouldGroup = state.groupByAuthor && state.mode === 'search';
     const groupFn = getGroupVideosByAuthor();
     const displayVideos = shouldGroup ? groupFn(videos) : videos;
@@ -254,7 +278,7 @@
       return;
     }
 
-    videos = deduplicateVideos(videos);
+    videos = filterKnownUnavailableVideos(deduplicateVideos(videos));
     const shouldGroup = state.groupByAuthor && state.mode === 'search';
     const groupFn = getGroupVideosByAuthor();
     const displayVideos = shouldGroup ? groupFn(videos) : videos;
@@ -338,6 +362,9 @@
   function appendVideoBatch(videos) {
     if (!videos || videos.length === 0 || !dom.videoGrid) return;
     cancelPendingChunks();
+    videos = filterKnownUnavailableVideos(videos);
+    if (videos.length === 0) return;
+
     const existingDomIds = new Set(
       Array.from(dom.videoGrid.querySelectorAll('.video-card, .skeleton-card'))
         .map(el => el._cardKey || getVideoKey(el._videoData || { id: el.dataset?.videoId, source: el.dataset?.source }))
@@ -376,6 +403,7 @@
     init,
     deduplicate: deduplicateVideos,
     deduplicateVideos,
+    filterKnownUnavailableVideos,
     render: renderVideoGrid,
     renderVideoGrid,
     replaceView,
