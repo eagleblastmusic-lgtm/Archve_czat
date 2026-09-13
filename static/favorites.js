@@ -8,10 +8,41 @@
   let showToast;
   const pendingMutations = new Set();
 
-  function videoKey(video) {
-    const source = String(video?.source || (String(video?.id || '').startsWith('cw_') ? 'camwhores' : '')).toLowerCase();
-    const providerId = String(video?.provider_id || video?.id || '').replace(/^cw_/, '').trim();
-    return source && providerId ? `${source}:id:${providerId}` : null;
+  function canonicalVideo(video, buttonEl = null) {
+    if (!video || typeof video !== 'object') return null;
+
+    const card = buttonEl?.closest?.('.video-card') || null;
+    const cardSource = String(card?.dataset?.source || '').trim().toLowerCase();
+    const cardId = String(card?.dataset?.videoId || '').trim();
+    const rawId = String(video.provider_id || video.id || cardId || '').trim();
+    const platform = String(video.platform || '').trim().toLowerCase();
+    const url = String(video.url || '').trim().toLowerCase();
+
+    let source = String(video.source || cardSource || '').trim().toLowerCase();
+    if (!source) {
+      if (rawId.toLowerCase().startsWith('cw_') || platform.includes('camwhores') || url.includes('camwhores')) {
+        source = 'camwhores';
+      } else if (platform.includes('archive') || url.includes('archivebate')) {
+        source = 'archivebate';
+      }
+    }
+
+    if (source !== 'archivebate' && source !== 'camwhores') return null;
+
+    const providerId = rawId.replace(/^cw_/i, '').trim();
+    if (!providerId) return null;
+
+    return {
+      ...video,
+      source,
+      provider_id: providerId,
+      id: source === 'camwhores' ? `cw_${providerId}` : providerId
+    };
+  }
+
+  function videoKey(video, buttonEl = null) {
+    const canonical = canonicalVideo(video, buttonEl);
+    return canonical ? `${canonical.source}:id:${canonical.provider_id}` : null;
   }
 
   function dockMainNavigation() {
@@ -99,6 +130,7 @@
   }
 
   function updateAllAuthorNameColors() {
+    if (typeof document === 'undefined') return;
     document.querySelectorAll('.video-card').forEach(card => {
       const link = card.querySelector('.model-profile-link');
       const u = String(link?.dataset.username || card.dataset.username || '').toLowerCase().trim();
@@ -125,11 +157,8 @@
         }
       }
 
-      if (shouldHighlight) {
-        card.classList.add('is-favorite-card');
-      } else {
-        card.classList.remove('is-favorite-card');
-      }
+      if (shouldHighlight) card.classList.add('is-favorite-card');
+      else card.classList.remove('is-favorite-card');
     });
 
     if (state.currentVideoDetails && dom.modalModelName) {
@@ -137,11 +166,8 @@
       const isModelFav = state.favoriteAuthors && state.favoriteAuthors.has(currU);
       const isVidFav = !!state.currentVideoDetails.is_favorite;
       const isFav = isModelFav || isVidFav;
-      if (isFav) {
-        dom.modalModelName.classList.add('is-favorite-author');
-      } else {
-        dom.modalModelName.classList.remove('is-favorite-author');
-      }
+      if (isFav) dom.modalModelName.classList.add('is-favorite-author');
+      else dom.modalModelName.classList.remove('is-favorite-author');
       const modalContent = dom.videoModal?.querySelector('.modal-content');
       if (modalContent) {
         if (isFav) modalContent.classList.add('is-favorite-modal');
@@ -151,8 +177,13 @@
   }
 
   async function toggleVideo(video, buttonEl = null) {
-    const key = videoKey(video);
-    if (!key || pendingMutations.has(key)) return Boolean(video?.is_favorite);
+    const mutationVideo = canonicalVideo(video, buttonEl);
+    const key = mutationVideo ? videoKey(mutationVideo) : null;
+    if (!key) {
+      showToast?.('Nie można ustalić źródła tego filmu. Odśwież widok i spróbuj ponownie.', 'error');
+      return Boolean(video?.is_favorite);
+    }
+    if (pendingMutations.has(key)) return Boolean(video?.is_favorite);
 
     const previousIsFav = typeof video?.is_favorite === 'boolean'
       ? video.is_favorite
@@ -168,7 +199,7 @@
     applyFavoriteState(video, key, buttonEl, optimisticIsFav, optimisticCount);
 
     try {
-      const data = await global.ArchivebateAPI.postJSON('/api/account/favorites/toggle', video);
+      const data = await global.ArchivebateAPI.postJSON('/api/account/favorites/toggle', mutationVideo);
       if (!data || typeof data.is_favorite !== 'boolean' || data.local_committed !== true) {
         throw new Error('invalid mutation response');
       }
@@ -190,9 +221,6 @@
       }
       return isFav;
     } catch (e) {
-      // The backend commits locally before attempting the optional remote Archivebate toggle.
-      // If that remote call outlives the client timeout, reconcile against the durable local store
-      // instead of falsely rolling the UI back or inviting a second toggle.
       return await reconcileLocalFavorite(video, key, buttonEl, previousIsFav, e);
     } finally {
       pendingMutations.delete(key);
@@ -204,11 +232,11 @@
     dom.modalFavBtn?.setAttribute?.('aria-pressed', isFav ? 'true' : 'false');
     dom.modalFavBtn?.setAttribute?.('aria-label', isFav ? 'Usuń z ulubionych' : 'Dodaj do ulubionych');
     if (isFav) {
-      dom.modalFavBtn.classList.add('active');
-      dom.modalFavBtn.innerHTML = '<i class="fa-solid fa-heart" style="color:#ef4444;"></i> Usuń z ulubionych';
+      dom.modalFavBtn?.classList?.add('active');
+      if (dom.modalFavBtn) dom.modalFavBtn.innerHTML = '<i class="fa-solid fa-heart" style="color:#ef4444;"></i> Usuń z ulubionych';
     } else {
-      dom.modalFavBtn.classList.remove('active');
-      dom.modalFavBtn.innerHTML = '<i class="fa-regular fa-heart"></i> Dodaj do ulubionych';
+      dom.modalFavBtn?.classList?.remove('active');
+      if (dom.modalFavBtn) dom.modalFavBtn.innerHTML = '<i class="fa-regular fa-heart"></i> Dodaj do ulubionych';
     }
     const currU = String(state.currentVideoDetails?.username || '').toLowerCase().trim();
     const isModelFav = state.favoriteAuthors && state.favoriteAuthors.has(currU);
