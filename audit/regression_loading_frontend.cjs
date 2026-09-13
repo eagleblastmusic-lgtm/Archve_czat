@@ -49,6 +49,65 @@ const load=(c,file)=>vm.runInContext(fs.readFileSync('static/'+file,'utf8'),c);
   await c.ArchivebateVideoViews.loadHomeVideos(1);
   assert.equal(calls,2,'A permanently expired snapshot must not recurse forever');
 
+  // A busy but healthy backend may exceed the former 12s full-page budget.
+  // The home handshake must accept a bounded first batch, then use the
+  // existing stream to replace it with the complete page.
+  const slowState={videos:[],currentPage:1,gridCardMap:new Map()};
+  const slowDom={videoGrid:element(),videoCount:element(),statPageVideos:element()};
+  const slow=env(slowState,slowDom);
+  let requestedTimeout=0; let feedStream=null;
+  slow.ArchivebateAPI={getJSON:async(url,options)=>{
+    requestedTimeout=options.timeoutMs;
+    await new Promise(resolve=>setTimeout(resolve,20));
+    return {
+      snapshot_id:'1',catalog_revision:1,revision:1,
+      videos:Array.from({length:16},(_,i)=>({id:`first_${i}`})),
+      complete:true,catalog_complete:true,page_complete:false,
+      video_count:280,group_count:280,page_count:1,has_more:false,updated_at:1
+    };
+  }};
+  slow.EventSource=class {
+    constructor(url){this.url=url;this.closed=false;feedStream=this;}
+    close(){this.closed=true;}
+  };
+  load(slow,'video-views.js');
+  await slow.ArchivebateVideoViews.loadHomeVideos(1);
+  assert(requestedTimeout>12000,'home handshake must not reuse the old 12s timeout');
+  assert.equal(slowState.videos.length,16,'first bounded batch should render immediately');
+  assert(!slowDom.videoCount.innerText.includes('Nie udało się załadować'),'healthy delayed response must not enter feed error state');
+  assert(feedStream && feedStream.url.includes('initial_items=16'),'home must continue through the existing feed stream');
+  feedStream.onmessage({data:JSON.stringify({
+    snapshot_id:'1',catalog_revision:1,revision:1,
+    videos:Array.from({length:280},(_,i)=>({id:`full_${i}`})),
+    complete:true,catalog_complete:true,page_complete:true,
+    video_count:280,group_count:280,page_count:1,has_more:false,updated_at:2
+  })});
+  await new Promise(resolve=>setTimeout(resolve,25));
+  assert.equal(slowState.videos.length,280,'stream must replace the bounded batch with the full page');
+  assert.equal(feedStream.closed,true);
+
+  // Transport failure after visible data is an error, but it must preserve
+  // the usable cards instead of replacing them with a false empty-view error.
+  feedStream=null;
+  await slow.ArchivebateVideoViews.loadHomeVideos(1,true);
+  assert(feedStream);
+  feedStream.onerror();
+  assert.equal(slowState.videos.length,16);
+  assert(slowDom.videoCount.innerText.includes('Nie udało się odświeżyć'));
+  assert(!slowDom.videoCount.innerText.includes('Nie udało się załadować'));
+
+  // A status timeout is availability information, not proof of an auth
+  // failure. It must not be rendered as the misleading "Błąd sesji" label.
+  const statusState={};
+  const statusDom={userEmail:element(),statusDot:element()};
+  const statusCtx={global:null,window:null,ArchivebateAppContext:{state:statusState,dom:statusDom},ArchivebateAPI:{getJSON:async()=>{throw Object.assign(new Error('slow'),{code:'timeout',status:408});}},setTimeout:fn=>{statusCtx._timers.push(fn);return fn;},clearTimeout(){},console,_timers:[]};
+  statusCtx.global=statusCtx; statusCtx.window=statusCtx;
+  vm.createContext(statusCtx); load(statusCtx,'account.js');
+  await statusCtx.ArchivebateAccount.initUserStatus();
+  for(let i=0;i<3;i++) await statusCtx._timers.shift()();
+  assert.equal(statusDom.userEmail.innerText,'Status chwilowo niedostępny');
+  assert.notEqual(statusDom.userEmail.innerText,'Błąd sesji');
+
   // Run the full modal module: immediate playback precedes slow details,
   // details do not restart it, retry bypasses stale prefetch data.
   const mState={};

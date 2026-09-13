@@ -94,7 +94,11 @@
         setTimeout(initUserStatus, 1500);
         return;
       }
-      dom.userEmail.innerText = 'Błąd sesji';
+      // A client-side timeout is a transport/liveness problem, not evidence
+      // that authentication failed. Keep the error visible without lying
+      // about the session; a later retry can still promote the real status.
+      dom.userEmail.innerText = 'Status chwilowo niedostępny';
+      dom.userEmail.title = 'Nie udało się odczytać lokalnego statusu. Spróbuj ponownie za chwilę.';
       dom.statusDot.classList.add('error');
     }
   }

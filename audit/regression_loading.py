@@ -66,4 +66,43 @@ with patch.object(requests.Session, 'request', side_effect=AssertionError('Exter
         resolve.assert_called_once_with('ttl-fixture')
         assert get.call_args.args[1] == fresh['direct_url']
 
+    # Status is local-only and must stay responsive even when the block
+    # projection contains the size seen in the live store. The old per-item
+    # scan made each library collection O(items * blocked_models).
+    with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as status_tmp:
+        status_store = main.storage.__class__(
+            store_file=Path(status_tmp) / 'status.json',
+            data_dir=status_tmp,
+            acquire_lock=False,
+        )
+        blocked = [f'blocked_{i}' for i in range(1941)]
+        status_store.data['blocked_models'] = blocked
+        status_store.data['favorites'] = [
+            {'id': f'fav_{i}', 'source': 'archivebate', 'username': 'blocked_0' if i == 0 else f'fav_{i}'}
+            for i in range(710)
+        ]
+        status_store.data['history'] = [
+            {'id': f'hist_{i}', 'source': 'archivebate', 'username': 'blocked_1' if i == 0 else f'hist_{i}'}
+            for i in range(624)
+        ]
+        status_store.data['following'] = [
+            {'id': f'follow_{i}', 'source': 'archivebate', 'username': f'follow_{i}'}
+            for i in range(758)
+        ]
+        original_store = main.storage
+        main.storage = status_store
+        try:
+            started = time.perf_counter()
+            response = TestClient(main.app).get('/api/status')
+            elapsed = time.perf_counter() - started
+            assert response.status_code == 200
+            status_data = response.json()
+            assert status_data['favorites_count'] == 709
+            assert status_data['history_count'] == 623
+            assert status_data['following_count'] == 758
+            assert elapsed < 1.0, f'local status filtering is too slow: {elapsed:.3f}s'
+        finally:
+            main.storage = original_store
+            status_store.close()
+
 print('PASS: legacy empty/populated migration, preserved items, restart, feed/stats/blocked endpoints, stale URL refreshed before connection')

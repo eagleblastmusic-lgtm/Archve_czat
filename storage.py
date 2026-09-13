@@ -11,7 +11,7 @@ import shutil
 import tempfile
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from cache_store import atomic_write_json
 from video_identity import VideoKey, strict_video_key
@@ -319,6 +319,24 @@ class UserStorage:
     def _norm_author(value: Any) -> str:
         return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
 
+    def _blocked_model_norms(self) -> Set[str]:
+        """Return the normalized block projection once for a read operation."""
+        normalized_values = set()
+        for value in self.data.get("blocked_models", []):
+            normalized = self._norm_author(value)
+            if normalized:
+                normalized_values.add(normalized)
+        return normalized_values
+
+    def _without_blocked_models(self, values: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        blocked = self._blocked_model_norms()
+        visible = []
+        for value in values:
+            normalized = self._norm_author(value.get("username"))
+            if not normalized or normalized not in blocked:
+                visible.append(value)
+        return visible
+
     @staticmethod
     def _strip_group_fields(video: Dict[str, Any]) -> Dict[str, Any]:
         return {
@@ -357,7 +375,7 @@ class UserStorage:
     def get_favorites(self, include_blocked: bool = True) -> List[Dict[str, Any]]:
         values = self.data.get("favorites", [])
         if not include_blocked:
-            values = [v for v in values if not self.is_model_blocked(v.get("username"))]
+            values = self._without_blocked_models(values)
         return _sort_items_newest(copy.deepcopy(values))
 
     def get_favorite_keys(self) -> List[Dict[str, str]]:
@@ -426,11 +444,12 @@ class UserStorage:
         return result
 
     def get_favorite_authors(self) -> List[str]:
+        blocked = self._blocked_model_norms()
         authors = {
             str(value.get("username")).lower().strip()
             for value in self.data.get("favorites", [])
             if value.get("username") and str(value.get("username")).lower().strip() not in {"model", ""}
-            and not self.is_model_blocked(value.get("username"))
+            and self._norm_author(value.get("username")) not in blocked
         }
         return sorted(authors)
 
@@ -438,7 +457,7 @@ class UserStorage:
     def get_history(self, include_blocked: bool = True) -> List[Dict[str, Any]]:
         values = self.data.get("history", [])
         if not include_blocked:
-            values = [v for v in values if not self.is_model_blocked(v.get("username"))]
+            values = self._without_blocked_models(values)
         return _sort_items_newest(copy.deepcopy(values))
 
     @_locked_method
@@ -463,7 +482,7 @@ class UserStorage:
     def get_following(self, include_blocked: bool = True) -> List[Dict[str, Any]]:
         values = self.data.get("following", [])
         if not include_blocked:
-            values = [v for v in values if not self.is_model_blocked(v.get("username"))]
+            values = self._without_blocked_models(values)
         return _sort_items_newest(copy.deepcopy(values))
 
     # SYNCHRONIZACJA
@@ -529,7 +548,7 @@ class UserStorage:
         norm = self._norm_author(username)
         if not norm:
             return False
-        return any(self._norm_author(value) == norm for value in self.data.get("blocked_models", []))
+        return norm in self._blocked_model_norms()
 
     @_locked_method
     def block_model(self, username: str, video_count: Optional[int] = None) -> dict:

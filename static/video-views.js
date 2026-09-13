@@ -175,6 +175,12 @@
 
   const HOME_PAGE_CACHE_LIMIT = 3;
   const HOME_PAGE_CACHE_TTL_MS = 90_000;
+  // The old 12s client budget covered a full 280-card response. The home
+  // handshake now asks the backend for a bounded first batch and continues on
+  // the existing SSE contract. Keep a route-specific ceiling for a healthy
+  // but busy local backend; the API client's global timeout stays unchanged.
+  const HOME_FEED_HANDSHAKE_TIMEOUT_MS = 30_000;
+  const HOME_INITIAL_ITEM_LIMIT = 16;
   const homePageCache = new Map();
   const homePagePrefetchInflight = new Map();
 
@@ -342,6 +348,7 @@
         state.lastAppliedFeedRevision = -1;
         state.lastAppliedFeedUpdatedAt = 0;
         state.lastAppliedFeedVideoCount = -1;
+        state.lastAppliedFeedPageComplete = true;
         state.lastAppliedVideosCount = 0;
       }
     } else {
@@ -367,8 +374,22 @@
     if (dom.pageJumpInput) dom.pageJumpInput.value = page;
     updateHomeStats();
 
-    const showFeedError = () => {
+    const showFeedError = ({ preserveVisible = false } = {}) => {
       if (generation !== state.viewGeneration) return;
+      const hasVisibleFeed = preserveVisible && Boolean(state.videos?.length || renderedFromPageCache);
+      if (hasVisibleFeed) {
+        if (dom.videoCount) dom.videoCount.innerText = 'Wyświetlam ostatni poprawny stan. Nie udało się odświeżyć katalogu.';
+        dom.videoGrid?.querySelectorAll('.skeleton-card').forEach(card => card.remove());
+        if (dom.videoGrid && !dom.videoGrid.querySelector('.feed-retry')) {
+          const retry = document.createElement('button');
+          retry.className = 'btn-card feed-retry feed-refresh-retry';
+          retry.textContent = 'Ponów odświeżanie katalogu';
+          retry.onclick = () => loadHomeVideos(page, true);
+          dom.videoGrid.appendChild(retry);
+        }
+        setFeedRefreshingIndicator(false);
+        return;
+      }
       if (dom.videoCount) dom.videoCount.innerText = 'Nie udało się załadować filmów. Ponów próbę.';
       dom.videoGrid?.querySelectorAll('.skeleton-card').forEach(card => card.remove());
       if (dom.videoGrid && !dom.videoGrid.querySelector('.feed-retry')) {
@@ -384,8 +405,11 @@
     try {
       const snapshot = !force && state.feedSpecKey === specKey ? state.feedSnapshotId : null;
       const revParam = !force && state.catalogRevision ? `&revision=${encodeURIComponent(state.catalogRevision)}` : '';
-      const params = `page=${page}&source=${src}&author_filter=${af}&group_authors=${grp}${force ? '&force_refresh=true' : ''}${revParam}`;
-      const data = await api().getJSON(`/api/feed?${params}${snapshot ? `&snapshot_id=${encodeURIComponent(snapshot)}` : ''}`, { timeoutMs: 12000, signal: controller.signal });
+      const initialItemsParam = !cachedPage && !isSamePageRefresh
+        ? `&initial_items=${HOME_INITIAL_ITEM_LIMIT}`
+        : '';
+      const params = `page=${page}&source=${src}&author_filter=${af}&group_authors=${grp}${force ? '&force_refresh=true' : ''}${revParam}${initialItemsParam}`;
+      const data = await api().getJSON(`/api/feed?${params}${snapshot ? `&snapshot_id=${encodeURIComponent(snapshot)}` : ''}`, { timeoutMs: HOME_FEED_HANDSHAKE_TIMEOUT_MS, signal: controller.signal });
       if (generation !== state.viewGeneration) return;
       state.feedSpecKey = specKey;
       state.feedSnapshotId = data.snapshot_id;
@@ -399,6 +423,7 @@
 
       const updateFeedCounters = d => {
         const isComplete = d.catalog_complete !== undefined ? d.catalog_complete : d.complete;
+        const pageComplete = d.page_complete !== false;
         const totalVids = d.video_count !== undefined ? d.video_count : (d.total_videos || d.known_count || 0);
         const totalGroups = d.group_count !== undefined ? d.group_count : totalVids;
         const pageCount = d.page_count || d.last_page || 1;
@@ -416,12 +441,14 @@
         if (dom.pageJumpInputTop) dom.pageJumpInputTop.max = pageCount;
 
         if (dom.videoCount) {
-          if (isComplete) {
+          if (isComplete && pageComplete) {
             if (state.groupByAuthor) {
               dom.videoCount.innerText = `${state.videos.length} na stronie • ${totalGroups.toLocaleString('pl-PL')} grup (${totalVids.toLocaleString('pl-PL')} nagrań) • strona ${page} z ${pageCount.toLocaleString('pl-PL')}`;
             } else {
               dom.videoCount.innerText = `${state.videos.length} na stronie • ${totalVids.toLocaleString('pl-PL')} nagrań • strona ${page} z ${pageCount.toLocaleString('pl-PL')}`;
             }
+          } else if (isComplete) {
+            dom.videoCount.innerText = `${state.videos.length} na stronie • Przygotowanie strony… (${totalVids.toLocaleString('pl-PL')} nagrań) • strona ${page}`;
           } else {
             dom.videoCount.innerText = `${state.videos.length} na stronie • Przygotowanie katalogu… (${totalVids.toLocaleString('pl-PL')} pozycji) • strona ${page}`;
           }
@@ -440,10 +467,12 @@
         const currentRev = batchData.catalog_revision !== undefined ? batchData.catalog_revision : batchData.revision;
         const incomingUpdatedAt = Number(batchData.updated_at || 0);
         const incomingVideoCount = Number(batchData.video_count !== undefined ? batchData.video_count : (batchData.known_count || 0));
+        const incomingPageComplete = batchData.page_complete !== false;
         const sameRevisionProgress = currentRev !== undefined && currentRev === state.lastAppliedFeedRevision && (
           incomingUpdatedAt > Number(state.lastAppliedFeedUpdatedAt || 0) ||
           incomingVideoCount > Number(state.lastAppliedFeedVideoCount ?? -1) ||
-          (!!batchData.catalog_complete && !state.catalogComplete)
+          (!!batchData.catalog_complete && !state.catalogComplete) ||
+          (incomingPageComplete && state.lastAppliedFeedPageComplete === false)
         );
         if (!isInitial && currentRev !== undefined && state.lastAppliedFeedRevision !== undefined && (
           currentRev < state.lastAppliedFeedRevision ||
@@ -452,7 +481,7 @@
           if (batchData.complete || batchData.stopped || batchData.type === 'source_error') {
             updateFeedCounters(batchData);
             setFeedRefreshingIndicator(false);
-            if (batchData.retryable || batchData.type === 'source_error') showFeedError();
+            if (batchData.retryable || batchData.type === 'source_error') showFeedError({ preserveVisible: true });
           }
           return;
         }
@@ -462,6 +491,7 @@
         state.lastAppliedFeedRevision = currentRev;
         state.lastAppliedFeedUpdatedAt = incomingUpdatedAt;
         state.lastAppliedFeedVideoCount = incomingVideoCount;
+        state.lastAppliedFeedPageComplete = incomingPageComplete;
         state.catalogRevision = currentRev;
         state.lastAppliedVideosCount = incomingVideos.length;
         state.videos = incomingVideos;
@@ -474,7 +504,7 @@
         state.totalCatalogVideos = batchData.video_count !== undefined ? batchData.video_count : batchData.known_count;
         state.catalogComplete = !!batchData.catalog_complete;
 
-        const pageComplete = batchData.complete || batchData.stopped || batchData.catalog_complete;
+        const pageComplete = batchData.page_complete !== false && (batchData.complete || batchData.stopped || batchData.catalog_complete);
         if (isInitial && !isSamePageRefresh && !renderedFromPageCache) {
           // Page transitions and the first app paint use chunked replacement:
           // the first 16 cards become visible immediately, the rest follow
@@ -488,7 +518,7 @@
         if (batchData.complete || batchData.stopped || batchData.catalog_complete) {
           setFeedRefreshingIndicator(false);
         }
-        if (batchData.retryable || batchData.type === 'source_error') showFeedError();
+        if (batchData.retryable || batchData.type === 'source_error') showFeedError({ preserveVisible: true });
       };
 
       const apply = (batchData, isInitial = false) => {
@@ -518,7 +548,8 @@
       // the paginator is used.
       prefetchNextPage();
       const catalogRevisionStream = data.catalog_complete === false && /^\d+$/.test(String(streamSnapshotId || ''));
-      if (data.refresh_pending || catalogRevisionStream || !data.complete) {
+      const pageNeedsStream = data.page_complete === false;
+      if (data.refresh_pending || catalogRevisionStream || !data.complete || pageNeedsStream) {
         const streamRevisionParam = streamRevision ? `&revision=${encodeURIComponent(streamRevision)}` : '';
         const stream = new EventSource(`/api/feed/stream?${params}${streamRevisionParam}&snapshot_id=${encodeURIComponent(streamSnapshotId)}`);
         state.activeSearchSource = stream;
@@ -528,13 +559,13 @@
           if (generation !== state.viewGeneration) return;
           stream.close();
           if (state.activeSearchSource === stream) state.activeSearchSource = null;
-          showFeedError();
+          showFeedError({ preserveVisible: true });
         }, 25000);
         stream.onmessage = event => {
           if (generation !== state.viewGeneration) { stream.close(); return; }
           let batch;
           try { batch = JSON.parse(event.data); }
-          catch (_) { clearTimeout(streamWatchdog); stream.close(); showFeedError(); return; }
+          catch (_) { clearTimeout(streamWatchdog); stream.close(); showFeedError({ preserveVisible: true }); return; }
           if ((batch.videos || batch.items || []).length || batch.catalog_complete || batch.stopped) {
             clearTimeout(streamWatchdog);
           }
@@ -546,7 +577,7 @@
             if (batch.type === 'source_error' && dom.videoCount) dom.videoCount.innerText += ' • źródło chwilowo niedostępne; odśwież widok';
           }
         };
-        stream.onerror = () => { clearTimeout(streamWatchdog); stream.close(); showFeedError(); };
+        stream.onerror = () => { clearTimeout(streamWatchdog); stream.close(); showFeedError({ preserveVisible: true }); };
       }
     } catch (e) {
       if (generation !== state.viewGeneration || e?.code === 'cancelled') return;
@@ -555,8 +586,12 @@
         state.catalogRevision = null;
         return loadHomeVideos(page, true);
       }
-      showFeedError();
-      triggerToast(e?.message || 'Błąd podczas pobierania filmów', 'error');
+      const preserveVisible = Boolean(state.videos?.length || renderedFromPageCache);
+      showFeedError({ preserveVisible });
+      triggerToast(
+        preserveVisible ? 'Nie udało się odświeżyć katalogu. Wyświetlam ostatni poprawny stan.' : (e?.message || 'Błąd podczas pobierania filmów'),
+        'error'
+      );
     } finally {
       if (generation === state.viewGeneration) {
         state.isLoading = false;

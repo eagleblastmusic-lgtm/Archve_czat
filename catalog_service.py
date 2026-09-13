@@ -724,9 +724,20 @@ class CatalogService:
         favorite_authors: Optional[List[str]] = None,
         favorite_ids: Optional[List[Any]] = None,
         enrich_fn: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
+        item_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Unified filtered query for count and items."""
+        """Unified filtered query for count and items.
+
+        ``item_limit`` is an optional first-paint bound. Counts, page geometry,
+        filters and the selected revision still describe the complete page;
+        only the number of materialized/enriched items is bounded. The feed
+        stream can subsequently request the full page without changing the
+        snapshot contract.
+        """
         ps = page_size or self.page_size
+        materialize_limit = None
+        if item_limit is not None:
+            materialize_limit = max(1, min(int(item_limit), ps))
         requested_revision = revision
 
         # File-backed reads must not queue behind the background writer.
@@ -844,7 +855,7 @@ class CatalogService:
                     ORDER BY published_at DESC, canonical_key ASC
                     LIMIT ? OFFSET ?
                     """,
-                    params + [ps, offset],
+                    params + [materialize_limit or ps, offset],
                 ).fetchall()
 
                 raw_items = [json.loads(r["raw_json"]) for r in item_rows]
@@ -887,7 +898,7 @@ class CatalogService:
                         ORDER BY pub DESC, canonical_key ASC
                         LIMIT ? OFFSET ?
                     """,
-                    params + [ps, offset],
+                    params + [materialize_limit or ps, offset],
                 ).fetchall()
 
                 # Fetch grouped members for every leader on this page in one query.
@@ -947,6 +958,10 @@ class CatalogService:
 
         has_more = page < page_count
         effective_known = total_groups if group_authors else total_videos
+        page_total = total_groups if group_authors else total_videos
+        page_offset = max(0, (page - 1) * ps)
+        expected_page_items = max(0, min(ps, page_total - page_offset))
+        page_complete = materialize_limit is None or len(items) >= expected_page_items
 
         return {
             "catalog_revision": rev,
@@ -963,6 +978,8 @@ class CatalogService:
             "indexing_progress": self._indexing_progress,
             "count": len(items),
             "target_count": ps,
+            "page_item_limit": materialize_limit,
+            "page_complete": page_complete,
             "known_count": effective_known,
             "has_more": has_more,
             "complete": is_complete,

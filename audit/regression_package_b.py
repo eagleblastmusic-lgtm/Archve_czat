@@ -205,6 +205,21 @@ def run_tests():
             assert len(d1["items"]) == 280
             assert d1["catalog_complete"] is True
 
+            # The home handshake may deliberately materialize only the first
+            # small batch; counts and revision semantics still describe the
+            # complete published page, while the existing SSE route can fill
+            # in the remainder.
+            resp_initial = client.get("/api/feed?page=1&initial_items=16")
+            assert resp_initial.status_code == 200, resp_initial.text
+            d_initial = resp_initial.json()
+            assert d_initial["catalog_revision"] == 1
+            assert d_initial["video_count"] == 721
+            assert d_initial["page_count"] == 3
+            assert len(d_initial["items"]) == 16
+            assert d_initial["page_item_limit"] == 16
+            assert d_initial["page_complete"] is False
+            assert d_initial["catalog_complete"] is True
+
             # GET /api/feed page 3 (last page jump)
             resp_p3 = client.get("/api/feed?page=3")
             assert resp_p3.status_code == 200

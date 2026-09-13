@@ -883,6 +883,10 @@ _feed_refresh_lock = threading.Lock()
 _feed_refreshing = set()
 HOME_FEED_FRESH_SECONDS = 90
 HOME_PAGE_SIZE = 280
+# The home view renders its first 16 cards synchronously and already has an
+# SSE path for the rest. Keep the first HTTP payload bounded under CPU pressure
+# instead of making the browser wait for enrichment of all 280 cards.
+HOME_INITIAL_ITEM_LIMIT = 16
 _catalog_bootstrap_lock = threading.Lock()
 _catalog_bootstrap_started = set()
 _catalog_bootstrap_active = set()
@@ -1275,10 +1279,14 @@ def progressive_feed(
     group_authors: str = "0",
     snapshot_id: Optional[str] = None,
     force_refresh: bool = False,
-    revision: Optional[int] = None
+    revision: Optional[int] = None,
+    initial_items: Optional[int] = Query(None, ge=1, le=32),
 ):
     from catalog_service import catalog_service
     revision = _coerce_optional_revision(revision)
+    initial_limit = _coerce_optional_revision(initial_items)
+    if initial_limit is not None:
+        initial_limit = min(initial_limit, HOME_INITIAL_ITEM_LIMIT)
     active_rev = _published_catalog_revision(catalog_service)
     if active_rev is None:
         _ensure_catalog_indexing(catalog_service)
@@ -1309,7 +1317,8 @@ def progressive_feed(
             blocked_models=blocked_models,
             favorite_authors=fav_authors,
             favorite_ids=fav_ids,
-            enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0")
+            enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0"),
+            item_limit=initial_limit,
         )
         result["refresh_revision"] = refresh_revision
         result["refresh_pending"] = bool(refresh_revision and refresh_revision != result.get("catalog_revision"))
@@ -1434,6 +1443,7 @@ def progressive_feed_stream(
                     data.get("video_count"),
                     data.get("group_count"),
                     data.get("page_count"),
+                    bool(data.get("page_complete")),
                     bool(data.get("catalog_complete")),
                     bool(progress.get("is_indexing")),
                     progress.get("error"),
