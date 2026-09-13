@@ -100,23 +100,148 @@
     persistUnavailableRegistry();
   }
 
+  function groupMemberArrays(video) {
+    if (!video || typeof video !== 'object') return [];
+    const arrays = [];
+    if (Array.isArray(video.grouped_videos)) arrays.push(video.grouped_videos);
+    if (Array.isArray(video._groupedVideos) && video._groupedVideos !== video.grouped_videos) arrays.push(video._groupedVideos);
+    return arrays;
+  }
+
+  function isGroupedAggregate(video) {
+    if (!video || typeof video !== 'object') return false;
+    const arrays = groupMemberArrays(video);
+    return Boolean(
+      video.is_grouped || video._isGrouped || video.group_members_lazy ||
+      Number(video.group_count || 0) > 1 || Number(video._groupCount || 0) > 1 ||
+      arrays.some(items => items.length > 1)
+    );
+  }
+
+  function pruneUnavailableGroupedMember(video, raw) {
+    if (!isGroupedAggregate(video)) return { grouped: false, changed: false, promoted: null };
+
+    const arrays = groupMemberArrays(video);
+    const knownIds = Array.isArray(video._unavailableMemberIds)
+      ? video._unavailableMemberIds.map(value => String(value || '').trim()).filter(Boolean)
+      : [];
+    const alreadyMarked = knownIds.includes(raw);
+    if (!alreadyMarked) knownIds.push(raw);
+
+    const uniqueMembers = [];
+    const seen = new Set();
+    for (const items of arrays) {
+      for (const member of items) {
+        const id = String(member?.id || '').trim();
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        uniqueMembers.push(member);
+      }
+    }
+
+    const memberWasPresent = uniqueMembers.some(member => String(member?.id || '').trim() === raw);
+    const leaderWasUnavailable = String(video.id || '').trim() === raw || isKnownUnavailableVideo(video.id);
+    if (!memberWasPresent && !leaderWasUnavailable && alreadyMarked) {
+      return { grouped: true, changed: false, promoted: null };
+    }
+
+    const keepMember = member => {
+      const id = String(member?.id || '').trim();
+      return Boolean(id) && id !== raw && !isKnownUnavailableVideo(id);
+    };
+    const remaining = uniqueMembers.filter(keepMember);
+
+    // Mutujemy istniejące tablice in-place. video-card.js trzyma do nich referencje
+    // w rozwijanej szufladzie, więc podmiana całej tablicy pozostawiałaby stare wpisy.
+    for (const items of arrays) {
+      const kept = items.filter(keepMember);
+      items.splice(0, items.length, ...kept);
+    }
+
+    const oldCount = Math.max(
+      1,
+      Number(video.group_count || 0),
+      Number(video._groupCount || 0),
+      uniqueMembers.length
+    );
+    const newCount = alreadyMarked ? oldCount : Math.max(1, oldCount - 1);
+
+    let promoted = null;
+    if (leaderWasUnavailable && remaining.length > 0) {
+      promoted = remaining[0];
+      const groupedVideosRef = Array.isArray(video.grouped_videos) ? video.grouped_videos : null;
+      const groupedVideosCompatRef = Array.isArray(video._groupedVideos) ? video._groupedVideos : null;
+      const groupMembersLazy = video.group_members_lazy;
+      const groupMembersUrl = video.group_members_url;
+      const revision = video.revision;
+      Object.assign(video, promoted);
+      if (groupedVideosRef) video.grouped_videos = groupedVideosRef;
+      if (groupedVideosCompatRef) video._groupedVideos = groupedVideosCompatRef;
+      if (groupMembersLazy !== undefined) video.group_members_lazy = groupMembersLazy;
+      if (groupMembersUrl !== undefined) video.group_members_url = groupMembersUrl;
+      if (revision !== undefined) video.revision = revision;
+    }
+
+    video.group_count = newCount;
+    video._groupCount = newCount;
+    video.is_grouped = newCount > 1;
+    video._isGrouped = newCount > 1;
+    video._unavailableMemberIds = knownIds;
+    video._representativeUnavailable = Boolean(leaderWasUnavailable && !promoted);
+
+    return {
+      grouped: true,
+      changed: !alreadyMarked || memberWasPresent || leaderWasUnavailable,
+      promoted
+    };
+  }
+
   function removeUnavailableCardInstances(videoId) {
     if (typeof document === 'undefined') return;
     const raw = String(videoId || '').trim();
     if (!raw) return;
 
+    const state = global.ArchivebateAppContext?.state || global.state;
+
     document.querySelectorAll('.video-card').forEach(card => {
       if (String(card?.dataset?.source || '').toLowerCase() !== 'archivebate') return;
+
+      const cardVideo = card?._videoData;
+      const groupedResult = pruneUnavailableGroupedMember(cardVideo, raw);
+      if (groupedResult.grouped && groupedResult.changed) {
+        // Najważniejsza zasada: awaria reprezentanta NIE usuwa całej grupy.
+        // Usuwamy tylko konkretny niedostępny element i, gdy mamy lokalnie
+        // kolejnego członka, promujemy go na miniaturkę/reprezentanta grupy.
+        if (groupedResult.promoted) {
+          card.dataset.videoId = String(cardVideo?.id || '');
+          card.dataset.source = String(cardVideo?.source || 'archivebate').toLowerCase();
+        }
+        if (typeof card._updateCard === 'function') {
+          try { card._updateCard(cardVideo, card._cardIndex); } catch (_) {}
+        }
+        return;
+      }
+
       if (String(card?.dataset?.videoId || '').trim() !== raw) return;
       const key = card._cardKey;
       try { card.remove(); } catch (_) {}
-      const state = global.ArchivebateAppContext?.state || global.state;
       if (key && state?.gridCardMap?.delete) state.gridCardMap.delete(key);
     });
 
-    const state = global.ArchivebateAppContext?.state || global.state;
     if (state && Array.isArray(state.videos)) {
-      state.videos = state.videos.filter(video => String(video?.id || '').trim() !== raw);
+      const nextVideos = [];
+      for (const video of state.videos) {
+        if (!video || typeof video !== 'object') continue;
+        const groupedResult = pruneUnavailableGroupedMember(video, raw);
+        if (groupedResult.grouped) {
+          // Zachowaj agregat: pozostałe 99 działających filmów nie mogą zniknąć
+          // tylko dlatego, że jeden reprezentant/element hostingu wygasł.
+          nextVideos.push(video);
+          continue;
+        }
+        if (String(video.id || '').trim() !== raw) nextVideos.push(video);
+      }
+      state.videos = nextVideos;
       const dom = global.ArchivebateAppContext?.dom || global.dom || {};
       if (dom.statPageVideos) dom.statPageVideos.textContent = String(state.videos.length);
     }
