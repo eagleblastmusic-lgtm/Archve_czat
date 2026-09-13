@@ -515,6 +515,9 @@
         }
         rememberHomePage(page, specKey, { ...batchData, videos: state.videos, items: state.videos });
         updateFeedCounters(batchData);
+        // Finish the visible page before spending SQL/thumbnail capacity on
+        // the next one. A bounded first batch still needs the SSE response.
+        if (pageComplete) prefetchNextPage();
         if (batchData.complete || batchData.stopped || batchData.catalog_complete) {
           setFeedRefreshingIndicator(false);
         }
@@ -543,10 +546,6 @@
       };
 
       apply(data, true);
-      // Prepare the most likely next click while the user is looking at the
-      // current page. JSON and the first posters will usually be warm before
-      // the paginator is used.
-      prefetchNextPage();
       const catalogRevisionStream = data.catalog_complete === false && /^\d+$/.test(String(streamSnapshotId || ''));
       const pageNeedsStream = data.page_complete === false;
       if (data.refresh_pending || catalogRevisionStream || !data.complete || pageNeedsStream) {

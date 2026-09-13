@@ -804,10 +804,15 @@ class CatalogService:
                     conds.append(f"author_clean NOT IN ({placeholders})")
                     params.extend(clean_fav)
                 if fav_keys:
-                    placeholders = " OR ".join("(source = ? AND video_id = ?)" for _ in fav_keys)
-                    conds.append(f"NOT ({placeholders})")
+                    # Scalar IN uses a lookup set in SQLite; composite NOT IN
+                    # scans every favorite for each catalog row on a miss.
+                    ids_by_source = {}
                     for key in fav_keys:
-                        params.extend([key.source, key.provider_id])
+                        ids_by_source.setdefault(key.source, []).append(key.provider_id)
+                    for fav_source, ids in ids_by_source.items():
+                        placeholders = ",".join("?" for _ in ids)
+                        conds.append(f"(source != ? OR video_id NOT IN ({placeholders}))")
+                        params.extend([fav_source, *ids])
                 if conds:
                     where_clauses.append(" AND ".join(conds))
 
@@ -821,8 +826,8 @@ class CatalogService:
                     conds.append(f"author_clean IN ({placeholders})")
                     params.extend(clean_fav)
                 if fav_keys:
-                    placeholders = " OR ".join("(source = ? AND video_id = ?)" for _ in fav_keys)
-                    conds.append(f"({placeholders})")
+                    placeholders = ",".join("(?, ?)" for _ in fav_keys)
+                    conds.append(f"(source, video_id) IN (VALUES {placeholders})")
                     for key in fav_keys:
                         params.extend([key.source, key.provider_id])
                 if conds:
@@ -908,7 +913,7 @@ class CatalogService:
                 grouped_authors = [
                     str(r["author_clean"] or "")
                     for r in leader_rows
-                    if int(r["grp_cnt"]) > 1
+                    if 1 < int(r["grp_cnt"]) <= GROUP_MEMBER_INLINE_LIMIT
                     and str(r["author_clean"] or "")
                     and str(r["author_clean"] or "") != "model"
                 ]
@@ -935,6 +940,20 @@ class CatalogService:
                         member_author = str(mr["author_clean"] or "")
                         member_map.setdefault(member_author, []).append(json.loads(mr["raw_json"]))
 
+                # Enrich one batch, not one per author: enrichment reads the
+                # same account projection each time. Preserve SQL membership
+                # and order even if the callback drops or reorders items.
+                if enrich_fn and member_map:
+                    enriched_members = {
+                        canonical_identity_key(v): v
+                        for v in enrich_fn([v for members in member_map.values() for v in members])
+                    }
+                    member_map = {
+                        author: [enriched_members[key] for v in members
+                                 if (key := canonical_identity_key(v)) in enriched_members]
+                        for author, members in member_map.items()
+                    }
+
                 items = []
                 for r in leader_rows:
                     v = json.loads(r["raw_json"])
@@ -944,7 +963,7 @@ class CatalogService:
                         v["is_grouped"] = True
                         v["group_count"] = g_cnt
                         members = member_map.get(author_clean, [dict(v)]) if g_cnt <= GROUP_MEMBER_INLINE_LIMIT else []
-                        v["grouped_videos"] = enrich_fn(members) if enrich_fn and members else members
+                        v["grouped_videos"] = members
                         v["group_members_lazy"] = g_cnt > GROUP_MEMBER_INLINE_LIMIT
                         v["group_members_url"] = f"/api/catalog/groups/{author_clean}/members" if g_cnt > GROUP_MEMBER_INLINE_LIMIT else None
                     else:

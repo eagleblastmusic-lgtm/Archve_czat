@@ -56,14 +56,16 @@ const load=(c,file)=>vm.runInContext(fs.readFileSync('static/'+file,'utf8'),c);
   const slowDom={videoGrid:element(),videoCount:element(),statPageVideos:element()};
   const slow=env(slowState,slowDom);
   let requestedTimeout=0; let feedStream=null;
+  const homeRequests=[];
   slow.ArchivebateAPI={getJSON:async(url,options)=>{
+    homeRequests.push(url);
     requestedTimeout=options.timeoutMs;
     await new Promise(resolve=>setTimeout(resolve,20));
     return {
       snapshot_id:'1',catalog_revision:1,revision:1,
       videos:Array.from({length:16},(_,i)=>({id:`first_${i}`})),
       complete:true,catalog_complete:true,page_complete:false,
-      video_count:280,group_count:280,page_count:1,has_more:false,updated_at:1
+      video_count:560,group_count:560,page_count:2,has_more:true,updated_at:1
     };
   }};
   slow.EventSource=class {
@@ -74,17 +76,19 @@ const load=(c,file)=>vm.runInContext(fs.readFileSync('static/'+file,'utf8'),c);
   await slow.ArchivebateVideoViews.loadHomeVideos(1);
   assert(requestedTimeout>12000,'home handshake must not reuse the old 12s timeout');
   assert.equal(slowState.videos.length,16,'first bounded batch should render immediately');
+  assert.equal(homeRequests.length,1,'next-page prefetch must wait for the visible page to finish');
   assert(!slowDom.videoCount.innerText.includes('Nie udało się załadować'),'healthy delayed response must not enter feed error state');
   assert(feedStream && feedStream.url.includes('initial_items=16'),'home must continue through the existing feed stream');
   feedStream.onmessage({data:JSON.stringify({
     snapshot_id:'1',catalog_revision:1,revision:1,
     videos:Array.from({length:280},(_,i)=>({id:`full_${i}`})),
     complete:true,catalog_complete:true,page_complete:true,
-    video_count:280,group_count:280,page_count:1,has_more:false,updated_at:2
+    video_count:560,group_count:560,page_count:2,has_more:true,updated_at:2
   })});
   await new Promise(resolve=>setTimeout(resolve,25));
   assert.equal(slowState.videos.length,280,'stream must replace the bounded batch with the full page');
   assert.equal(feedStream.closed,true);
+  assert(homeRequests.some(url=>url.includes('page=2')),'complete page should resume next-page prefetch');
 
   // Transport failure after visible data is an error, but it must preserve
   // the usable cards instead of replacing them with a false empty-view error.

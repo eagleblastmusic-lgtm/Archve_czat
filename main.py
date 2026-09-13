@@ -1385,7 +1385,8 @@ def progressive_feed_stream(
     if rev_to_check is not None and catalog_service.is_revision_complete(rev_to_check):
         async def direct_events():
             is_grouped = group_authors in (True, "1", "true", "True")
-            data = catalog_service.query_page(
+            data = await asyncio.to_thread(
+                catalog_service.query_page,
                 page=page,
                 page_size=HOME_PAGE_SIZE,
                 source=source,

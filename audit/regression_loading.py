@@ -3,6 +3,8 @@ import sqlite3
 import sys
 import tempfile
 import time
+import asyncio
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +16,20 @@ with patch.object(requests.Session, 'request', side_effect=AssertionError('Exter
     import main
     import catalog_service as catalog
     from fastapi.testclient import TestClient
+
+    # A completed catalog takes the direct SSE branch. Its SQL/enrichment
+    # must run off-loop so thumbnail and playback requests can be dispatched.
+    async def check_direct_stream_thread():
+        loop_thread = threading.get_ident()
+        def query(**kwargs):
+            assert threading.get_ident() != loop_thread, 'completed feed blocks the event loop'
+            return {'items': [], 'catalog_complete': True, 'page_complete': True}
+        with patch.object(catalog.catalog_service, 'is_revision_complete', return_value=True), patch.object(catalog.catalog_service, 'query_page', side_effect=query):
+            response = main.progressive_feed_stream(snapshot_id='1', page=1, revision=1)
+            event = await anext(response.body_iterator)
+            assert '"type": "complete"' in event
+            await response.body_iterator.aclose()
+    asyncio.run(check_direct_stream_thread())
 
     with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
         db = Path(tmp) / 'legacy.db'
