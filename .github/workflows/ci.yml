@@ -70,6 +70,8 @@ jobs:
         run: python audit/regression_archivebate_sparse_pagination.py
       - name: Deep Archivebate discovery regression
         run: python audit/regression_deep_archivebate.py
+      - name: V4.1 catalog concurrency regression
+        run: python audit/regression_catalog_v41.py
       - name: Camwhores sparse pagination regression
         run: python audit/regression_camwhores_sparse_pagination.py
       - name: Legacy resume cursor regression

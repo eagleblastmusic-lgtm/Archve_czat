@@ -101,7 +101,8 @@ class DeepArchivebateService:
                     total INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL,
-                    last_error TEXT
+                    last_error TEXT,
+                    retry_at REAL
                 )
                 """
             )
@@ -135,6 +136,9 @@ class DeepArchivebateService:
                 conn.execute("ALTER TABLE archivebate_models ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
             if "retry_at" not in model_columns:
                 conn.execute("ALTER TABLE archivebate_models ADD COLUMN retry_at REAL")
+            queue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(archivebate_discovery_queue)")}
+            if "retry_at" not in queue_columns:
+                conn.execute("ALTER TABLE archivebate_discovery_queue ADD COLUMN retry_at REAL")
 
     def close(self) -> None:
         with self._lock:
@@ -260,10 +264,12 @@ class DeepArchivebateService:
                 """
                 SELECT * FROM archivebate_discovery_queue
                 WHERE status IN ('pending', 'paging', 'retry')
+                  AND (retry_at IS NULL OR retry_at <= ?)
                 ORDER BY CASE status WHEN 'paging' THEN 0 WHEN 'retry' THEN 1 ELSE 2 END,
                          depth ASC, updated_at ASC, prefix ASC
                 LIMIT 1
-                """
+                """,
+                (time.time(),),
             ).fetchone()
             if not row:
                 return False
@@ -299,17 +305,17 @@ class DeepArchivebateService:
                             (child, depth + 1, now),
                         )
                     conn.execute(
-                        "UPDATE archivebate_discovery_queue SET status='split', total=?, last_page=?, attempts=attempts+1, updated_at=?, last_error=NULL WHERE prefix=?",
+                        "UPDATE archivebate_discovery_queue SET status='split', total=?, last_page=?, attempts=attempts+1, updated_at=?, last_error=NULL, retry_at=NULL WHERE prefix=?",
                         (total, last_page, now, prefix),
                     )
                 elif page >= last_page:
                     conn.execute(
-                        "UPDATE archivebate_discovery_queue SET status='done', total=?, last_page=?, next_page=?, attempts=attempts+1, updated_at=?, last_error=NULL WHERE prefix=?",
+                        "UPDATE archivebate_discovery_queue SET status='done', total=?, last_page=?, next_page=?, attempts=attempts+1, updated_at=?, last_error=NULL, retry_at=NULL WHERE prefix=?",
                         (total, last_page, page + 1, now, prefix),
                     )
                 else:
                     conn.execute(
-                        "UPDATE archivebate_discovery_queue SET status='paging', total=?, last_page=?, next_page=?, attempts=attempts+1, updated_at=?, last_error=NULL WHERE prefix=?",
+                        "UPDATE archivebate_discovery_queue SET status='paging', total=?, last_page=?, next_page=?, attempts=attempts+1, updated_at=?, last_error=NULL, retry_at=NULL WHERE prefix=?",
                         (total, last_page, page + 1, now, prefix),
                     )
                 self._progress["last_activity"] = now
@@ -320,9 +326,13 @@ class DeepArchivebateService:
                 conn = self._get_conn()
                 attempts = int(row["attempts"] or 0) + 1
                 terminal = attempts >= 8
+                failed_at = time.time()
+                retry_delay = min(300.0, 2.0 ** min(attempts, 8))
+                retry_at = None if terminal else failed_at + retry_delay
                 conn.execute(
-                    "UPDATE archivebate_discovery_queue SET status=?, attempts=?, updated_at=?, last_error=? WHERE prefix=?",
-                    ("error" if terminal else "retry", attempts, time.time(), str(exc), prefix),
+                    "UPDATE archivebate_discovery_queue "
+                    "SET status=?, attempts=?, updated_at=?, last_error=?, retry_at=? WHERE prefix=?",
+                    ("error" if terminal else "retry", attempts, failed_at, str(exc), retry_at, prefix),
                 )
                 self._progress["last_error"] = str(exc)
             return True
@@ -461,19 +471,10 @@ class DeepArchivebateService:
                 conn.execute("ROLLBACK")
                 return None
 
-            next_revision = int(
-                conn.execute(
-                    "SELECT COALESCE(MAX(revision), 0) AS revision FROM revisions"
-                ).fetchone()["revision"] or 0
-            ) + 1
-
-            conn.execute(
-                "INSERT INTO revisions("
-                "revision, created_at, updated_at, complete, is_active, failed, "
-                "video_count, error, published_hash, published_at"
-                ") VALUES(?, ?, ?, 0, 0, 0, 0, NULL, NULL, NULL)",
-                (next_revision, now, now),
-            )
+            # Use the same allocator as the normal catalog. BEGIN IMMEDIATE above
+            # serializes revision IDs across both independent SQLite connections.
+            from catalog_service import allocate_revision_in_transaction
+            next_revision = allocate_revision_in_transaction(conn, now=now)
 
             conn.execute(
                 """
@@ -653,9 +654,11 @@ class DeepArchivebateService:
                 """
                 SELECT * FROM archivebate_models
                 WHERE crawl_complete = 0
+                  AND (retry_at IS NULL OR retry_at <= ?)
                 ORDER BY priority DESC, pages_scanned DESC, updated_at ASC, model_key ASC
                 LIMIT 1
-                """
+                """,
+                (time.time(),),
             ).fetchone()
             if not row:
                 return False
@@ -670,9 +673,15 @@ class DeepArchivebateService:
                 error_text = result.error or result.status
                 with self._lock:
                     conn = self._get_conn()
+                    failed_at = time.time()
+                    retry_count = int(row["retry_count"] or 0) + 1
+                    retry_delay = max(
+                        float(result.retry_after or 0.0),
+                        min(300.0, 2.0 ** min(retry_count, 8)),
+                    )
                     conn.execute(
-                        "UPDATE archivebate_models SET retry_count=COALESCE(retry_count, 0)+1, retry_at=?, last_error=?, updated_at=? WHERE model_key=?",
-                        (time.time() + (result.retry_after or 1.0), error_text, time.time(), model_key),
+                        "UPDATE archivebate_models SET retry_count=?, retry_at=?, last_error=?, updated_at=? WHERE model_key=?",
+                        (retry_count, failed_at + retry_delay, error_text, failed_at, model_key),
                     )
                     self._progress["last_error"] = error_text
                 return True
@@ -733,9 +742,12 @@ class DeepArchivebateService:
         except Exception as exc:
             with self._lock:
                 conn = self._get_conn()
+                failed_at = time.time()
+                retry_count = int(row["retry_count"] or 0) + 1
+                retry_delay = min(300.0, 2.0 ** min(retry_count, 8))
                 conn.execute(
-                    "UPDATE archivebate_models SET last_error=?, updated_at=? WHERE model_key=?",
-                    (str(exc), time.time(), model_key),
+                    "UPDATE archivebate_models SET retry_count=?, retry_at=?, last_error=?, updated_at=? WHERE model_key=?",
+                    (retry_count, failed_at + retry_delay, str(exc), failed_at, model_key),
                 )
                 self._progress["last_error"] = str(exc)
             return True
