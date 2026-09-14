@@ -161,6 +161,7 @@ class CatalogService:
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute("PRAGMA cache_size = -64000")  # 64MB cache
             conn.execute("PRAGMA temp_store = MEMORY")
+            conn.execute("PRAGMA wal_autocheckpoint = 1000")
             self._conn = conn
         return self._conn
 
@@ -624,7 +625,11 @@ class CatalogService:
         return digest.hexdigest()
 
     def publish_revision(self, revision: int) -> bool:
-        """Atomically publish a revision unless a newer successful snapshot already exists."""
+        """Atomically publish a revision unless a newer successful snapshot already exists.
+
+        Full catalog revisions are staging snapshots. After a successful publish only
+        the active snapshot and one previous successful snapshot are retained.
+        """
         with self._lock:
             conn = self._get_conn()
             now = time.time()
@@ -640,40 +645,141 @@ class CatalogService:
                 if bool(current["complete"]) and not bool(current["failed"]):
                     conn.execute("COMMIT")
                     return bool(current["is_active"])
-                cnt = conn.execute("SELECT COUNT(*) AS total FROM catalog_items WHERE revision = ?", (revision,)).fetchone()["total"]
+
+                cnt = conn.execute(
+                    "SELECT COUNT(*) AS total FROM catalog_items WHERE revision = ?",
+                    (revision,),
+                ).fetchone()["total"]
+
                 newer = conn.execute(
                     "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 AND revision > ? "
                     "ORDER BY revision DESC LIMIT 1",
                     (revision,),
                 ).fetchone()
+
                 if newer:
-                    # A stale worker may finish after a newer snapshot was already published.
-                    # Keep its rows for diagnostics/history, but never roll the live feed backwards.
+                    # A stale worker finished after a newer successful snapshot.
+                    # Keep tiny revision metadata for diagnostics, but discard the
+                    # duplicated catalog payload.
+                    digest = self._revision_digest(conn, revision)
                     conn.execute(
                         "UPDATE revisions SET complete = 1, is_active = 0, failed = 0, error = NULL, "
                         "updated_at = ?, video_count = ?, published_hash = ?, published_at = ? WHERE revision = ?",
-                        (now, cnt, self._revision_digest(conn, revision), now, revision),
+                        (now, cnt, digest, now, revision),
+                    )
+                    conn.execute(
+                        "DELETE FROM catalog_items WHERE revision = ?",
+                        (revision,),
+                    )
+                    conn.execute(
+                        "DELETE FROM source_runs WHERE revision = ?",
+                        (revision,),
                     )
                     conn.execute("COMMIT")
                     return False
+
+                digest = self._revision_digest(conn, revision)
                 conn.execute("UPDATE revisions SET is_active = 0")
                 conn.execute(
-                    "UPDATE revisions SET complete = 1, is_active = 1, failed = 0, error = NULL, updated_at = ?, video_count = ?, published_hash = ?, published_at = ? WHERE revision = ?",
-                    (now, cnt, self._revision_digest(conn, revision), now, revision),
+                    "UPDATE revisions SET complete = 1, is_active = 1, failed = 0, error = NULL, "
+                    "updated_at = ?, video_count = ?, published_hash = ?, published_at = ? WHERE revision = ?",
+                    (now, cnt, digest, now, revision),
                 )
+
+                # Bound full-snapshot retention. This is the key protection against
+                # the historical 30+ million duplicate catalog rows.
+                try:
+                    keep_count = max(
+                        1,
+                        int(os.getenv("ARCHIVEBATE_CATALOG_REVISIONS_KEEP", "2")),
+                    )
+                except (TypeError, ValueError):
+                    keep_count = 2
+
+                completed_rows = conn.execute(
+                    "SELECT revision FROM revisions "
+                    "WHERE complete = 1 AND failed = 0 "
+                    "ORDER BY is_active DESC, published_at DESC, revision DESC"
+                ).fetchall()
+                keep_revisions = [
+                    int(row["revision"])
+                    for row in completed_rows[:keep_count]
+                ]
+                if revision not in keep_revisions:
+                    keep_revisions.insert(0, revision)
+
+                placeholders = ",".join("?" for _ in keep_revisions)
+                stale_rows = conn.execute(
+                    f"SELECT revision FROM revisions "
+                    f"WHERE complete = 1 AND failed = 0 AND is_active = 0 AND revision NOT IN ({placeholders})",
+                    keep_revisions,
+                ).fetchall()
+                stale_revisions = [int(row["revision"]) for row in stale_rows]
+
+                if stale_revisions:
+                    stale_placeholders = ",".join("?" for _ in stale_revisions)
+                    conn.execute(
+                        f"DELETE FROM catalog_items WHERE revision IN ({stale_placeholders})",
+                        stale_revisions,
+                    )
+                    conn.execute(
+                        f"DELETE FROM source_runs WHERE revision IN ({stale_placeholders})",
+                        stale_revisions,
+                    )
+                    conn.execute(
+                        f"DELETE FROM revisions WHERE revision IN ({stale_placeholders})",
+                        stale_revisions,
+                    )
+
                 conn.execute("COMMIT")
+
+                # Reclaim WAL sidecar pages without the cost/risk of VACUUM on
+                # every refresh. Freed DB pages remain reusable by SQLite.
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.OperationalError:
+                    pass
                 return True
             except Exception:
                 conn.execute("ROLLBACK")
                 raise
 
     def mark_revision_failed(self, revision: int, error_msg: str):
+        """Mark a revision failed; preserve resumable work, discard terminal payload."""
         with self._lock:
             conn = self._get_conn()
-            conn.execute(
-                "UPDATE revisions SET failed = 1, complete = 0, is_active = 0, error = ?, updated_at = ? WHERE revision = ?",
-                (error_msg, time.time(), revision),
-            )
+            recoverable = False
+            try:
+                recoverable = bool(self._is_recoverable_source_error(error_msg))
+            except Exception:
+                recoverable = False
+
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "UPDATE revisions SET failed = 1, complete = 0, is_active = 0, "
+                    "error = ?, updated_at = ? WHERE revision = ?",
+                    (error_msg, time.time(), revision),
+                )
+
+                # The newer catalog architecture can resume recoverable source errors
+                # from source_runs. Preserve those rows and their partial catalog.
+                # Terminal failures cannot be resumed, so their heavy payload is
+                # removed immediately.
+                if not recoverable:
+                    conn.execute(
+                        "DELETE FROM catalog_items WHERE revision = ?",
+                        (revision,),
+                    )
+                    conn.execute(
+                        "DELETE FROM source_runs WHERE revision = ?",
+                        (revision,),
+                    )
+
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     def _empty_query_page(self, page: int, page_size: int) -> Dict[str, Any]:
         return {
@@ -1403,6 +1509,44 @@ class CatalogService:
             if not force and "archivebate" in fetchers:
                 self._reopen_legacy_archivebate_cap_revision()
             active = self.get_active_revision()
+            # Deep/force refresh previously created a new full snapshot on every
+            # request. Coalesce repeated attempts, including recently FAILED attempts,
+            # so a failing Deep loop cannot fill the disk again.
+            if force and active is not None and self.is_revision_complete(active):
+                try:
+                    cooldown = max(
+                        0.0,
+                        float(
+                            os.getenv(
+                                "ARCHIVEBATE_CATALOG_FORCE_REFRESH_COOLDOWN_SECONDS",
+                                "1800",
+                            )
+                        ),
+                    )
+                except (TypeError, ValueError):
+                    cooldown = 1800.0
+
+                last_attempt_row = self._get_conn().execute(
+                    "SELECT MAX(updated_at) AS last_attempt FROM revisions"
+                ).fetchone()
+                last_attempt = float(
+                    last_attempt_row["last_attempt"] or 0.0
+                ) if last_attempt_row else 0.0
+
+                if cooldown > 0 and last_attempt > 0:
+                    age = max(0.0, time.time() - last_attempt)
+                    if age < cooldown:
+                        self._indexing_progress = {
+                            "is_indexing": False,
+                            "revision": active,
+                            "resumed": False,
+                            "source_progress": {},
+                            "error": None,
+                            "refresh_throttled": True,
+                            "refresh_retry_after": max(0.0, cooldown - age),
+                        }
+                        return active
+
             resumable = None if force else self.get_resumable_revision()
             if resumable is None and not force and active is not None and self.is_revision_complete(active):
                 return active

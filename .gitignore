@@ -27,3 +27,17 @@ audit/deep_fixture_*
 data/catalog.db
 data/catalog.db-wal
 data/catalog.db-shm
+
+# Archivebite local runtime data
+data/catalog.db
+data/catalog.db-wal
+data/catalog.db-shm
+data/user_store.json
+data/credentials.local.json
+.env.local
+
+# Local backups created during repairs
+*.bak_*
+*.db
+*.db-wal
+*.db-shm
