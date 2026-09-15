@@ -34,16 +34,12 @@ const vm = require('node:vm');
   vm.createContext(context);
   vm.runInContext(source, context, { filename: 'youtube-storyboard.js' });
 
-  // The same sprite URL must have one underlying Image load even when one
-  // consumer aborts. A surviving consumer must still resolve successfully.
   const api = context.window.ArchivebateYouTubeStoryboard;
   assert.ok(api, 'ArchivebateYouTubeStoryboard should be exported');
 
-  // Access preload indirectly through two ready segment loads so this test stays
-  // on the public contract instead of slicing private functions out of the file.
   let segmentStarts = 0;
   context.ArchivebateAPI = {
-    request: async (url, options = {}) => {
+    request: async (url) => {
       if (String(url).includes('/api/storyboard/demand')) {
         return { ok: true, json: async () => ({ ok: true }) };
       }
@@ -76,9 +72,17 @@ const vm = require('node:vm');
 
   firstAbort.abort();
   await assert.rejects(first, { name: 'AbortError' });
+
+  // Backend start and Image creation are asynchronous microtasks. Wait until the
+  // surviving consumer has reached sprite preload instead of asserting in the
+  // same tick as the abort.
+  for (let i = 0; i < 50 && images.length === 0; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
   assert.equal(segmentStarts, 1, 'same segment must share one backend start');
   assert.equal(images.length, 1, 'same sprite must share one Image load');
   images[0].onload();
+
   const board = await second;
   assert.equal(board.sprite_url, '/sprite');
 
