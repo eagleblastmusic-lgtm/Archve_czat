@@ -12,6 +12,7 @@
   const segmentMemory = new Map();
   const segmentInFlight = new Map();
   const activeTargetRequests = new Map();
+  const targetLeases = new Map();
   const recentTargets = new Map();
   const warmInFlight = new Map();
   const playbackPrewarmTimers = new WeakMap();
@@ -183,6 +184,44 @@
   function releaseLease(url) {
     if (!url) return;
     mutationRequest(url, { method: 'DELETE', keepalive: true }).catch(() => {});
+  }
+
+  // Keep one lease for the complete pointer-hover session, not only for the
+  // individual exact segment request. This gives the backend's directional
+  // neighbor prefetch enough lifetime to finish, while pointerleave/video switch
+  // still cancels it immediately through the same AbortSignal.
+  function ensureTargetLease(videoId, signal) {
+    if (!videoId || !signal || signal.aborted) return;
+    const previous = targetLeases.get(videoId);
+    if (previous && previous.signal === signal && !previous.released) return;
+    previous?.release?.();
+
+    const holder = {
+      signal,
+      url: '',
+      released: false,
+      release: null,
+    };
+    const release = () => {
+      if (holder.released) return;
+      holder.released = true;
+      signal.removeEventListener?.('abort', release);
+      if (holder.url) releaseLease(holder.url);
+      if (targetLeases.get(videoId) === holder) targetLeases.delete(videoId);
+    };
+    holder.release = release;
+    targetLeases.set(videoId, holder);
+    signal.addEventListener?.('abort', release, { once: true });
+
+    acquireLease(videoId, createConsumerToken('hover'), signal)
+      .then(url => {
+        holder.url = url;
+        if (holder.released || signal.aborted) releaseLease(url);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (holder.released && targetLeases.get(videoId) === holder) targetLeases.delete(videoId);
+      });
   }
 
   // QUICK is now cache-only from the UI. Cards may use an already prepared
@@ -360,6 +399,8 @@
       if (typeof onReady === 'function') onReady(cached);
       return cached;
     }
+
+    ensureTargetLease(videoId, signal);
 
     let active = activeTargetRequests.get(videoId);
     if (active && active.segmentIndex === segmentIndex && !active.controller.signal.aborted) {
@@ -579,6 +620,7 @@
       segment_cache_entries: segmentMemory.size,
       segment_inflight: segmentInFlight.size,
       active_target_requests: activeTargetRequests.size,
+      target_leases: targetLeases.size,
       preload_entries: preloadMemory.size,
       exact_ready_p50_ms: percentile(metrics.exactReadyMs, 0.50),
       exact_ready_p95_ms: percentile(metrics.exactReadyMs, 0.95),
