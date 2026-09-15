@@ -16,6 +16,15 @@
     let bufferedAhead = 0;
     try {
       bufferedAhead = Number(perf?.getBufferedAhead?.(video) || 0);
+      if (!bufferedAhead && video.buffered?.length) {
+        const current = Number(video.currentTime) || 0;
+        for (let i = 0; i < video.buffered.length; i += 1) {
+          if (video.buffered.start(i) <= current + 0.1 && video.buffered.end(i) >= current) {
+            bufferedAhead = Math.max(0, video.buffered.end(i) - current);
+            break;
+          }
+        }
+      }
     } catch (_) {}
     return {
       id: String(video.id || ''),
@@ -42,6 +51,8 @@
       has_camwhores_timeline_prefix: !!state?.currentTimelinePrefix,
       timeline_prefix: state?.currentTimelinePrefix ? String(state.currentTimelinePrefix) : '',
       timeline_count: Number(state?.currentTimelineCount || 0),
+      coarse_board_ready: !!state?.timelineSpriteBoard?.sprite_url,
+      coarse_board_frames: Number(state?.timelineSpriteBoard?.frame_count || 0),
       hover_controller_active: !!state?.timelineHoverController && !state.timelineHoverController.signal?.aborted,
       storyboard_api_loaded: !!globalThis.ArchivebateYouTubeStoryboard,
       storyboard_request_segment: typeof globalThis.ArchivebateYouTubeStoryboard?.requestSegment === 'function',
@@ -58,25 +69,35 @@
     }));
   }
 
-  async function serverStoryboardStats() {
+  async function fetchJSON(url) {
     try {
-      const response = await fetch('/api/diagnostics', { cache: 'no-store' });
+      const response = await fetch(url, { cache: 'no-store' });
       if (!response.ok) return { error: `HTTP ${response.status}` };
-      const data = await response.json();
-      return data?.jobs?.storyboard || null;
+      return await response.json();
     } catch (error) {
-      return { error: String(error?.message || error || 'diagnostics_failed') };
+      return { error: String(error?.message || error || 'request_failed') };
     }
+  }
+
+  async function serverStoryboardStats() {
+    const data = await fetchJSON('/api/diagnostics');
+    if (data?.error) return data;
+    return data?.jobs?.storyboard || null;
   }
 
   async function collect() {
     const perf = globalThis.ArchivebatePerf || null;
     const storyboard = globalThis.ArchivebateYouTubeStoryboard || null;
+    const fallback = globalThis.ArchivebateV43TimelineFallback || null;
     const clientStoryboard = typeof storyboard?.stats === 'function' ? storyboard.stats() : null;
-    const serverStoryboard = await serverStoryboardStats();
+    const fallbackStats = typeof fallback?.stats === 'function' ? fallback.stats() : null;
+    const [serverStoryboard, coarseServer] = await Promise.all([
+      serverStoryboardStats(),
+      fetchJSON('/api/runtime/v43/storyboard/stats'),
+    ]);
 
     return {
-      schema: 'archivebate-v43-live-report/2',
+      schema: 'archivebate-v43-live-report/3',
       generated_at: new Date().toISOString(),
       playback: {
         click_to_first_frame: percentiles(perf, 'total_click_to_first_frame_ms'),
@@ -88,8 +109,10 @@
         recent_sessions: recentPlaybackSessions(perf),
       },
       timeline: {
-        client: clientStoryboard,
-        server: serverStoryboard,
+        exact_client: clientStoryboard,
+        fallback: fallbackStats,
+        exact_server: serverStoryboard,
+        coarse_server: coarseServer,
       },
       player: activePlayerSnapshot(perf),
       context: activeContextSnapshot(),
@@ -101,8 +124,10 @@
     try {
       console.group('Archivebate V4.3 live gate');
       console.log('click -> first frame', report.playback.click_to_first_frame);
-      console.log('timeline client', report.timeline.client);
-      console.log('timeline server', report.timeline.server);
+      console.log('timeline exact client', report.timeline.exact_client);
+      console.log('timeline fallback', report.timeline.fallback);
+      console.log('timeline exact server', report.timeline.exact_server);
+      console.log('timeline coarse server', report.timeline.coarse_server);
       console.log('player', report.player);
       console.log('context', report.context);
       console.log(JSON.stringify(report, null, 2));
