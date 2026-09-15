@@ -90,7 +90,43 @@ const vm = require('node:vm');
   assert.equal(warm.sprite_url, '/sprite');
   assert.equal(segmentStarts, 1, 'warm cache must not restart backend work');
 
-  console.log('PASS: shared segment survives one consumer abort; image/backend work are deduplicated');
+  // `attach` may inspect an already cached QUICK board, but pointer-enter/play
+  // must not independently start an exact FFmpeg segment before playback has a
+  // useful buffer. The global buffered-playing prewarm path owns that decision.
+  let statusGets = 0;
+  context.fetch = async (url) => {
+    if (String(url).startsWith('/api/storyboard?')) {
+      statusGets += 1;
+      return { ok: true, json: async () => ({ status: 'missing' }) };
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  const handlers = new Map();
+  const fakeVideo = {
+    duration: 90,
+    currentTime: 10,
+    paused: true,
+    readyState: 0,
+    addEventListener(name, callback) { handlers.set(`video:${name}`, callback); }
+  };
+  const fakeTimeline = {
+    addEventListener(name, callback) { handlers.set(`timeline:${name}`, callback); }
+  };
+  const attachAbort = new AbortController();
+  api.attach({
+    video: fakeVideo,
+    videoId: 'attach-fixture',
+    timeline: fakeTimeline,
+    signal: attachAbort.signal,
+    onBoard: () => { throw new Error('missing QUICK board should not be delivered'); }
+  });
+  handlers.get('timeline:pointerenter')();
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(statusGets, 1, 'attach may perform one cache-only QUICK status lookup');
+  assert.equal(segmentStarts, 1, 'attach pointer-enter must not start exact segment work');
+  attachAbort.abort();
+
+  console.log('PASS: shared segment abort/dedupe works and attach cannot start unbuffered exact work');
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
