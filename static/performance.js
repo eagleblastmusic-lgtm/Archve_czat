@@ -116,9 +116,10 @@
   };
 
   function activateLocalIconFallback() {
-    const root = globalThis.document?.documentElement;
-    if (!root || root.classList.contains('archivebate-icon-fallback')) return;
-    const style = document.createElement('style');
+    const doc = globalThis.document;
+    const root = doc?.documentElement;
+    if (!doc || !root || root.classList.contains('archivebate-icon-fallback')) return;
+    const style = doc.createElement('style');
     style.id = 'archivebate-local-icon-fallback';
     const rules = [
       "html.archivebate-icon-fallback i.fa-solid::before,html.archivebate-icon-fallback i.fa-regular::before{font-family:'Segoe UI Symbol','Arial Unicode MS',sans-serif!important;font-style:normal!important;font-weight:700!important;display:inline-block!important;min-width:1em;text-align:center;line-height:1;content:'•'!important}",
@@ -130,39 +131,42 @@
       rules.push(`html.archivebate-icon-fallback i.${name}::before{content:'${safe}'!important}`);
     }
     style.textContent = rules.join('');
-    document.head.appendChild(style);
+    doc.head?.appendChild(style);
     root.classList.add('archivebate-icon-fallback');
   }
 
   async function fontAwesomeIsUsable() {
-    if (!globalThis.document?.body) return false;
-    const probe = document.createElement('i');
+    const doc = globalThis.document;
+    if (!doc?.body) return false;
+    const probe = doc.createElement('i');
     probe.className = 'fa-solid fa-house';
     probe.style.cssText = 'position:absolute;left:-9999px;top:-9999px;visibility:hidden';
-    document.body.appendChild(probe);
+    doc.body.appendChild(probe);
     try {
-      const pseudo = getComputedStyle(probe, '::before');
+      const pseudo = globalThis.getComputedStyle?.(probe, '::before');
       const content = String(pseudo?.content || '');
       const family = String(pseudo?.fontFamily || '');
       if (!content || content === 'none' || content === 'normal' || content === '""' || !/Font Awesome/i.test(family)) return false;
-      if (!document.fonts?.load) return true;
+      if (!doc.fonts?.load) return true;
       const loaded = await Promise.race([
-        document.fonts.load('900 16px "Font Awesome 6 Free"', '\uf015'),
+        doc.fonts.load('900 16px "Font Awesome 6 Free"', '\uf015'),
         new Promise(resolve => setTimeout(() => resolve([]), 450))
       ]);
       return Array.isArray(loaded) ? loaded.length > 0 : Boolean(loaded?.length);
     } catch (_) {
       return false;
     } finally {
-      probe.remove();
+      probe.remove?.();
     }
   }
 
   function scheduleIconFallbackCheck() {
+    const doc = globalThis.document;
+    if (!doc) return;
     const run = async () => {
       if (!(await fontAwesomeIsUsable())) activateLocalIconFallback();
     };
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => setTimeout(run, 120), { once: true });
+    if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', () => setTimeout(run, 120), { once: true });
     else setTimeout(run, 120);
   }
   scheduleIconFallbackCheck();
@@ -171,6 +175,8 @@
   // sixteen on first home paint so the visible rows fill quickly without the
   // old 280-request thumbnail burst.
   function installFirstScreenThumbnailBoost() {
+    const doc = globalThis.document;
+    if (!doc) return;
     const install = () => {
       const mod = globalThis.ArchivebateVideoPrefetch;
       if (!mod || typeof mod.armLazyThumbnail !== 'function' || mod.__v43FirstScreenBoost) return;
@@ -189,7 +195,7 @@
       };
       mod.__v43FirstScreenBoost = true;
     };
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', install, { once: true });
+    if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', install, { once: true });
     else install();
   }
   installFirstScreenThumbnailBoost();
@@ -383,7 +389,7 @@
           timeoutMs: 3000
         }).catch(() => {});
       } else if (typeof fetch === 'function') {
-        const token = document.querySelector('meta[name="archivebate-mutation-token"]')?.content || '';
+        const token = globalThis.document?.querySelector?.('meta[name="archivebate-mutation-token"]')?.content || '';
         fetch('/api/playback/status', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Archivebate-Mutation-Token': token } : {}) },
