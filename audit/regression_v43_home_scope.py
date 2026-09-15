@@ -15,6 +15,16 @@ EXPECTED_BLOBS = {
     "static/video-views.js": "ab7f9f2fc801006e4d3da4b336cce653588edf91",
 }
 
+# performance.js is shared by playback and the home screen, so V4.3 may keep
+# its tiny modal identity bridge but must not smuggle home/feed/icon/loading
+# experiments into this module again.
+FORBIDDEN_SHARED_RUNTIME_MARKERS = (
+    "__v43FullHomeFeed",
+    "searchParams.delete('initial_items')",
+    "archivebate-icon-fallback",
+    "__v43FirstScreenBoost",
+)
+
 
 def git_blob_sha(path: Path) -> str:
     data = path.read_bytes()
@@ -32,7 +42,15 @@ for filename, expected in EXPECTED_BLOBS.items():
     if actual != expected:
         mismatches.append(f"{filename}: expected {expected}, got {actual}")
 
+performance_source = Path("static/performance.js").read_text(encoding="utf-8")
+for marker in FORBIDDEN_SHARED_RUNTIME_MARKERS:
+    if marker in performance_source:
+        mismatches.append(f"static/performance.js: forbidden V4.3 home runtime marker {marker!r}")
+
 if mismatches:
     raise SystemExit("V4.3 home-scope violation:\n" + "\n".join(mismatches))
 
-print(f"PASS V4.3 HOME SCOPE: {len(EXPECTED_BLOBS)} home/feed/grid files are byte-identical to V4.2 master")
+print(
+    f"PASS V4.3 HOME SCOPE: {len(EXPECTED_BLOBS)} home/feed/grid files are byte-identical "
+    "to V4.2 master and shared performance.js contains no V4.3 home-loading overrides"
+)
