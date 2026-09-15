@@ -19,6 +19,7 @@
     } catch (_) {}
     return {
       id: String(video.id || ''),
+      dataset_video_id: String(video.dataset?.videoId || ''),
       paused: !!video.paused,
       ended: !!video.ended,
       seeking: !!video.seeking,
@@ -26,6 +27,24 @@
       current_time_s: Number((Number(video.currentTime) || 0).toFixed(3)),
       duration_s: Number.isFinite(Number(video.duration)) ? Number(Number(video.duration).toFixed(3)) : null,
       buffered_ahead_s: Number(bufferedAhead.toFixed(3)),
+    };
+  }
+
+  function activeContextSnapshot() {
+    const state = globalThis.ArchivebateAppContext?.state || globalThis.state || null;
+    const details = state?.currentVideoDetails || null;
+    const id = String(state?.currentVideoId || details?.id || '').trim();
+    const source = String(details?.source || '').trim() || (id.startsWith('cw_') ? 'camwhores' : 'archivebate');
+    return {
+      current_video_id: id,
+      current_details_id: String(details?.id || ''),
+      source,
+      has_camwhores_timeline_prefix: !!state?.currentTimelinePrefix,
+      timeline_prefix: state?.currentTimelinePrefix ? String(state.currentTimelinePrefix) : '',
+      timeline_count: Number(state?.currentTimelineCount || 0),
+      hover_controller_active: !!state?.timelineHoverController && !state.timelineHoverController.signal?.aborted,
+      storyboard_api_loaded: !!globalThis.ArchivebateYouTubeStoryboard,
+      storyboard_request_segment: typeof globalThis.ArchivebateYouTubeStoryboard?.requestSegment === 'function',
     };
   }
 
@@ -57,7 +76,7 @@
     const serverStoryboard = await serverStoryboardStats();
 
     return {
-      schema: 'archivebate-v43-live-report/1',
+      schema: 'archivebate-v43-live-report/2',
       generated_at: new Date().toISOString(),
       playback: {
         click_to_first_frame: percentiles(perf, 'total_click_to_first_frame_ms'),
@@ -73,6 +92,7 @@
         server: serverStoryboard,
       },
       player: activePlayerSnapshot(perf),
+      context: activeContextSnapshot(),
     };
   }
 
@@ -84,6 +104,7 @@
       console.log('timeline client', report.timeline.client);
       console.log('timeline server', report.timeline.server);
       console.log('player', report.player);
+      console.log('context', report.context);
       console.log(JSON.stringify(report, null, 2));
       console.groupEnd();
     } catch (_) {}
