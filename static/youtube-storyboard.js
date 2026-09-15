@@ -7,6 +7,7 @@
   const SEGMENT_DURATION = 30;
   const SEGMENT_MEMORY_LIMIT = 48;
   const QUICK_MEMORY_LIMIT = 24;
+  const HOVER_INTENT_MS = 140;
   const preloadMemory = new Map();
   const quickMemory = new Map();
   const segmentMemory = new Map();
@@ -24,6 +25,9 @@
     abortedConsumers: 0,
     targetSwitches: 0,
     prewarmRequests: 0,
+    intentScheduled: 0,
+    intentCancelled: 0,
+    hoverSessionCancels: 0,
     exactReadyMs: [],
     imageReadyMs: [],
   };
@@ -174,22 +178,53 @@
     return globalThis.crypto?.randomUUID?.() || `${prefix}-${Date.now()}-${Math.random()}`;
   }
 
+  function leaseUrl(videoId, consumer) {
+    return `/api/storyboard/demand?id=${encodeURIComponent(videoId)}&consumer=${encodeURIComponent(consumer)}`;
+  }
+
   async function acquireLease(videoId, consumer, signal) {
-    const url = `/api/storyboard/demand?id=${encodeURIComponent(videoId)}&consumer=${encodeURIComponent(consumer)}`;
-    const response = await mutationRequest(url, { method: 'POST', signal });
+    const url = leaseUrl(videoId, consumer);
+    // Do not abort the tiny localhost POST with the hover signal. If the server
+    // commits the lease while the browser aborts the response, the client would
+    // otherwise lose the token and leave a 45-second orphan lease behind.
+    const response = await mutationRequest(url, { method: 'POST' });
     if (!response.ok) throw new Error(`Storyboard demand HTTP ${response.status}`);
+    if (signal?.aborted) {
+      await releaseLease(url);
+      throw new DOMException('Aborted', 'AbortError');
+    }
     return url;
   }
 
   function releaseLease(url) {
-    if (!url) return;
-    mutationRequest(url, { method: 'DELETE', keepalive: true }).catch(() => {});
+    if (!url) return Promise.resolve();
+    return mutationRequest(url, { method: 'DELETE', keepalive: true }).catch(() => null);
+  }
+
+  function abortSegmentEntriesForVideo(videoId) {
+    for (const entry of segmentInFlight.values()) {
+      if (entry.videoId === videoId && !entry.controller.signal.aborted) entry.controller.abort();
+    }
+  }
+
+  function cancelWarmForVideo(videoId) {
+    for (const [key, holder] of warmInFlight.entries()) {
+      if (holder.videoId !== videoId) continue;
+      if (!holder.controller.signal.aborted) holder.controller.abort();
+      warmInFlight.delete(key);
+    }
+  }
+
+  function cancelVideoClientWork(videoId) {
+    cancelActiveTarget(videoId);
+    cancelWarmForVideo(videoId);
+    abortSegmentEntriesForVideo(videoId);
   }
 
   // Keep one lease for the complete pointer-hover session, not only for the
-  // individual exact segment request. This gives the backend's directional
-  // neighbor prefetch enough lifetime to finish, while pointerleave/video switch
-  // still cancels it immediately through the same AbortSignal.
+  // individual exact segment request. It is released on pointerleave. At that
+  // same lifecycle boundary we abort every local exact/prewarm consumer for the
+  // video so no unrelated playback-prewarm lease can keep stale hover FFmpeg alive.
   function ensureTargetLease(videoId, signal) {
     if (!videoId || !signal || signal.aborted) return;
     const previous = targetLeases.get(videoId);
@@ -205,7 +240,9 @@
     const release = () => {
       if (holder.released) return;
       holder.released = true;
+      metrics.hoverSessionCancels += 1;
       signal.removeEventListener?.('abort', release);
+      cancelVideoClientWork(videoId);
       if (holder.url) releaseLease(holder.url);
       if (targetLeases.get(videoId) === holder) targetLeases.delete(videoId);
     };
@@ -213,7 +250,7 @@
     targetLeases.set(videoId, holder);
     signal.addEventListener?.('abort', release, { once: true });
 
-    acquireLease(videoId, createConsumerToken('hover'), signal)
+    acquireLease(videoId, createConsumerToken('hover'))
       .then(url => {
         holder.url = url;
         if (holder.released || signal.aborted) releaseLease(url);
@@ -293,7 +330,7 @@
         }
         throw new Error('Przekroczono czas przygotowania segmentu');
       } finally {
-        releaseLease(entry.leaseUrl);
+        await releaseLease(entry.leaseUrl);
         if (segmentInFlight.get(key) === entry) segmentInFlight.delete(key);
       }
     })();
@@ -348,7 +385,9 @@
 
   function getSegmentFromCache(videoId, duration, targetTime) {
     const segmentIndex = Math.max(0, Math.floor((Number(targetTime) || 0) / SEGMENT_DURATION));
-    return lruGet(segmentMemory, segmentKey(videoId, duration, segmentIndex));
+    const cached = lruGet(segmentMemory, segmentKey(videoId, duration, segmentIndex));
+    if (cached) metrics.cacheHits += 1;
+    return cached;
   }
 
   function noteTarget(videoId, targetTime) {
@@ -379,6 +418,11 @@
     const active = activeTargetRequests.get(videoId);
     if (!active) return;
     activeTargetRequests.delete(videoId);
+    if (active.timer) {
+      clearTimeout(active.timer);
+      active.timer = null;
+      if (!active.started) metrics.intentCancelled += 1;
+    }
     active.unlink?.();
     if (!active.controller.signal.aborted) active.controller.abort();
   }
@@ -405,6 +449,7 @@
     let active = activeTargetRequests.get(videoId);
     if (active && active.segmentIndex === segmentIndex && !active.controller.signal.aborted) {
       active.onReady = typeof onReady === 'function' ? onReady : active.onReady;
+      active.targetTime = Number(targetTime) || 0;
       return null;
     }
 
@@ -417,22 +462,35 @@
     const unlink = linkAbort(signal, controller);
     active = {
       segmentIndex,
+      targetTime: Number(targetTime) || 0,
       controller,
       unlink,
       onReady: typeof onReady === 'function' ? onReady : null,
       promise: null,
+      timer: null,
+      started: false,
     };
     activeTargetRequests.set(videoId, active);
-    active.promise = prepareSegment({ videoId, duration, segmentIndex, signal: controller.signal })
-      .then(segment => {
-        if (!controller.signal.aborted && typeof active.onReady === 'function') active.onReady(segment);
-        return segment;
-      })
-      .catch(() => null)
-      .finally(() => {
-        if (activeTargetRequests.get(videoId) === active) activeTargetRequests.delete(videoId);
-        unlink();
-      });
+    metrics.intentScheduled += 1;
+
+    // Intent gate: crossing a segment while the pointer is still moving does
+    // not start FFmpeg. The timer is not reset while the pointer moves inside
+    // the same 30-second segment, so a real dwell still starts promptly.
+    active.timer = setTimeout(() => {
+      active.timer = null;
+      if (controller.signal.aborted || activeTargetRequests.get(videoId) !== active) return;
+      active.started = true;
+      active.promise = prepareSegment({ videoId, duration, segmentIndex, signal: controller.signal })
+        .then(segment => {
+          if (!controller.signal.aborted && typeof active.onReady === 'function') active.onReady(segment);
+          return segment;
+        })
+        .catch(() => null)
+        .finally(() => {
+          if (activeTargetRequests.get(videoId) === active) activeTargetRequests.delete(videoId);
+          unlink();
+        });
+    }, HOVER_INTENT_MS);
     return null;
   }
 
@@ -446,19 +504,21 @@
     const key = segmentKey(videoId, duration, segmentIndex);
     const cached = lruGet(segmentMemory, key);
     if (cached) return Promise.resolve(cached);
-    if (warmInFlight.has(key)) return warmInFlight.get(key);
+    const existing = warmInFlight.get(key);
+    if (existing) return existing.promise;
 
     metrics.prewarmRequests += 1;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
-    const promise = prepareSegment({ videoId, duration, segmentIndex, signal: controller.signal })
+    const holder = { videoId, controller, promise: null };
+    holder.promise = prepareSegment({ videoId, duration, segmentIndex, signal: controller.signal })
       .catch(() => null)
       .finally(() => {
         clearTimeout(timer);
-        if (warmInFlight.get(key) === promise) warmInFlight.delete(key);
+        if (warmInFlight.get(key) === holder) warmInFlight.delete(key);
       });
-    warmInFlight.set(key, promise);
-    return promise;
+    warmInFlight.set(key, holder);
+    return holder.promise;
   }
 
   function resolvePlaybackVideoId(video) {
@@ -617,8 +677,13 @@
       aborted_consumers: metrics.abortedConsumers,
       target_switches: metrics.targetSwitches,
       prewarm_requests: metrics.prewarmRequests,
+      intent_scheduled: metrics.intentScheduled,
+      intent_cancelled_before_start: metrics.intentCancelled,
+      hover_session_cancels: metrics.hoverSessionCancels,
+      hover_intent_ms: HOVER_INTENT_MS,
       segment_cache_entries: segmentMemory.size,
       segment_inflight: segmentInFlight.size,
+      warm_inflight: warmInFlight.size,
       active_target_requests: activeTargetRequests.size,
       target_leases: targetLeases.size,
       preload_entries: preloadMemory.size,
@@ -641,8 +706,10 @@
     requestSegment,
     prepareSegment,
     cancelActiveTarget,
+    cancelVideoClientWork,
     stats,
     SEGMENT_DURATION,
+    HOVER_INTENT_MS,
   };
 
   window.ArchivebateYouTubeStoryboard = api;
