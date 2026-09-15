@@ -49,14 +49,23 @@ vm.createContext(context);
 vm.runInContext(fs.readFileSync('static/video-views.js', 'utf8'), context);
 
 const cards = Array.from({ length: 280 }, (_, i) => ({ id: `v${i}`, username: 'fixture' }));
-context.ArchivebateAPI = { getJSON: async () => ({
-  snapshot_id: '1', catalog_revision: 1, revision: 1, videos: cards,
-  items: cards, complete: true, catalog_complete: false,
-  video_count: 280, group_count: 280, page_count: 1, has_more: true, updated_at: 1
-}) };
+let refreshCalls = 0;
+context.ArchivebateAPI = {
+  postJSON: async (url) => {
+    assert.equal(url, '/api/catalog/refresh', 'forced refresh must use the protected POST route');
+    refreshCalls += 1;
+    return { refresh_revision: 1, refresh_pending: true };
+  },
+  getJSON: async () => ({
+    snapshot_id: '1', catalog_revision: 1, revision: 1, videos: cards,
+    items: cards, complete: true, catalog_complete: false,
+    video_count: 280, group_count: 280, page_count: 1, has_more: true, updated_at: 1
+  })
+};
 
 (async () => {
   await context.ArchivebateVideoViews.loadHomeVideos(1, true);
+  assert.equal(refreshCalls, 1, 'forced refresh must issue exactly one POST');
   assert(eventSource, 'partial catalog must open a progress stream');
   assert.equal(eventSource.closed, false);
   eventSource.onmessage({ data: JSON.stringify({
@@ -75,5 +84,5 @@ context.ArchivebateAPI = { getJSON: async () => ({
   assert.equal(state.catalogRevision, 2, 'published revision must replace partial revision');
   assert.equal(state.catalogComplete, true);
   assert.equal(eventSource.closed, true);
-  console.log('PASS: partial catalog cards stream progress and switch to published revision');
+  console.log('PASS: partial catalog POST refresh streams progress and switches to published revision');
 })().catch(error => { console.error(error); process.exitCode = 1; });
