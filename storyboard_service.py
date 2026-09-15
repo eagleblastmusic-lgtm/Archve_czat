@@ -22,8 +22,10 @@ from cache_store import (
 )
 
 # V4.3: exact-segment-first storyboard scheduler.
-# Urgent hover work may preempt stale work for the same video. Two workers let an
-# urgent target run even when one background/prewarm task is already in FFmpeg.
+# - exact hover work is urgent and preemptible,
+# - a second worker is reserved for useful neighbor/prewarm work,
+# - stale generations are rejected before FFmpeg,
+# - GET status calls briefly wait on state changes instead of busy-polling.
 STORYBOARD_VERSION = 8
 FRAME_WIDTH = 160
 FRAME_HEIGHT = 90
@@ -36,8 +38,10 @@ WORKER_COUNT = 2
 QUEUE_CAPACITY = 96
 LEASE_SECONDS = 45.0
 DESIRED_TARGET_TTL = 3.0
+SEGMENT_STATUS_WAIT_SECONDS = 0.45
 
 _state_lock = threading.RLock()
+_state_changed = threading.Condition(_state_lock)
 _states: Dict[str, Dict[str, object]] = {}
 _leases: Dict[str, Dict[str, float]] = {}
 _desired_segments: Dict[str, Dict[str, object]] = {}
@@ -112,9 +116,14 @@ def runtime_stats() -> dict:
             if any(float(expiry) > now for expiry in entries.values())
         )
         desired = {
-            key: int(value.get("segment", -1))
+            key: {
+                "segment": int(value.get("segment", -1)),
+                "direction": int(value.get("direction", 0)),
+                "generation": int(value.get("generation", 0)),
+            }
             for key, value in _desired_segments.items()
             if now - float(value.get("updated", 0.0)) <= DESIRED_TARGET_TTL
+            or any(float(expiry) > now for expiry in (_leases.get(key) or {}).values())
         }
     return {
         "queue_size": _jobs.qsize(),
@@ -131,6 +140,7 @@ def runtime_stats() -> dict:
         "segment_ffmpeg_p95_ms": _percentile(_recent_segment_ms, 0.95),
         "queue_wait_p50_ms": _percentile(_recent_queue_wait_ms, 0.50),
         "queue_wait_p95_ms": _percentile(_recent_queue_wait_ms, 0.95),
+        "segment_status_wait_ms": int(SEGMENT_STATUS_WAIT_SECONDS * 1000),
         "auto_full_upgrade": False,
         "storyboard_version": STORYBOARD_VERSION,
     }
@@ -143,42 +153,63 @@ def _has_live_lease(video_id: str) -> bool:
         return any(float(expiry) > now for expiry in entries.values())
 
 
-def _set_desired_segment(video_id: str, segment_index: int) -> int:
+def _set_desired_segment_locked(video_id: str, segment_index: int) -> int:
     k = _key(video_id)
     now = time.monotonic()
+    previous = _desired_segments.get(k) or {}
+    previous_segment = previous.get("segment")
+    direction = int(previous.get("direction") or 0)
+    if previous_segment is not None and int(previous_segment) != int(segment_index):
+        direction = 1 if int(segment_index) > int(previous_segment) else -1
+    generation = int(previous.get("generation") or 0) + 1
+    _desired_segments[k] = {
+        "segment": int(segment_index),
+        "direction": direction,
+        "generation": generation,
+        "updated": now,
+    }
+    return generation
+
+
+def _set_desired_segment(video_id: str, segment_index: int) -> int:
     with _state_lock:
-        previous = _desired_segments.get(k) or {}
-        generation = int(previous.get("generation") or 0) + 1
-        _desired_segments[k] = {
-            "segment": int(segment_index),
-            "generation": generation,
-            "updated": now,
-        }
-        return generation
+        return _set_desired_segment_locked(video_id, segment_index)
+
+
+def _touch_desired_segment_locked(video_id: str, segment_index: int) -> Optional[int]:
+    value = _desired_segments.get(_key(video_id))
+    if not value or int(value.get("segment", -1)) != int(segment_index):
+        return None
+    value["updated"] = time.monotonic()
+    return int(value.get("generation") or 0)
 
 
 def _current_desired(video_id: str) -> Optional[dict]:
     now = time.monotonic()
+    k = _key(video_id)
     with _state_lock:
-        value = dict(_desired_segments.get(_key(video_id)) or {})
+        value = dict(_desired_segments.get(k) or {})
+        live = any(float(expiry) > now for expiry in (_leases.get(k) or {}).values())
     if not value:
         return None
-    if now - float(value.get("updated") or 0.0) > DESIRED_TARGET_TTL:
+    if not live and now - float(value.get("updated") or 0.0) > DESIRED_TARGET_TTL:
         return None
     return value
 
 
 def _job_is_superseded(video_id: str, segment_index: int, generation: int, priority: int) -> bool:
-    # Background prefetch is allowed unless the queue currently has a fresh urgent
-    # target for the same video. Urgent jobs are generation-bound and stale ones
-    # are skipped before they ever reach FFmpeg.
     desired = _current_desired(video_id)
     if not desired:
-        return False
-    desired_segment = int(desired.get("segment", -1))
+        return int(priority) > 0
+    current_generation = int(desired.get("generation", -1))
     if int(priority) <= 0:
-        return desired_segment != int(segment_index) or int(desired.get("generation", -1)) != int(generation)
-    return desired_segment != int(segment_index)
+        return (
+            int(desired.get("segment", -1)) != int(segment_index)
+            or current_generation != int(generation)
+        )
+    # Directional neighbor prefetch may target a different segment, but it is
+    # valid only while it belongs to the current urgent generation.
+    return current_generation != int(generation)
 
 
 def _preempt_active_for_target(video_id: str, segment_index: int) -> None:
@@ -341,9 +372,21 @@ def get_segment_status(video_id: str, duration: float, segment_index: int) -> di
     cached = _cached_segment(video_id, duration, segment_index)
     if cached:
         return {"status": "ready", **cached}
-    with _state_lock:
-        state = dict(_states.get(_segment_state_key(video_id, segment_index)) or {})
-    return state or {"status": "missing"}
+    state_key = _segment_state_key(video_id, segment_index)
+    with _state_changed:
+        state = dict(_states.get(state_key) or {})
+        if state.get("status") == "building":
+            _state_changed.wait_for(
+                lambda: (_states.get(state_key) or {}).get("status") != "building",
+                timeout=SEGMENT_STATUS_WAIT_SECONDS,
+            )
+            state = dict(_states.get(state_key) or {})
+    if state:
+        return state
+    cached = _cached_segment(video_id, duration, segment_index)
+    if cached:
+        return {"status": "ready", **cached}
+    return {"status": "missing"}
 
 
 def sprite_path(video_id: str, quality: str = "best", revision=None) -> Optional[Path]:
@@ -509,8 +552,8 @@ def _extract_segment_frames(
 
 
 def _extract_one(ffmpeg: str, source_url: str, target: float, output_path: Path, timeout: int) -> bool:
-    # Kept for compatibility with older tests/tools. Production V4.3 uses it only
-    # for the tiny quick fallback, never for exact segment hover work.
+    # Compatibility helper for the cache-only QUICK fallback. Production V4.3
+    # does not start cold QUICK generation from card hover.
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
         "-ss", f"{target:.3f}", "-i", source_url,
@@ -526,15 +569,13 @@ def _extract_one(ffmpeg: str, source_url: str, target: float, output_path: Path,
 
 
 def _build_variant(video_id: str, duration: float, source_url: str, quality: str) -> dict:
-    # V4.3 intentionally supports only QUICK in the active path. FULL is removed
-    # from scheduling: exact 1-fps segments are the high-resolution timeline.
     if quality != "quick":
         raise RuntimeError("FULL storyboard generation is disabled in V4.3")
     sprite_base, meta_path = _paths(video_id, quality)
     revision = str(time.time_ns())
     sprite_path_out = sprite_base.with_name(f"{sprite_base.stem}.{revision}.jpg")
     frame_count = QUICK_FRAMES
-    times = [
+    requested_times = [
         min(max(0.05, duration * ((i + 0.5) / frame_count)), max(0.05, duration - 0.12))
         for i in range(frame_count)
     ]
@@ -542,15 +583,12 @@ def _build_variant(video_id: str, duration: float, source_url: str, quality: str
     with tempfile.TemporaryDirectory(prefix="archivebate_storyboard_quick_") as tmp_dir:
         tmp = Path(tmp_dir)
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        # QUICK is low-priority fallback. Keep concurrency at one so it cannot
-        # fan out into eight simultaneous network seeks and compete with playback.
-        for i, target in enumerate(times):
+        for i, target in enumerate(requested_times):
             if not _has_live_lease(video_id):
                 break
             out = tmp / f"frame_{i:03d}.jpg"
             if _extract_one(ffmpeg, source_url, target, out, 12):
                 successful[i] = out
-            # The moment an exact hover target appears, stop spending time on QUICK.
             if _current_desired(video_id):
                 break
         if len(successful) < 4:
@@ -558,7 +596,10 @@ def _build_variant(video_id: str, duration: float, source_url: str, quality: str
         columns = QUICK_COLUMNS
         rows = int(math.ceil(frame_count / columns))
         sprite = Image.new("RGB", (columns * FRAME_WIDTH, rows * FRAME_HEIGHT), (12, 12, 12))
-        selected_indices = [i if i in successful else min(successful, key=lambda k: abs(k - i)) for i in range(frame_count)]
+        selected_indices = [
+            i if i in successful else min(successful, key=lambda k: abs(k - i))
+            for i in range(frame_count)
+        ]
         for i, source_idx in enumerate(selected_indices):
             with Image.open(successful[source_idx]) as frame:
                 frame = frame.convert("RGB")
@@ -578,7 +619,9 @@ def _build_variant(video_id: str, duration: float, source_url: str, quality: str
         "rows": int(math.ceil(frame_count / QUICK_COLUMNS)),
         "frame_width": FRAME_WIDTH,
         "frame_height": FRAME_HEIGHT,
-        "times": [round(times[i], 3) for i in selected_indices],
+        "times": [round(requested_times[i], 3) for i in selected_indices],
+        "requested_times": [round(value, 3) for value in requested_times],
+        "selected_indices": selected_indices,
         "approximate": True,
         "time_precision": "seek_target_not_decoded_pts",
         "created_at": revision,
@@ -660,7 +703,7 @@ def _build_segment(video_id: str, duration: float, segment_index: int, source_ur
 def demand(video_id: str, consumer: str, active: bool = True):
     k = _key(video_id)
     should_cancel = False
-    with _state_lock:
+    with _state_changed:
         now = time.monotonic()
         for old_key, old_entries in list(_leases.items()):
             for token, expiry in list(old_entries.items()):
@@ -677,7 +720,9 @@ def demand(video_id: str, consumer: str, active: bool = True):
             entries.pop(str(consumer), None)
             if not entries:
                 _leases.pop(k, None)
+                _desired_segments.pop(k, None)
                 should_cancel = True
+        _state_changed.notify_all()
     if should_cancel:
         _cancel_all_for_video(video_id)
 
@@ -697,6 +742,21 @@ def _ensure_workers() -> None:
             _worker_threads.append(thread)
             thread.start()
         _worker_started = True
+
+
+def _maybe_enqueue_directional_prefetch(video_id: str, duration: float, segment_index: int, source_url: str, generation: int) -> None:
+    desired = _current_desired(video_id)
+    if not desired or int(desired.get("generation", -1)) != int(generation):
+        return
+    if int(desired.get("segment", -1)) != int(segment_index):
+        return
+    direction = int(desired.get("direction") or 0)
+    if direction == 0 or not _has_live_lease(video_id):
+        return
+    neighbor = int(segment_index) + direction
+    if neighbor < 0 or float(neighbor) * SEGMENT_DURATION >= float(duration):
+        return
+    start_segment(video_id, duration, neighbor, source_url, force=False, priority=1)
 
 
 def _run_jobs():
@@ -720,44 +780,53 @@ def _run_jobs():
                 generation = int(job[8])
                 state_key = _segment_state_key(video_id, segment_index)
                 if not _has_live_lease(video_id) or _job_is_superseded(video_id, segment_index, generation, priority):
-                    with _state_lock:
-                        if _states.get(state_key, {}).get("status") == "building":
+                    with _state_changed:
+                        if (_states.get(state_key) or {}).get("status") == "building":
                             _states.pop(state_key, None)
+                        _state_changed.notify_all()
                     continue
                 try:
                     result = _build_segment(video_id, duration, segment_index, source_url, priority=priority)
-                    with _state_lock:
+                    with _state_changed:
                         _states[state_key] = {"status": "ready", **result}
+                        _state_changed.notify_all()
+                    if priority <= 0:
+                        _maybe_enqueue_directional_prefetch(video_id, duration, segment_index, source_url, generation)
                 except Exception as exc:
-                    # A preempted/superseded target is not a user-visible error.
-                    if _job_is_superseded(video_id, segment_index, generation, priority) or not _has_live_lease(video_id):
-                        with _state_lock:
+                    superseded = _job_is_superseded(video_id, segment_index, generation, priority)
+                    if superseded or not _has_live_lease(video_id):
+                        with _state_changed:
                             _states.pop(state_key, None)
+                            _state_changed.notify_all()
                     else:
-                        with _state_lock:
+                        with _state_changed:
                             _states[state_key] = {"status": "error", "error": str(exc), "finished_at": time.time()}
+                            _state_changed.notify_all()
                 continue
 
             quality = str(job[7])
             state_key = _state_key(video_id, duration)
             if not _has_live_lease(video_id):
-                with _state_lock:
+                with _state_changed:
                     _states.pop(state_key, None)
+                    _state_changed.notify_all()
                 continue
-            # Exact hover work always wins over QUICK fallback.
             if _current_desired(video_id):
-                with _state_lock:
+                with _state_changed:
                     _states.pop(state_key, None)
+                    _state_changed.notify_all()
                 continue
             try:
                 result = _build_variant(video_id, duration, source_url, quality)
-                with _state_lock:
+                with _state_changed:
                     _states[state_key] = {"status": "ready", **result, "upgrade_status": "disabled"}
+                    _state_changed.notify_all()
             except Exception as exc:
-                with _state_lock:
+                with _state_changed:
                     _states[state_key] = {
                         "status": "error", "error": str(exc), "finished_at": time.time(), "upgrade_status": "disabled"
                     }
+                    _state_changed.notify_all()
         finally:
             _jobs.task_done()
 
@@ -770,7 +839,7 @@ def start(video_id: str, duration: float, source_url: str, force: bool = False) 
     if cached and not force:
         return {"status": "ready", **cached, "upgrade_status": "disabled"}
     k = _state_key(video_id, duration)
-    with _state_lock:
+    with _state_changed:
         current = dict(_states.get(k) or {})
         if current.get("status") == "building":
             return current
@@ -781,6 +850,7 @@ def start(video_id: str, duration: float, source_url: str, force: bool = False) 
         state = {"status": "building", "stage": "quick", "upgrade_status": "disabled"}
         _states[k] = state
         _jobs.put_nowait((3, next(_sequence), time.monotonic(), video_id, duration, source_url, "variant", "quick"))
+        _state_changed.notify_all()
     _ensure_workers()
     return dict(state)
 
@@ -802,23 +872,26 @@ def start_segment(
     if cached and not force:
         return {"status": "ready", **cached}
 
-    generation = 0
-    if priority <= 0:
-        generation = _set_desired_segment(video_id, segment_index)
-        _preempt_active_for_target(video_id, segment_index)
-    else:
-        desired = _current_desired(video_id)
-        generation = int((desired or {}).get("generation") or 0)
-
     k_seg = _segment_state_key(video_id, segment_index)
-    with _state_lock:
+    should_preempt = False
+    with _state_changed:
         current = dict(_states.get(k_seg) or {})
         if current.get("status") == "building" and not force:
+            if priority <= 0:
+                _touch_desired_segment_locked(video_id, segment_index)
             return current
         if current.get("status") == "error" and not force and time.time() - float(current.get("finished_at") or 0) < 10:
             return current
         if _jobs.full():
             return {"status": "error", "error": "Storyboard queue is full"}
+
+        if priority <= 0:
+            generation = _set_desired_segment_locked(video_id, segment_index)
+            should_preempt = True
+        else:
+            desired = dict(_desired_segments.get(_key(video_id)) or {})
+            generation = int(desired.get("generation") or 0)
+
         state = {
             "status": "building",
             "type": "segment",
@@ -828,6 +901,10 @@ def start_segment(
         }
         _states[k_seg] = state
         _jobs.put_nowait((priority, next(_sequence), time.monotonic(), video_id, duration, source_url, "segment", segment_index, generation))
+        _state_changed.notify_all()
+
+    if should_preempt:
+        _preempt_active_for_target(video_id, segment_index)
     _ensure_workers()
     return dict(state)
 
@@ -858,9 +935,11 @@ def shutdown(timeout: float = 10.0) -> None:
             break
         else:
             _jobs.task_done()
-    with _state_lock:
+    with _state_changed:
         _states.clear()
         _desired_segments.clear()
+        _leases.clear()
+        _state_changed.notify_all()
     _worker_started = False
     _worker_threads = []
 
