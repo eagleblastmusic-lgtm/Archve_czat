@@ -41,9 +41,27 @@ jobs:
           p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
           PY
       - name: Apply V4.2 source transformations
+        shell: bash
         run: |
-          python tools/apply_v42_full.py
-          python tools/apply_v42_followup.py
+          set +e
+          {
+            python tools/apply_v42_full.py
+            rc=$?
+            if [ "$rc" -eq 0 ]; then
+              python tools/apply_v42_followup.py
+              rc=$?
+            fi
+            echo "APPLY_RC=$rc"
+            exit "$rc"
+          } > v42_apply.log 2>&1
+          rc=$?
+          cat v42_apply.log
+          if [ "$rc" -ne 0 ]; then
+            git add v42_apply.log
+            git commit -m "Record V4.2 executor failure"
+            git push origin HEAD:v4.2-security-runtime-hardening
+            exit "$rc"
+          fi
       - name: Resolve reproducible dependency lock
         run: |
           python -m pip install --upgrade pip pip-tools
@@ -64,6 +82,7 @@ jobs:
         run: python -m unittest test_suite -q
       - name: Commit applied V4.2 implementation
         run: |
+          rm -f v42_apply.log
           git add -A
           git status --short
           if git diff --cached --quiet; then
