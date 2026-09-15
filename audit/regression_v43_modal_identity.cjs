@@ -70,7 +70,8 @@ assert.match(fallbackSource, /getSegmentFromCache/);
 assert.match(fallbackSource, /Number\(mainVideo\.readyState \|\| 0\) < 2/);
 assert.match(fallbackSource, /timeline\.addEventListener\('pointerleave'/);
 assert.match(fallbackSource, /meta\.isLatest === false/);
-assert.doesNotMatch(fallbackSource, /cold QUICK/i, 'fallback must not re-enable cold QUICK generation');
+assert.doesNotMatch(fallbackSource, /requestSegment\s*\(/, 'dynamic fallback must not start exact FFmpeg jobs itself');
+assert.doesNotMatch(fallbackSource, /\/api\/storyboard\/segment/, 'dynamic fallback must use the media proxy, not cold storyboard generation');
 
 const runtimeSource = fs.readFileSync('runtime_app.py', 'utf8');
 assert.match(runtimeSource, /v43-timeline-fallback\.js/);
