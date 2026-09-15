@@ -59,151 +59,10 @@
   function setPlaybackBusy(value) { playbackBusy=!!value; drain(); }
   globalThis.document?.addEventListener('visibilitychange',drain);
 
-  // Home recovery: on a published SQLite catalog the browser should receive
-  // the complete 280-item page in the first response. The older 16-item
-  // handshake required an immediate SSE replacement and could cancel the
-  // deferred grid chunks before all cards reached the DOM. Keep the API itself
-  // generic; only the normal /api/feed JSON request is upgraded here.
-  function installHomeFeedFastPath() {
-    const api = globalThis.ArchivebateAPI;
-    if (!api || typeof api.getJSON !== 'function' || api.__v43FullHomeFeed) return;
-    const originalGetJSON = api.getJSON.bind(api);
-    api.getJSON = async (url, options = {}) => {
-      let requestUrl = url;
-      let isHomeFeed = false;
-      if (typeof url === 'string' && url.startsWith('/api/feed?') && !url.startsWith('/api/feed/stream?')) {
-        try {
-          const parsed = new URL(url, globalThis.location?.origin || 'http://127.0.0.1:8000');
-          if (parsed.pathname === '/api/feed') {
-            isHomeFeed = true;
-            parsed.searchParams.delete('initial_items');
-            requestUrl = `${parsed.pathname}${parsed.search}`;
-          }
-        } catch (_) {}
-      }
-      const data = await originalGetJSON(requestUrl, options);
-      if (isHomeFeed && data && typeof data === 'object' && data.catalog_complete === true && data.page_complete !== false) {
-        // A complete catalog page does not need a second EventSource round-trip.
-        data.complete = true;
-      }
-      return data;
-    };
-    api.__v43FullHomeFeed = true;
-  }
-  installHomeFeedFastPath();
-
-  // A fresh browser profile may not have the remote Font Awesome webfont in
-  // cache. Do not leave blank icon slots when cdnjs is slow/offline: after a
-  // short grace period switch only the icon glyphs to a tiny local symbol set.
-  // The external stylesheet remains asynchronous and therefore never blocks
-  // the first useful home render.
-  const FALLBACK_ICON_CONTENT = {
-    'fa-house': '⌂', 'fa-heart': '♥', 'fa-clock-rotate-left': '↶', 'fa-user-group': '●●',
-    'fa-circle-user': '●', 'fa-location-dot': '●', 'fa-magnifying-glass': '⌕', 'fa-xmark': '×',
-    'fa-rotate-right': '↻', 'fa-rotate-left': '↺', 'fa-rotate': '↻', 'fa-arrows-rotate': '↻',
-    'fa-tags': '#', 'fa-tag': '#', 'fa-user-tag': '#', 'fa-user-shield': '◆', 'fa-trash': '×',
-    'fa-file-export': '⇥', 'fa-file-import': '⇤', 'fa-stethoscope': '+', 'fa-film': '▣',
-    'fa-database': '▤', 'fa-users': '●●', 'fa-layer-group': '≡', 'fa-bookmark': '◆',
-    'fa-ban': '⊘', 'fa-bolt': '⚡', 'fa-chevron-left': '‹', 'fa-chevron-right': '›',
-    'fa-chevron-down': '⌄', 'fa-chevron-up': '⌃', 'fa-angles-right': '»', 'fa-angles-down': '⌄',
-    'fa-play': '▶', 'fa-pause': 'Ⅱ', 'fa-backward-step': '◀', 'fa-forward-step': '▶',
-    'fa-user-minus': '−', 'fa-user-plus': '+', 'fa-volume-high': '◖', 'fa-volume-xmark': '×',
-    'fa-clone': '▣', 'fa-expand': '⛶', 'fa-compress': '⊡', 'fa-video': '▶', 'fa-download': '↓',
-    'fa-arrow-up-right-from-square': '↗', 'fa-arrow-right': '→', 'fa-lock': '■', 'fa-eye': '◉',
-    'fa-calendar-days': '□', 'fa-star': '★', 'fa-tv': '▣', 'fa-folder': '▰', 'fa-folder-open': '▱',
-    'fa-circle-exclamation': '!', 'fa-triangle-exclamation': '!', 'fa-check': '✓', 'fa-plus': '+',
-    'fa-minus': '−', 'fa-spinner': '↻'
-  };
-
-  function activateLocalIconFallback() {
-    const doc = globalThis.document;
-    const root = doc?.documentElement;
-    if (!doc || !root || root.classList.contains('archivebate-icon-fallback')) return;
-    const style = doc.createElement('style');
-    style.id = 'archivebate-local-icon-fallback';
-    const rules = [
-      "html.archivebate-icon-fallback i.fa-solid::before,html.archivebate-icon-fallback i.fa-regular::before{font-family:'Segoe UI Symbol','Arial Unicode MS',sans-serif!important;font-style:normal!important;font-weight:700!important;display:inline-block!important;min-width:1em;text-align:center;line-height:1;content:'•'!important}",
-      "html.archivebate-icon-fallback i.fa-spin{animation:archivebateFallbackSpin 1s linear infinite}",
-      '@keyframes archivebateFallbackSpin{to{transform:rotate(360deg)}}'
-    ];
-    for (const [name, glyph] of Object.entries(FALLBACK_ICON_CONTENT)) {
-      const safe = String(glyph).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-      rules.push(`html.archivebate-icon-fallback i.${name}::before{content:'${safe}'!important}`);
-    }
-    style.textContent = rules.join('');
-    doc.head?.appendChild(style);
-    root.classList.add('archivebate-icon-fallback');
-  }
-
-  async function fontAwesomeIsUsable() {
-    const doc = globalThis.document;
-    if (!doc?.body) return false;
-    const probe = doc.createElement('i');
-    probe.className = 'fa-solid fa-house';
-    probe.style.cssText = 'position:absolute;left:-9999px;top:-9999px;visibility:hidden';
-    doc.body.appendChild(probe);
-    try {
-      const pseudo = globalThis.getComputedStyle?.(probe, '::before');
-      const content = String(pseudo?.content || '');
-      const family = String(pseudo?.fontFamily || '');
-      if (!content || content === 'none' || content === 'normal' || content === '""' || !/Font Awesome/i.test(family)) return false;
-      if (!doc.fonts?.load) return true;
-      const loaded = await Promise.race([
-        doc.fonts.load('900 16px "Font Awesome 6 Free"', '\uf015'),
-        new Promise(resolve => setTimeout(() => resolve([]), 450))
-      ]);
-      return Array.isArray(loaded) ? loaded.length > 0 : Boolean(loaded?.length);
-    } catch (_) {
-      return false;
-    } finally {
-      probe.remove?.();
-    }
-  }
-
-  function scheduleIconFallbackCheck() {
-    const doc = globalThis.document;
-    if (!doc) return;
-    const run = async () => {
-      if (!(await fontAwesomeIsUsable())) activateLocalIconFallback();
-    };
-    if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', () => setTimeout(run, 120), { once: true });
-    else setTimeout(run, 120);
-  }
-  scheduleIconFallbackCheck();
-
-  // The first eight card thumbnails are already eager. Promote only the next
-  // sixteen on first home paint so the visible rows fill quickly without the
-  // old 280-request thumbnail burst.
-  function installFirstScreenThumbnailBoost() {
-    const doc = globalThis.document;
-    if (!doc) return;
-    const install = () => {
-      const mod = globalThis.ArchivebateVideoPrefetch;
-      if (!mod || typeof mod.armLazyThumbnail !== 'function' || mod.__v43FirstScreenBoost) return;
-      const originalArm = mod.armLazyThumbnail.bind(mod);
-      let budget = 16;
-      mod.armLazyThumbnail = img => {
-        if (budget > 0 && img?.dataset?.src) {
-          budget -= 1;
-          img.loading = 'eager';
-          img.fetchPriority = 'auto';
-          img.src = img.dataset.src;
-          delete img.dataset.src;
-          return;
-        }
-        return originalArm(img);
-      };
-      mod.__v43FirstScreenBoost = true;
-    };
-    if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', install, { once: true });
-    else install();
-  }
-  installFirstScreenThumbnailBoost();
-
-  // V4.3 compatibility bridge: the modular modal stores the active video in
-  // currentVideoDetails, while exact storyboard hover/prewarm historically read
-  // currentVideoId. Synchronize the identity at the earliest media lifecycle
-  // event, before `playing` and before a user can hover the timeline.
+  // V4.3 compatibility bridge: the modal keeps the active item in
+  // currentVideoDetails, while storyboard prewarm/hover historically reads
+  // currentVideoId. This is intentionally the only V4.3 change in this shared
+  // performance module; home/feed/grid behavior stays identical to master.
   function bridgeModalVideoIdentity(video) {
     if (!video || video.id !== 'modalVideo') return '';
     const appState = globalThis.ArchivebateAppContext?.state || null;
@@ -389,7 +248,7 @@
           timeoutMs: 3000
         }).catch(() => {});
       } else if (typeof fetch === 'function') {
-        const token = globalThis.document?.querySelector?.('meta[name="archivebate-mutation-token"]')?.content || '';
+        const token = document.querySelector('meta[name="archivebate-mutation-token"]')?.content || '';
         fetch('/api/playback/status', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...(token ? { 'X-Archivebate-Mutation-Token': token } : {}) },
