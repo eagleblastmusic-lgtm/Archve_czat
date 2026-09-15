@@ -44,17 +44,13 @@ jobs:
         shell: bash
         run: |
           set +e
-          {
-            python tools/apply_v42_full.py
-            rc=$?
-            if [ "$rc" -eq 0 ]; then
-              python tools/apply_v42_followup.py
-              rc=$?
-            fi
-            echo "APPLY_RC=$rc"
-            exit "$rc"
-          } > v42_apply.log 2>&1
+          python tools/apply_v42_full.py > v42_apply.log 2>&1
           rc=$?
+          if [ "$rc" -eq 0 ]; then
+            python tools/apply_v42_followup.py >> v42_apply.log 2>&1
+            rc=$?
+          fi
+          echo "APPLY_RC=$rc" >> v42_apply.log
           cat v42_apply.log
           if [ "$rc" -ne 0 ]; then
             git add v42_apply.log
