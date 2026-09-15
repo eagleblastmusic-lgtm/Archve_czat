@@ -17,7 +17,7 @@ RUNTIME_ID = "v4.3-fast2"
 # of changing the V4.2/master HTML. It loads after the ordinary application
 # scripts and supplies a changing low-priority video frame only while an exact
 # storyboard segment is still cold.
-_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback.js?v=2"></script>'
+_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback.js?v=3"></script>'
 _original_versioned_html = _main._versioned_html
 
 
