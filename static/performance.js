@@ -59,12 +59,11 @@
   function setPlaybackBusy(value) { playbackBusy=!!value; drain(); }
   globalThis.document?.addEventListener('visibilitychange',drain);
 
-  // V4.3 browser-mode repair: Font Awesome is loaded with media="print" and an
-  // inline onload handler. V4.2 CSP intentionally blocks inline script, so in a
-  // normal browser the handler cannot switch the stylesheet to screen media and
-  // every <i class="fa-..."> stays blank. Switch it from our allowed self-hosted
-  // script and provide a tiny local glyph fallback when the CDN/webfont is slow
-  // or unavailable. This does not touch feed/grid loading.
+  // Browser mode: Font Awesome is declared as media="print" and was supposed
+  // to switch to screen via an inline onload handler. V4.2 CSP blocks inline
+  // handlers, so a normal browser can leave every FA icon blank. Repair the
+  // media value from this allowed self-hosted script. If the CDN/webfont still
+  // cannot load, use a small local glyph fallback rather than empty controls.
   const LOCAL_ICON_GLYPHS = {
     'fa-house': '⌂', 'fa-heart': '♥', 'fa-clock-rotate-left': '↶', 'fa-user-group': '●●',
     'fa-circle-user': '●', 'fa-location-dot': '●', 'fa-magnifying-glass': '⌕', 'fa-xmark': '×',
@@ -86,8 +85,9 @@
   function activateLocalIconFallback() {
     const doc = globalThis.document;
     const root = doc?.documentElement;
-    if (!doc || !root || root.classList.contains('archivebate-local-icons')) return;
-    const style = doc.createElement('style');
+    if (!doc || !root || root.classList?.contains?.('archivebate-local-icons')) return;
+    const style = doc.createElement?.('style');
+    if (!style) return;
     style.id = 'archivebate-local-icon-style';
     const rules = [
       "html.archivebate-local-icons i.fa-solid::before,html.archivebate-local-icons i.fa-regular::before{font-family:'Segoe UI Symbol','Arial Unicode MS',sans-serif!important;font-style:normal!important;font-weight:700!important;display:inline-block!important;min-width:1em;text-align:center;line-height:1;content:'•'!important}",
@@ -99,19 +99,20 @@
       rules.push(`html.archivebate-local-icons i.${name}::before{content:'${safe}'!important}`);
     }
     style.textContent = rules.join('');
-    doc.head?.appendChild(style);
-    root.classList.add('archivebate-local-icons');
+    doc.head?.appendChild?.(style);
+    root.classList?.add?.('archivebate-local-icons');
   }
 
   async function fontAwesomeUsable() {
     const doc = globalThis.document;
-    if (!doc?.body || typeof getComputedStyle !== 'function') return false;
-    const probe = doc.createElement('i');
+    if (!doc?.body || typeof globalThis.getComputedStyle !== 'function') return false;
+    const probe = doc.createElement?.('i');
+    if (!probe) return false;
     probe.className = 'fa-solid fa-house';
     probe.style.cssText = 'position:absolute;left:-10000px;top:-10000px;visibility:hidden';
-    doc.body.appendChild(probe);
+    doc.body.appendChild?.(probe);
     try {
-      const pseudo = getComputedStyle(probe, '::before');
+      const pseudo = globalThis.getComputedStyle(probe, '::before');
       const content = String(pseudo?.content || '');
       const family = String(pseudo?.fontFamily || '');
       if (!content || content === 'none' || content === 'normal' || content === '""' || !/Font Awesome/i.test(family)) return false;
@@ -124,89 +125,23 @@
     } catch (_) {
       return false;
     } finally {
-      probe.remove();
+      probe.remove?.();
     }
   }
 
   function repairBrowserIcons() {
     const doc = globalThis.document;
-    if (!doc) return;
+    if (!doc?.querySelectorAll) return;
     const link = Array.from(doc.querySelectorAll('link[rel="stylesheet"]'))
       .find(node => String(node.href || '').includes('font-awesome'));
-    if (link && String(link.media || '').toLowerCase() === 'print') {
-      link.media = 'all';
-    }
+    if (link && String(link.media || '').toLowerCase() === 'print') link.media = 'all';
     const check = () => setTimeout(async () => {
       if (!(await fontAwesomeUsable())) activateLocalIconFallback();
     }, 900);
-    if (doc.readyState === 'loading') doc.addEventListener('DOMContentLoaded', check, { once: true });
+    if (doc.readyState === 'loading') doc.addEventListener?.('DOMContentLoaded', check, { once: true });
     else check();
   }
   repairBrowserIcons();
-
-  // Passive home-load probe. It does not alter the feed or DOM; it only records
-  // when cards become visible and exposes resource timings so a real 8-second
-  // load can be split into backend/SSE/render/thumbnail costs instead of guessed.
-  const homeProbe = {
-    started_ms: performance.now(),
-    first_card_ms: null,
-    cards_16_ms: null,
-    cards_280_ms: null,
-    max_cards: 0
-  };
-
-  function setupHomeProbe() {
-    const doc = globalThis.document;
-    const grid = doc?.getElementById?.('videoGrid');
-    if (!grid || typeof MutationObserver === 'undefined') return;
-    const sample = () => {
-      const count = grid.querySelectorAll?.('.video-card')?.length || 0;
-      homeProbe.max_cards = Math.max(homeProbe.max_cards, count);
-      const t = performance.now();
-      if (count >= 1 && homeProbe.first_card_ms === null) homeProbe.first_card_ms = t;
-      if (count >= 16 && homeProbe.cards_16_ms === null) homeProbe.cards_16_ms = t;
-      if (count >= 280 && homeProbe.cards_280_ms === null) homeProbe.cards_280_ms = t;
-    };
-    sample();
-    const observer = new MutationObserver(sample);
-    observer.observe(grid, { childList: true });
-  }
-  if (globalThis.document?.readyState === 'loading') {
-    globalThis.document.addEventListener('DOMContentLoaded', setupHomeProbe, { once: true });
-  } else {
-    setupHomeProbe();
-  }
-
-  function getHomeLoadSnapshot() {
-    const nav = performance.getEntriesByType?.('navigation')?.[0] || null;
-    const resources = (performance.getEntriesByType?.('resource') || [])
-      .filter(entry => /\/api\/(feed|feed\/stream|thumb)|cdnjs\.cloudflare\.com/.test(String(entry.name || '')))
-      .map(entry => ({
-        name: String(entry.name || '').replace(globalThis.location?.origin || '', ''),
-        initiator: entry.initiatorType,
-        start_ms: Math.round(entry.startTime * 10) / 10,
-        response_start_ms: Math.round(entry.responseStart * 10) / 10,
-        end_ms: Math.round(entry.responseEnd * 10) / 10,
-        duration_ms: Math.round(entry.duration * 10) / 10,
-        transfer_size: Number(entry.transferSize || 0)
-      }));
-    const now = performance.now();
-    const currentCards = globalThis.document?.querySelectorAll?.('#videoGrid .video-card')?.length || 0;
-    return {
-      elapsed_ms: Math.round(now * 10) / 10,
-      cards: currentCards,
-      first_card_ms: homeProbe.first_card_ms === null ? null : Math.round(homeProbe.first_card_ms * 10) / 10,
-      cards_16_ms: homeProbe.cards_16_ms === null ? null : Math.round(homeProbe.cards_16_ms * 10) / 10,
-      cards_280_ms: homeProbe.cards_280_ms === null ? null : Math.round(homeProbe.cards_280_ms * 10) / 10,
-      max_cards: homeProbe.max_cards,
-      navigation: nav ? {
-        dom_content_loaded_ms: Math.round(nav.domContentLoadedEventEnd * 10) / 10,
-        load_event_ms: Math.round(nav.loadEventEnd * 10) / 10,
-        response_end_ms: Math.round(nav.responseEnd * 10) / 10
-      } : null,
-      resources
-    };
-  }
 
   // V4.3 compatibility bridge: the modal keeps the active item in
   // currentVideoDetails, while storyboard prewarm/hover historically reads
@@ -446,7 +381,6 @@
     calculatePercentiles,
     sessionHistory,
     bridgeModalVideoIdentity,
-    getHomeLoadSnapshot,
     getActiveSession: () => activeSession
   };
 })();
