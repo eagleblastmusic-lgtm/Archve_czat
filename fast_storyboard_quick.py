@@ -1,9 +1,9 @@
-"""V4.3 coarse storyboard accelerator.
+"""V4.3 playback-safe coarse storyboard accelerator.
 
-The precise 1-fps/30s segment path remains untouched.  This module only replaces
-QUICK storyboard generation with a low-resolution, persistent sprite built from
-parallel fast keyframe seeks.  It is installed before ``main`` imports the
-storyboard entry points, so browser and desktop use the same implementation.
+The precise 1-fps/30s segment path remains the authoritative hover source.  This
+module only builds a tiny persistent coarse sprite after primary playback is
+healthy.  Coarse work is intentionally easy to cancel and exact hover work always
+wins: an active desired exact segment cancels QUICK extraction immediately.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,17 +20,30 @@ from PIL import Image
 
 import storyboard_service as _sb
 
-QUICK_PARALLELISM = 4
-QUICK_FAST_TIMEOUT = 7
-QUICK_ACCURATE_TIMEOUT = 9
+# Four frames are enough to avoid a blank/static timeline while exact 1-fps
+# segments fill in locally.  Two parallel low-resolution seeks are a compromise
+# between first-build latency and not stealing four upstream connections from the
+# real player as the previous implementation did.
+QUICK_FRAME_COUNT = 4
+QUICK_PARALLELISM = 2
+QUICK_MIN_SUCCESS = 3
+QUICK_FAST_TIMEOUT = 5
+QUICK_ACCURATE_TIMEOUT = 7
 
 _installed = False
 _metrics_lock = threading.Lock()
 _quick_build_ms = []
 _quick_fast_hits = 0
 _quick_retry_hits = 0
+_quick_builds = 0
+_quick_cancelled = 0
+_quick_failures = 0
 
 _original_build_variant = _sb._build_variant
+
+
+class QuickCancelled(RuntimeError):
+    """Expected cancellation when playback/exact hover takes priority."""
 
 
 def _remember_ms(value: float) -> None:
@@ -48,20 +61,64 @@ def _percentile(values, p: float) -> float:
     return round(float(ordered[idx]), 2)
 
 
+def _cancel_requested(video_id: str) -> bool:
+    # Exact hover owns the machine/network budget.  The desired-target record is
+    # set before exact FFmpeg starts, so QUICK can stop before competing with it.
+    return (
+        _sb._worker_stop.is_set()
+        or not _sb._has_live_lease(video_id)
+        or bool(_sb._current_desired(video_id))
+    )
+
+
 def runtime_stats() -> dict:
     with _metrics_lock:
         samples = list(_quick_build_ms)
         fast_hits = int(_quick_fast_hits)
         retry_hits = int(_quick_retry_hits)
+        builds = int(_quick_builds)
+        cancelled = int(_quick_cancelled)
+        failures = int(_quick_failures)
+    with _sb._active_process_lock:
+        active_quick = sum(1 for info in _sb._active_processes.values() if info.get("kind") == "quick")
     return {
         "installed": bool(_installed),
+        "frame_count": QUICK_FRAME_COUNT,
         "parallelism": QUICK_PARALLELISM,
         "quick_build_p50_ms": _percentile(samples, 0.50),
         "quick_build_p95_ms": _percentile(samples, 0.95),
         "quick_build_samples": len(samples),
+        "quick_builds": builds,
+        "quick_cancelled": cancelled,
+        "quick_failures": failures,
+        "active_quick_processes": active_quick,
         "fast_keyframe_hits": fast_hits,
         "accurate_retry_hits": retry_hits,
+        "exact_preempts_quick": True,
     }
+
+
+def wait_status(video_id: str, duration: float, timeout: float = 1.2) -> dict:
+    """Long-poll QUICK state so the browser does not hammer localhost every 120 ms."""
+    duration = float(duration or 0)
+    cached = _sb._cached_variant(video_id, duration, "quick")
+    if cached:
+        return {"status": "ready", **cached, "upgrade_status": "disabled"}
+
+    key = _sb._state_key(video_id, duration)
+    with _sb._state_changed:
+        state = dict(_sb._states.get(key) or {})
+        if state.get("status") == "building" and timeout > 0:
+            _sb._state_changed.wait_for(
+                lambda: (_sb._states.get(key) or {}).get("status") != "building",
+                timeout=max(0.0, min(float(timeout), 2.0)),
+            )
+            state = dict(_sb._states.get(key) or {})
+
+    cached = _sb._cached_variant(video_id, duration, "quick")
+    if cached:
+        return {"status": "ready", **cached, "upgrade_status": "disabled"}
+    return state or {"status": "missing", "upgrade_status": "disabled"}
 
 
 def _run_one(
@@ -73,12 +130,15 @@ def _run_one(
     video_id: str,
     process_key: str,
     fast: bool,
-) -> bool:
+) -> str:
+    if _cancel_requested(video_id):
+        return "cancelled"
+
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
-    # QUICK is intentionally approximate.  Fast keyframe-only seeking avoids
-    # decoding long GOPs simply to paint a 160x90 hover thumbnail.
     cmd += ["-ss", f"{target:.3f}"]
     if fast:
+        # QUICK is intentionally approximate.  Keyframe-only input seeking keeps
+        # each request small and avoids decoding long GOPs for a 160x90 image.
         cmd += ["-noaccurate_seek", "-skip_frame", "nokey"]
     cmd += [
         "-i", source_url,
@@ -99,81 +159,142 @@ def _run_one(
             timeout=timeout,
             process_key=process_key,
             text=False,
-            cancel_check=lambda: _sb._worker_stop.is_set() or not _sb._has_live_lease(video_id),
+            cancel_check=lambda: _cancel_requested(video_id),
             video_id=video_id,
             kind="quick",
             segment_index=None,
             priority=3,
         )
     except Exception:
-        return False
-    return (
-        not cancelled
-        and returncode == 0
+        return "failed"
+
+    if cancelled or _cancel_requested(video_id):
+        return "cancelled"
+    if (
+        returncode == 0
         and output_path.exists()
         and output_path.stat().st_size > 350
         and _sb._valid_segment_frame(output_path)
+    ):
+        return "ok"
+    return "failed"
+
+
+def _fast_frame(ffmpeg, source_url, video_id, revision, index, target, out):
+    global _quick_fast_hits
+    status = _run_one(
+        ffmpeg,
+        source_url,
+        target,
+        out,
+        video_id=video_id,
+        process_key=f"{_sb._key(video_id)}:quick-fast:{index}:{revision}",
+        fast=True,
     )
-
-
-def _extract_quick_frame(ffmpeg: str, source_url: str, video_id: str, revision: str, index: int, target: float, out: Path):
-    global _quick_fast_hits, _quick_retry_hits
-    fast_key = f"{_sb._key(video_id)}:quick-fast:{index}:{revision}"
-    if _run_one(ffmpeg, source_url, target, out, video_id=video_id, process_key=fast_key, fast=True):
+    if status == "ok":
         with _metrics_lock:
             _quick_fast_hits += 1
-        return index, out
-    if not _sb._has_live_lease(video_id):
-        return index, None
-    retry_key = f"{_sb._key(video_id)}:quick-retry:{index}:{revision}"
-    if _run_one(ffmpeg, source_url, target, out, video_id=video_id, process_key=retry_key, fast=False):
+    return index, out if status == "ok" else None, status
+
+
+def _accurate_retry(ffmpeg, source_url, video_id, revision, index, target, out):
+    global _quick_retry_hits
+    status = _run_one(
+        ffmpeg,
+        source_url,
+        target,
+        out,
+        video_id=video_id,
+        process_key=f"{_sb._key(video_id)}:quick-retry:{index}:{revision}",
+        fast=False,
+    )
+    if status == "ok":
         with _metrics_lock:
             _quick_retry_hits += 1
-        return index, out
-    return index, None
+    return index, out if status == "ok" else None, status
 
 
-def _build_variant_parallel(video_id: str, duration: float, source_url: str, quality: str) -> dict:
+def _build_variant_playback_safe(video_id: str, duration: float, source_url: str, quality: str) -> dict:
+    global _quick_builds
     if quality != "quick":
         return _original_build_variant(video_id, duration, source_url, quality)
+    if _cancel_requested(video_id):
+        raise QuickCancelled("QUICK skipped because exact/playback work has priority")
 
+    with _metrics_lock:
+        _quick_builds += 1
     started = time.monotonic()
     sprite_base, meta_path = _sb._paths(video_id, quality)
     revision = str(time.time_ns())
     sprite_path_out = sprite_base.with_name(f"{sprite_base.stem}.{revision}.jpg")
-    frame_count = int(_sb.QUICK_FRAMES)
+    frame_count = QUICK_FRAME_COUNT
     requested_times = [
         min(max(0.05, duration * ((i + 0.5) / frame_count)), max(0.05, duration - 0.12))
         for i in range(frame_count)
     ]
     successful = {}
 
-    with tempfile.TemporaryDirectory(prefix="archivebate_storyboard_quick_parallel_") as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix="archivebate_storyboard_quick_safe_") as tmp_dir:
         tmp = Path(tmp_dir)
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        max_workers = max(1, min(QUICK_PARALLELISM, frame_count))
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="storyboard-quick") as pool:
+        with ThreadPoolExecutor(
+            max_workers=min(QUICK_PARALLELISM, frame_count),
+            thread_name_prefix="storyboard-quick",
+        ) as pool:
             futures = []
             for i, target in enumerate(requested_times):
                 out = tmp / f"frame_{i:03d}.jpg"
                 futures.append(pool.submit(
-                    _extract_quick_frame,
+                    _fast_frame,
                     ffmpeg, source_url, video_id, revision, i, target, out,
                 ))
+            cancelled = False
             for future in as_completed(futures):
                 try:
-                    index, path = future.result()
+                    index, path, status = future.result()
                 except Exception:
                     continue
+                if status == "cancelled":
+                    cancelled = True
                 if path is not None:
                     successful[index] = path
+            if cancelled or _cancel_requested(video_id):
+                for future in futures:
+                    future.cancel()
+                raise QuickCancelled("QUICK preempted by exact hover")
 
-        if len(successful) < 4:
-            raise RuntimeError(f"Parallel QUICK prepared only {len(successful)}/{frame_count} frames")
+        # Accurate retry is intentionally serial and stops as soon as there are
+        # enough unique frames.  The old implementation could launch an accurate
+        # retry for every miss, multiplying upstream traffic during playback.
+        if len(successful) < QUICK_MIN_SUCCESS:
+            for i, target in enumerate(requested_times):
+                if i in successful:
+                    continue
+                if _cancel_requested(video_id):
+                    raise QuickCancelled("QUICK retry preempted by exact hover")
+                out = tmp / f"frame_{i:03d}.jpg"
+                index, path, status = _accurate_retry(
+                    ffmpeg, source_url, video_id, revision, i, target, out,
+                )
+                if status == "cancelled":
+                    raise QuickCancelled("QUICK accurate retry cancelled")
+                if path is not None:
+                    successful[index] = path
+                if len(successful) >= QUICK_MIN_SUCCESS:
+                    break
 
-        columns = int(_sb.QUICK_COLUMNS)
-        rows = int(math.ceil(frame_count / columns))
-        sprite = Image.new("RGB", (columns * _sb.FRAME_WIDTH, rows * _sb.FRAME_HEIGHT), (12, 12, 12))
+        if len(successful) < QUICK_MIN_SUCCESS:
+            raise RuntimeError(
+                f"Playback-safe QUICK prepared only {len(successful)}/{frame_count} frames"
+            )
+
+        columns = frame_count
+        rows = 1
+        sprite = Image.new(
+            "RGB",
+            (columns * _sb.FRAME_WIDTH, rows * _sb.FRAME_HEIGHT),
+            (12, 12, 12),
+        )
         selected_indices = [
             i if i in successful else min(successful, key=lambda key: abs(key - i))
             for i in range(frame_count)
@@ -182,11 +303,21 @@ def _build_variant_parallel(video_id: str, duration: float, source_url: str, qua
             with Image.open(successful[source_idx]) as frame:
                 frame = frame.convert("RGB")
                 if frame.size != (_sb.FRAME_WIDTH, _sb.FRAME_HEIGHT):
-                    frame = frame.resize((_sb.FRAME_WIDTH, _sb.FRAME_HEIGHT), Image.Resampling.BILINEAR)
-                sprite.paste(frame, ((i % columns) * _sb.FRAME_WIDTH, (i // columns) * _sb.FRAME_HEIGHT))
+                    frame = frame.resize(
+                        (_sb.FRAME_WIDTH, _sb.FRAME_HEIGHT),
+                        Image.Resampling.BILINEAR,
+                    )
+                sprite.paste(frame, (i * _sb.FRAME_WIDTH, 0))
 
         tmp_sprite = sprite_path_out.with_suffix(".tmp.jpg")
-        sprite.save(tmp_sprite, format="JPEG", quality=70, optimize=False, progressive=False, subsampling=2)
+        sprite.save(
+            tmp_sprite,
+            format="JPEG",
+            quality=68,
+            optimize=False,
+            progressive=False,
+            subsampling=2,
+        )
         os.replace(tmp_sprite, sprite_path_out)
 
     meta = {
@@ -195,54 +326,45 @@ def _build_variant_parallel(video_id: str, duration: float, source_url: str, qua
         "video_id": str(video_id),
         "duration": float(duration),
         "frame_count": frame_count,
-        "columns": int(_sb.QUICK_COLUMNS),
-        "rows": int(math.ceil(frame_count / _sb.QUICK_COLUMNS)),
+        "columns": frame_count,
+        "rows": 1,
         "frame_width": _sb.FRAME_WIDTH,
         "frame_height": _sb.FRAME_HEIGHT,
         "times": [round(requested_times[i], 3) for i in selected_indices],
         "requested_times": [round(value, 3) for value in requested_times],
         "selected_indices": selected_indices,
         "approximate": True,
-        "time_precision": "parallel_fast_keyframe_seek",
+        "time_precision": "playback_safe_keyframe_seek",
         "created_at": revision,
         "sprite_file": sprite_path_out.name,
     }
     _sb.atomic_write_json(meta_path, meta)
     try:
-        _sb.trim_cache_directory(_sb.STORYBOARD_CACHE_DIR, max_bytes=500 * 1024 * 1024, preserve_suffixes=())
+        _sb.trim_cache_directory(
+            _sb.STORYBOARD_CACHE_DIR,
+            max_bytes=500 * 1024 * 1024,
+            preserve_suffixes=(),
+        )
     except Exception:
         pass
     _remember_ms((time.monotonic() - started) * 1000.0)
     return meta
 
 
-def _preempt_segments_only(video_id: str, segment_index: int) -> None:
-    """Exact hover may preempt stale exact work, but not the one-time coarse sprite."""
-    video_key = _sb._key(video_id)
-    victims = []
-    with _sb._active_process_lock:
-        for process_key, info in list(_sb._active_processes.items()):
-            if info.get("video_key") != video_key:
-                continue
-            if info.get("kind") == "quick":
-                continue
-            if info.get("kind") == "segment" and int(info.get("segment", -1)) == int(segment_index):
-                continue
-            proc = info.get("proc")
-            if proc is not None and proc.poll() is None:
-                _sb._preempted_processes.add(process_key)
-                victims.append(proc)
-        if victims:
-            _sb._preempted_count += len(victims)
-    for proc in victims:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+def _clear_state(state_key: str) -> None:
+    with _sb._state_changed:
+        _sb._states.pop(state_key, None)
+        _sb._state_changed.notify_all()
 
 
 def _run_jobs_v43():
-    """Baseline scheduler with one change: QUICK is allowed to finish beside exact work."""
+    """Baseline scheduler plus graceful QUICK cancellation.
+
+    Unlike the previous patch, QUICK does *not* survive an exact hover target.
+    Exact work keeps the original preemption semantics and QUICK cancellation is
+    cleared to `missing` instead of poisoning the state with a 30-second error.
+    """
+    global _quick_cancelled, _quick_failures
     while not _sb._worker_stop.is_set():
         try:
             job = _sb._jobs.get(timeout=0.20)
@@ -253,7 +375,10 @@ def _run_jobs_v43():
                 continue
             priority = int(job[0])
             queued_at = float(job[2])
-            _sb._remember_metric(_sb._recent_queue_wait_ms, (time.monotonic() - queued_at) * 1000.0)
+            _sb._remember_metric(
+                _sb._recent_queue_wait_ms,
+                (time.monotonic() - queued_at) * 1000.0,
+            )
             video_id = job[3]
             duration = float(job[4])
             source_url = job[5]
@@ -263,48 +388,73 @@ def _run_jobs_v43():
                 segment_index = int(job[7])
                 generation = int(job[8])
                 state_key = _sb._segment_state_key(video_id, segment_index)
-                if not _sb._has_live_lease(video_id) or _sb._job_is_superseded(video_id, segment_index, generation, priority):
+                if (
+                    not _sb._has_live_lease(video_id)
+                    or _sb._job_is_superseded(video_id, segment_index, generation, priority)
+                ):
                     with _sb._state_changed:
                         if (_sb._states.get(state_key) or {}).get("status") == "building":
                             _sb._states.pop(state_key, None)
                         _sb._state_changed.notify_all()
                     continue
                 try:
-                    result = _sb._build_segment(video_id, duration, segment_index, source_url, priority=priority)
+                    result = _sb._build_segment(
+                        video_id,
+                        duration,
+                        segment_index,
+                        source_url,
+                        priority=priority,
+                    )
                     with _sb._state_changed:
                         _sb._states[state_key] = {"status": "ready", **result}
                         _sb._state_changed.notify_all()
                     if priority <= 0:
-                        _sb._maybe_enqueue_directional_prefetch(video_id, duration, segment_index, source_url, generation)
+                        _sb._maybe_enqueue_directional_prefetch(
+                            video_id,
+                            duration,
+                            segment_index,
+                            source_url,
+                            generation,
+                        )
                 except Exception as exc:
-                    superseded = _sb._job_is_superseded(video_id, segment_index, generation, priority)
+                    superseded = _sb._job_is_superseded(
+                        video_id, segment_index, generation, priority
+                    )
                     if superseded or not _sb._has_live_lease(video_id):
-                        with _sb._state_changed:
-                            _sb._states.pop(state_key, None)
-                            _sb._state_changed.notify_all()
+                        _clear_state(state_key)
                     else:
                         with _sb._state_changed:
-                            _sb._states[state_key] = {"status": "error", "error": str(exc), "finished_at": time.time()}
+                            _sb._states[state_key] = {
+                                "status": "error",
+                                "error": str(exc),
+                                "finished_at": time.time(),
+                            }
                             _sb._state_changed.notify_all()
                 continue
 
             quality = str(job[7])
             state_key = _sb._state_key(video_id, duration)
-            if not _sb._has_live_lease(video_id):
-                with _sb._state_changed:
-                    _sb._states.pop(state_key, None)
-                    _sb._state_changed.notify_all()
+            if not _sb._has_live_lease(video_id) or _sb._current_desired(video_id):
+                _clear_state(state_key)
                 continue
             try:
                 result = _sb._build_variant(video_id, duration, source_url, quality)
                 with _sb._state_changed:
-                    _sb._states[state_key] = {"status": "ready", **result, "upgrade_status": "disabled"}
+                    _sb._states[state_key] = {
+                        "status": "ready",
+                        **result,
+                        "upgrade_status": "disabled",
+                    }
                     _sb._state_changed.notify_all()
+            except QuickCancelled:
+                with _metrics_lock:
+                    _quick_cancelled += 1
+                _clear_state(state_key)
             except Exception as exc:
-                if not _sb._has_live_lease(video_id):
-                    with _sb._state_changed:
-                        _sb._states.pop(state_key, None)
-                        _sb._state_changed.notify_all()
+                with _metrics_lock:
+                    _quick_failures += 1
+                if not _sb._has_live_lease(video_id) or _sb._current_desired(video_id):
+                    _clear_state(state_key)
                 else:
                     with _sb._state_changed:
                         _sb._states[state_key] = {
@@ -322,8 +472,10 @@ def install() -> None:
     global _installed
     if _installed:
         return
-    _sb._build_variant = _build_variant_parallel
-    _sb._preempt_active_for_target = _preempt_segments_only
+    _sb._build_variant = _build_variant_playback_safe
     _sb._run_jobs = _run_jobs_v43
+    # Keep the historical marker for compatibility with existing diagnostics,
+    # and add a more precise marker for the repaired architecture.
     _sb._v43_parallel_quick_installed = True
+    _sb._v43_playback_safe_quick_installed = True
     _installed = True
