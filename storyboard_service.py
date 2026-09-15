@@ -202,14 +202,21 @@ def _job_is_superseded(video_id: str, segment_index: int, generation: int, prior
     if not desired:
         return int(priority) > 0
     current_generation = int(desired.get("generation", -1))
+    current_segment = int(desired.get("segment", -1))
     if int(priority) <= 0:
-        return (
-            int(desired.get("segment", -1)) != int(segment_index)
-            or current_generation != int(generation)
-        )
-    # Directional neighbor prefetch may target a different segment, but it is
-    # valid only while it belongs to the current urgent generation.
-    return current_generation != int(generation)
+        return current_segment != int(segment_index) or current_generation != int(generation)
+    if current_generation != int(generation):
+        return True
+    # Background work is allowed only for the current target itself or for the
+    # single directional neighbor predicted by the latest real cursor movement.
+    # This prevents an arbitrary same-generation background segment from
+    # occupying the second FFmpeg worker.
+    if int(segment_index) == current_segment:
+        return False
+    direction = int(desired.get("direction") or 0)
+    if direction == 0:
+        return True
+    return int(segment_index) != current_segment + direction
 
 
 def _preempt_active_for_target(video_id: str, segment_index: int) -> None:
