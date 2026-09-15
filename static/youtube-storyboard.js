@@ -459,9 +459,13 @@
       attempts += 1;
       const bufferedAhead = Number(globalThis.ArchivebatePerf?.getBufferedAhead?.(video) || 0);
       const ready = Number(video.readyState || 0) >= 3 && bufferedAhead >= 2.0;
-      if (!ready && attempts < 6) {
-        const timer = setTimeout(check, 350);
-        playbackPrewarmTimers.set(video, timer);
+      if (!ready) {
+        if (attempts < 6) {
+          const timer = setTimeout(check, 350);
+          playbackPrewarmTimers.set(video, timer);
+        } else {
+          playbackPrewarmTimers.delete(video);
+        }
         return;
       }
       playbackPrewarmTimers.delete(video);
