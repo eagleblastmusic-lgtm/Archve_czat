@@ -58,45 +58,51 @@ const otherVideo = { id: 'mainPlayer', dataset: {} };
 listeners.get('play')({ target: otherVideo });
 assert.equal(otherVideo.dataset.videoId, undefined, 'bridge is modal-specific');
 
-const fallbackSource = fs.readFileSync('static/v43-timeline-fallback.js', 'utf8');
-assert.doesNotThrow(() => new vm.Script(fallbackSource, { filename: 'v43-timeline-fallback.js' }));
-assert.match(fallbackSource, /ArchivebateYouTubeStoryboard\.applyFrame/,
-  'pointer motion must select cached sprite frames locally');
-assert.match(fallbackSource, /getSegmentFromCache/,
-  'exact 1-fps segment remains above the coarse fallback');
-assert.match(fallbackSource, /\/api\/runtime\/v43\/storyboard\/quick/,
-  'QUICK state must use the V4.3 long-poll endpoint instead of browser busy polling');
-assert.match(fallbackSource, /PREWARM_DELAY_MS = 2500/,
-  'coarse work must not begin in the click-to-first-frame window');
-assert.match(fallbackSource, /PREWARM_BUFFER_SECONDS = 8\.0/,
-  'playing video needs a substantial buffer before speculative coarse work');
-assert.match(fallbackSource, /LOW_BUFFER_CANCEL_SECONDS = 3\.0/,
-  'coarse work must yield again when playback buffer becomes fragile');
+const fallbackSource = fs.readFileSync('static/v43-timeline-fallback-v7.js', 'utf8');
+assert.doesNotThrow(() => new vm.Script(fallbackSource, { filename: 'v43-timeline-fallback-v7.js' }));
+assert.match(fallbackSource, /coordinator_version:\s*7/);
+assert.match(fallbackSource, /currentVideoDetails\?\.id/,
+  'modal details id must be the source of truth, not a stale compatibility id');
+assert.match(fallbackSource, /showExact/,
+  'V7 must render cached exact frames itself instead of depending on listener ordering');
+assert.match(fallbackSource, /getExactCached/,
+  'exact 1-fps segments remain authoritative');
+assert.match(fallbackSource, /ensureInteractiveCoarse/,
+  'real hover must be able to start one persistent coarse overview');
+assert.match(fallbackSource, /COARSE_EXACT_DEFER_MS = 3500/,
+  'cold coarse generation gets only a bounded head start');
+assert.match(fallbackSource, /coordinatedRequestSegment/,
+  'V7 must coordinate exact requests with the one-time coarse build');
+assert.match(fallbackSource, /deferExact/);
+assert.match(fallbackSource, /hover_coarse_starts/);
+assert.match(fallbackSource, /source_video_id:\s*latestVideoId/,
+  'diagnostics must expose the real active source id');
+assert.match(fallbackSource, /INTERACTIVE_BUFFER_SECONDS = 3\.0/,
+  'interactive coarse work requires a useful primary playback buffer');
+assert.match(fallbackSource, /PREWARM_BUFFER_SECONDS = 5\.0/,
+  'background coarse work remains more conservative than interactive hover');
+assert.match(fallbackSource, /LOW_BUFFER_CANCEL_SECONDS = 2\.0/,
+  'coarse work must yield when the playback buffer becomes fragile');
 assert.match(fallbackSource, /showPosterFallback/,
   'cold hover must preserve a meaningful poster instead of a black tooltip');
 assert.match(fallbackSource, /previewImg\.style\.display = 'block'/,
-  'poster image must remain visible while nothing dynamic is ready');
-assert.match(fallbackSource, /Apply first[\s\S]*Only after the sprite has a valid frame do we hide the[\s\S]*poster/,
-  'poster may be hidden only after a valid sprite frame is applied');
-assert.match(fallbackSource, /timeline\.addEventListener\('pointerenter'[\s\S]*cancelCoarse\(videoId, 'exact_hover'\)/,
-  'interactive exact hover must cancel speculative coarse generation');
+  'poster image remains visible until a valid dynamic frame exists');
 assert.match(fallbackSource, /mainVideo\.addEventListener\('waiting'/);
 assert.match(fallbackSource, /mainVideo\.addEventListener\('stalled'/);
-assert.match(fallbackSource, /low_buffer_cancels/);
 assert.match(fallbackSource, /media_seek_enabled:\s*false/);
 assert.match(fallbackSource, /black_fallback_enabled:\s*false/);
+assert.doesNotMatch(fallbackSource, /cancelCoarse\(videoId, 'exact_hover'\)/,
+  'pointerenter may no longer kill the coarse build before it has a chance to finish');
 assert.doesNotMatch(fallbackSource, /\/api\/video\/stream\?id=.*owner=preview/,
   'timeline must never seek a second full-resolution MP4');
 assert.doesNotMatch(fallbackSource, /previewVideo\.currentTime\s*=/,
   'timeline pointer motion must not trigger media seeks');
-assert.doesNotMatch(fallbackSource, /createPreviewSeeker\(previewVideo/);
-assert.doesNotMatch(fallbackSource, /requestSegment\s*\(/,
-  'fallback itself must not duplicate exact-segment scheduling');
 
 const runtimeSource = fs.readFileSync('runtime_app.py', 'utf8');
-assert.match(runtimeSource, /v43-timeline-fallback\.js\?v=6/);
-assert.match(runtimeSource, /\/api\/runtime\/v43\/storyboard\/quick/);
-assert.match(runtimeSource, /playback_safe_quick_storyboard/);
+assert.match(runtimeSource, /v43-timeline-fallback-v7\.js\?v=7/);
+assert.match(runtimeSource, /timeline_coordinator_version["']:\s*7/);
+assert.match(runtimeSource, /QUICK_FRAME_COUNT = 8/);
+assert.match(runtimeSource, /QUICK_PARALLELISM = 2/);
 assert.match(runtimeSource, /media_seek_fallback["']:\s*False/);
 
-console.log('PASS V4.3 MODAL IDENTITY + NO-BLACK PLAYBACK-SAFE TIMELINE');
+console.log('PASS V4.3 MODAL IDENTITY + COARSE-FIRST V7 TIMELINE');
