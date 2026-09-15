@@ -69,7 +69,10 @@ assert.match(fallbackSource, /owner=preview&priority=low&reason=timeline_preview
 assert.match(fallbackSource, /getSegmentFromCache/);
 assert.match(fallbackSource, /Number\(mainVideo\.readyState \|\| 0\) < 2/);
 assert.match(fallbackSource, /timeline\.addEventListener\('pointerleave'/);
-assert.match(fallbackSource, /meta\.isLatest === false/);
+assert.match(fallbackSource, /keepPreviewComposited\(previewVideo, false\)/, 'preview video must remain compositor-visible before first frame');
+assert.match(fallbackSource, /opacity = visible \? '1' : '0\.001'/, 'cold preview must not use display:none while waiting for requestVideoFrameCallback');
+assert.match(fallbackSource, /hasDynamicFrame/, 'last decoded frame should remain visible while the next seek is pending');
+assert.doesNotMatch(fallbackSource, /meta\.isLatest === false/, 'intermediate decoded frames must not all be discarded while pointer is moving');
 assert.doesNotMatch(fallbackSource, /requestSegment\s*\(/, 'dynamic fallback must not start exact FFmpeg jobs itself');
 assert.doesNotMatch(fallbackSource, /\/api\/storyboard\/segment/, 'dynamic fallback must use the media proxy, not cold storyboard generation');
 
@@ -77,4 +80,4 @@ const runtimeSource = fs.readFileSync('runtime_app.py', 'utf8');
 assert.match(runtimeSource, /v43-timeline-fallback\.js/);
 assert.match(runtimeSource, /dynamic_timeline_fallback["']:\s*True/);
 
-console.log('PASS V4.3 MODAL IDENTITY + DYNAMIC TIMELINE FALLBACK');
+console.log('PASS V4.3 MODAL IDENTITY + COMPOSITOR TIMELINE FALLBACK');
