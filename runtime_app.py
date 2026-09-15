@@ -11,11 +11,11 @@ import fast_storyboard_quick as _quick_storyboard
 
 install_grouped_feed_fast_path()
 
-# Cold-hover overview is a bridge, not the final precise timeline. Keep only four
-# logical anchors and accept two unique decoded anchors for the first persistent
-# sprite. This lets two low-resolution range seeks run as one batch; exact 1-fps
-# segments immediately take over the hovered 30-second region afterwards.
-_quick_storyboard.QUICK_FRAME_COUNT = 4
+# Cold-hover overview is only the first bridge until exact 1-fps segments take
+# over. Two anchors can be fetched in one two-process batch, which removes the
+# previous second batch from first-preview latency and keeps playback contention
+# bounded. Exact segment frames provide the fine-grained follow-up.
+_quick_storyboard.QUICK_FRAME_COUNT = 2
 _quick_storyboard.QUICK_PARALLELISM = 2
 _quick_storyboard.QUICK_MIN_SUCCESS = 2
 _quick_storyboard.install()
