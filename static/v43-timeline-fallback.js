@@ -1,46 +1,45 @@
 (() => {
   'use strict';
 
-  // Dynamic Archivebate timeline fallback. Exact storyboard segments still win.
-  // The media fallback is now latest-target-wins: a new pointer target supersedes
-  // an older in-flight seek instead of waiting for every old seek to finish.
-  const MOVE_SEEK_INTERVAL_MS = 100;
-  const TARGET_STEP_SECONDS = 1.0;
-  const PREWARM_DELAY_MS = 1400;
+  // YouTube-style V4.3 fallback: never chase the pointer by seeking a full-size
+  // auxiliary MP4.  Build one tiny persistent 160x90 QUICK sprite per opened
+  // video, preload it in the background, then change frames locally.  Exact
+  // 1-fps/30s storyboard segments still win whenever they are ready.
+  const PREWARM_DELAY_MS = 450;
+  const PREWARM_BUFFER_SECONDS = 3.0;
+  const STATUS_TIMEOUT_MS = 12000;
+  const QUICK_MEMORY_LIMIT = 24;
 
   let installed = false;
   let hoverActive = false;
-  let sourceVideoId = '';
-  let latestTargetTime = 0;
-  let latestDuration = 0;
   let latestVideoId = '';
-  let hasDynamicFrame = false;
-  let lastFrameTargetTime = null;
-  let lastPublishedMediaTime = null;
+  let latestDuration = 0;
+  let latestTargetTime = 0;
   let pointerRaf = 0;
   let pendingClientX = 0;
-  let pendingSeekTarget = null;
-  let seekTimer = null;
   let prewarmTimer = null;
-  let lastSeekAt = 0;
-  let lastSeekTarget = null;
+  let lastFrameIdentity = '';
+
+  const coarseBoards = new Map();
+  const coarseBuilds = new Map();
 
   const metrics = {
     requests: 0,
     pointerUpdates: 0,
-    seekDispatches: 0,
-    supersededSeeks: 0,
     frames: 0,
-    sourceLoads: 0,
-    prewarmLoads: 0,
+    coarseBuilds: 0,
+    coarseReady: 0,
+    coarseCacheHits: 0,
+    coarseReadyMs: [],
     exactSkips: 0,
-    coarseSkips: 0,
-    notReadySkips: 0,
-    metadataEvents: 0,
-    seekedEvents: 0,
-    videoErrors: 0,
-    seekedFallbackFrames: 0,
+    existingCoarseHits: 0,
+    prewarmStarts: 0,
+    buildErrors: 0,
   };
+
+  function now() {
+    return globalThis.performance?.now?.() ?? Date.now();
+  }
 
   function appState() {
     return globalThis.ArchivebateAppContext?.state || globalThis.state || null;
@@ -71,54 +70,172 @@
     return { videoId, duration };
   }
 
+  function cacheKey(videoId, duration) {
+    return `${videoId}:${Math.max(1, Math.round(Number(duration) || 0))}`;
+  }
+
+  function lruGet(map, key) {
+    if (!map.has(key)) return null;
+    const value = map.get(key);
+    map.delete(key);
+    map.set(key, value);
+    return value;
+  }
+
+  function lruSet(map, key, value, limit) {
+    if (map.has(key)) map.delete(key);
+    map.set(key, value);
+    while (map.size > limit) map.delete(map.keys().next().value);
+    return value;
+  }
+
   function currentSegmentCached(videoId, duration, targetTime) {
-    if (!videoId || !duration || !globalThis.ArchivebateYouTubeStoryboard?.getSegmentFromCache) return false;
-    return Boolean(globalThis.ArchivebateYouTubeStoryboard.getSegmentFromCache(videoId, duration, targetTime));
+    return Boolean(globalThis.ArchivebateYouTubeStoryboard?.getSegmentFromCache?.(videoId, duration, targetTime));
   }
 
-  function keepPreviewComposited(previewVideo, visible = false) {
-    if (!previewVideo) return;
-    previewVideo.style.display = 'block';
-    previewVideo.style.visibility = 'visible';
-    previewVideo.style.opacity = visible ? '1' : '0.001';
-    previewVideo.style.pointerEvents = 'none';
+  function mutationRequest(url, options = {}) {
+    if (globalThis.ArchivebateAPI?.request) return globalThis.ArchivebateAPI.request(url, options);
+    const headers = { ...(options.headers || {}) };
+    const token = document.querySelector?.('meta[name="archivebate-mutation-token"]')?.content || '';
+    if (token) headers['X-Archivebate-Mutation-Token'] = token;
+    return fetch(url, { ...options, headers });
   }
 
-  function hideDynamicVideo(previewVideo) {
-    if (!previewVideo) return;
-    previewVideo.style.display = 'none';
-    previewVideo.style.opacity = '0.001';
+  function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(new DOMException('Aborted', 'AbortError'));
+      const timer = setTimeout(() => {
+        signal?.removeEventListener?.('abort', abort);
+        resolve();
+      }, ms);
+      const abort = () => {
+        clearTimeout(timer);
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+      signal?.addEventListener?.('abort', abort, { once: true });
+    });
   }
 
-  function clearSeekTimer() {
-    if (seekTimer) clearTimeout(seekTimer);
-    seekTimer = null;
+  async function preloadBoard(data, signal) {
+    if (!data?.sprite_url) throw new Error('Brak sprite_url');
+    const img = new Image();
+    const loaded = new Promise((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('QUICK sprite load failed'));
+    });
+    img.src = data.sprite_url;
+    await Promise.race([
+      loaded,
+      sleep(8000, signal).then(() => { throw new Error('QUICK sprite timeout'); }),
+    ]);
+    try { await img.decode?.(); } catch (_) {}
+    return { ...data, _image: img };
   }
 
-  function resetHover(previewVideo, { clearSource = false } = {}) {
-    hideDynamicVideo(previewVideo);
-    hoverActive = false;
-    latestTargetTime = 0;
-    latestDuration = 0;
-    latestVideoId = '';
-    pendingSeekTarget = null;
-    clearSeekTimer();
-    if (pointerRaf) cancelAnimationFrame(pointerRaf);
-    pointerRaf = 0;
-    if (clearSource && previewVideo) {
-      if (prewarmTimer) clearTimeout(prewarmTimer);
-      prewarmTimer = null;
-      try { previewVideo.pause?.(); } catch (_) {}
-      previewVideo.removeAttribute?.('src');
-      try { previewVideo.load?.(); } catch (_) {}
-      if (previewVideo.dataset) delete previewVideo.dataset.v43PreviewVideoId;
-      sourceVideoId = '';
-      hasDynamicFrame = false;
-      lastFrameTargetTime = null;
-      lastPublishedMediaTime = null;
-      lastSeekTarget = null;
-      lastSeekAt = 0;
+  async function fetchQuickStatus(videoId, duration, signal) {
+    metrics.requests += 1;
+    const response = await fetch(
+      `/api/storyboard?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}`,
+      { cache: 'no-store', signal },
+    );
+    if (!response.ok) throw new Error(`QUICK status HTTP ${response.status}`);
+    return response.json();
+  }
+
+  function demandUrl(videoId, consumer) {
+    return `/api/storyboard/demand?id=${encodeURIComponent(videoId)}&consumer=${encodeURIComponent(consumer)}`;
+  }
+
+  async function acquireDemand(videoId, consumer) {
+    const url = demandUrl(videoId, consumer);
+    metrics.requests += 1;
+    const response = await mutationRequest(url, { method: 'POST' });
+    if (!response.ok) throw new Error(`QUICK demand HTTP ${response.status}`);
+    return url;
+  }
+
+  function releaseDemand(url) {
+    if (!url) return Promise.resolve();
+    metrics.requests += 1;
+    return mutationRequest(url, { method: 'DELETE', keepalive: true }).catch(() => null);
+  }
+
+  function consumerToken(videoId) {
+    return globalThis.crypto?.randomUUID?.() || `quick-${videoId}-${Date.now()}-${Math.random()}`;
+  }
+
+  function cancelBuildsExcept(videoId) {
+    for (const [key, holder] of coarseBuilds.entries()) {
+      if (holder.videoId === videoId) continue;
+      holder.controller.abort();
+      coarseBuilds.delete(key);
     }
+  }
+
+  function prewarmCoarse(videoId, duration) {
+    duration = Number(duration);
+    if (!videoId || !Number.isFinite(duration) || duration <= 0) return Promise.resolve(null);
+    const key = cacheKey(videoId, duration);
+    const cached = lruGet(coarseBoards, key);
+    if (cached) {
+      metrics.coarseCacheHits += 1;
+      return Promise.resolve(cached);
+    }
+    const existing = coarseBuilds.get(key);
+    if (existing) return existing.promise;
+
+    cancelBuildsExcept(videoId);
+    const controller = new AbortController();
+    const holder = { videoId, controller, demand: '', promise: null };
+    const started = now();
+    metrics.coarseBuilds += 1;
+
+    holder.promise = (async () => {
+      try {
+        let data = await fetchQuickStatus(videoId, duration, controller.signal);
+        if (data.status !== 'ready' || !data.sprite_url) {
+          holder.demand = await acquireDemand(videoId, consumerToken(videoId));
+          metrics.requests += 1;
+          const startResponse = await mutationRequest(
+            `/api/storyboard?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}`,
+            { method: 'POST', cache: 'no-store', signal: controller.signal },
+          );
+          if (!startResponse.ok) throw new Error(`QUICK start HTTP ${startResponse.status}`);
+          data = await startResponse.json();
+        }
+
+        const deadline = now() + STATUS_TIMEOUT_MS;
+        while ((data.status !== 'ready' || !data.sprite_url) && now() < deadline) {
+          if (data.status === 'error') throw new Error(data.error || 'QUICK build error');
+          await sleep(now() - started < 1800 ? 120 : 240, controller.signal);
+          data = await fetchQuickStatus(videoId, duration, controller.signal);
+        }
+        if (data.status !== 'ready' || !data.sprite_url) throw new Error('QUICK build timeout');
+
+        const board = await preloadBoard(data, controller.signal);
+        lruSet(coarseBoards, key, board, QUICK_MEMORY_LIMIT);
+        metrics.coarseReady += 1;
+        metrics.coarseReadyMs.push(now() - started);
+        if (metrics.coarseReadyMs.length > 32) metrics.coarseReadyMs.shift();
+        return board;
+      } catch (error) {
+        if (error?.name !== 'AbortError') metrics.buildErrors += 1;
+        return null;
+      } finally {
+        await releaseDemand(holder.demand);
+        if (coarseBuilds.get(key) === holder) coarseBuilds.delete(key);
+      }
+    })();
+
+    coarseBuilds.set(key, holder);
+    return holder.promise;
+  }
+
+  function percentile(values, p) {
+    if (!values.length) return 0;
+    const ordered = [...values].sort((a, b) => a - b);
+    const index = Math.min(ordered.length - 1, Math.max(0, Math.ceil(ordered.length * p) - 1));
+    return Number(ordered[index].toFixed(1));
   }
 
   function install() {
@@ -130,128 +247,31 @@
     const sprite = document.getElementById('modalTimelineSprite');
     const status = document.getElementById('modalTimelinePreviewStatus');
     const modal = document.getElementById('videoModal');
-    if (!timeline || !mainVideo || !previewVideo) return;
+    if (!timeline || !mainVideo || !sprite || !globalThis.ArchivebateYouTubeStoryboard?.applyFrame) return;
 
     installed = true;
-    previewVideo.muted = true;
-    previewVideo.playsInline = true;
-    previewVideo.preload = 'metadata';
 
-    function publishFrame(targetTime, { fromSeekedFallback = false } = {}) {
-      if (!hoverActive || !modal?.classList?.contains?.('active')) return false;
-      const state = appState();
-      const { videoId, duration } = currentIdentity(mainVideo, state);
-      if (!videoId || videoId !== latestVideoId || Math.abs(duration - latestDuration) > 1.0) return false;
-      if (currentSegmentCached(videoId, duration, latestTargetTime)) {
-        metrics.exactSkips += 1;
-        hideDynamicVideo(previewVideo);
-        return false;
-      }
-      if (state?.currentTimelinePrefix || state?.timelineSpriteBoard) {
-        metrics.coarseSkips += 1;
-        hideDynamicVideo(previewVideo);
-        return false;
-      }
-      if (previewVideo.readyState < 2 || previewVideo.seeking) return false;
-
-      const mediaTime = Number(previewVideo.currentTime) || 0;
-      if (lastPublishedMediaTime !== null && Math.abs(mediaTime - lastPublishedMediaTime) < 0.01) {
-        keepPreviewComposited(previewVideo, true);
-        return true;
-      }
-      lastPublishedMediaTime = mediaTime;
-      hasDynamicFrame = true;
-      lastFrameTargetTime = Number(targetTime) || mediaTime;
+    function hideMediaFallback() {
+      if (previewVideo) previewVideo.style.display = 'none';
       if (previewImg) previewImg.style.display = 'none';
-      if (sprite && globalThis.ArchivebateYouTubeStoryboard?.clearFrame) {
-        globalThis.ArchivebateYouTubeStoryboard.clearFrame(sprite);
-      }
+    }
+
+    function showCoarse(board, targetTime, duration) {
+      if (!board || !hoverActive) return false;
+      hideMediaFallback();
       if (status) status.style.display = 'none';
-      keepPreviewComposited(previewVideo, true);
-      metrics.frames += 1;
-      if (fromSeekedFallback) metrics.seekedFallbackFrames += 1;
-      return true;
-    }
-
-    function quantizeTarget(target, duration) {
-      const maxTime = Math.max(0, Number(duration) - 0.05);
-      const clamped = Math.max(0, Math.min(maxTime, Number(target) || 0));
-      return Math.max(0, Math.min(maxTime, Math.round(clamped / TARGET_STEP_SECONDS) * TARGET_STEP_SECONDS));
-    }
-
-    function dispatchLatestSeek() {
-      clearSeekTimer();
-      if (pendingSeekTarget === null || previewVideo.readyState < 1 || !Number.isFinite(previewVideo.duration) || previewVideo.duration <= 0) return;
-
-      const target = quantizeTarget(pendingSeekTarget, previewVideo.duration);
-      pendingSeekTarget = null;
-      const now = performance.now();
-      const wait = MOVE_SEEK_INTERVAL_MS - (now - lastSeekAt);
-      if (wait > 0) {
-        pendingSeekTarget = target;
-        seekTimer = setTimeout(dispatchLatestSeek, wait);
-        return;
+      const result = globalThis.ArchivebateYouTubeStoryboard.applyFrame(
+        sprite,
+        board,
+        targetTime,
+        { targetTime, duration },
+      );
+      if (!result?.ok) return false;
+      const identity = `${board.sprite_url}|${result.frameIndex}`;
+      if (identity !== lastFrameIdentity) {
+        lastFrameIdentity = identity;
+        metrics.frames += 1;
       }
-
-      if (lastSeekTarget !== null && Math.abs(target - lastSeekTarget) < 0.5) return;
-      if (previewVideo.seeking) metrics.supersededSeeks += 1;
-      lastSeekAt = now;
-      lastSeekTarget = target;
-      metrics.seekDispatches += 1;
-      metrics.requests = metrics.seekDispatches;
-
-      try {
-        // Setting currentTime while a previous seek is still active makes the
-        // browser abandon the obsolete target and chase the newest pointer target.
-        // The old shared seeker intentionally serialized seeks; that was correct
-        // but visually sluggish on remote MP4 range streams.
-        previewVideo.currentTime = target;
-      } catch (_) {
-        metrics.videoErrors += 1;
-      }
-    }
-
-    function queueLatestSeek(targetTime) {
-      pendingSeekTarget = targetTime;
-      if (previewVideo.readyState < 1) return;
-      const now = performance.now();
-      const wait = Math.max(0, MOVE_SEEK_INTERVAL_MS - (now - lastSeekAt));
-      clearSeekTimer();
-      seekTimer = setTimeout(dispatchLatestSeek, wait);
-    }
-
-    previewVideo.addEventListener('loadedmetadata', () => {
-      metrics.metadataEvents += 1;
-      if (pendingSeekTarget !== null) dispatchLatestSeek();
-    });
-    previewVideo.addEventListener('seeked', () => {
-      metrics.seekedEvents += 1;
-      requestAnimationFrame(() => requestAnimationFrame(() => {
-        publishFrame(previewVideo.currentTime, { fromSeekedFallback: true });
-        if (pendingSeekTarget !== null) dispatchLatestSeek();
-      }));
-    });
-    previewVideo.addEventListener('error', () => { metrics.videoErrors += 1; });
-
-    function ensurePreviewSource(videoId, { prewarm = false } = {}) {
-      if (!videoId) return false;
-      if (sourceVideoId === videoId && previewVideo.getAttribute?.('src')) return true;
-
-      sourceVideoId = videoId;
-      hasDynamicFrame = false;
-      lastFrameTargetTime = null;
-      lastPublishedMediaTime = null;
-      lastSeekTarget = null;
-      lastSeekAt = 0;
-      const src = `/api/video/stream?id=${encodeURIComponent(videoId)}&owner=preview&priority=low&reason=timeline_preview`;
-      if (previewVideo.dataset) previewVideo.dataset.v43PreviewVideoId = videoId;
-      previewVideo.src = src;
-      previewVideo.preload = 'metadata';
-      if (prewarm) hideDynamicVideo(previewVideo);
-      else keepPreviewComposited(previewVideo, false);
-      try { previewVideo.load(); } catch (_) {}
-      metrics.sourceLoads += 1;
-      if (prewarm) metrics.prewarmLoads += 1;
       return true;
     }
 
@@ -266,42 +286,48 @@
       if (!rect?.width) return;
       const pos = Math.max(0, Math.min(1, (Number(clientX) - rect.left) / rect.width));
       const targetTime = pos * duration;
-
-      if (currentSegmentCached(videoId, duration, targetTime)) {
-        metrics.exactSkips += 1;
-        hideDynamicVideo(previewVideo);
-        return;
-      }
-      if (state.timelineSpriteBoard) {
-        metrics.coarseSkips += 1;
-        hideDynamicVideo(previewVideo);
-        return;
-      }
-      if (Number(mainVideo.readyState || 0) < 2) {
-        metrics.notReadySkips += 1;
-        return;
-      }
-
-      ensurePreviewSource(videoId);
-      hoverActive = true;
-      latestTargetTime = targetTime;
-      latestDuration = duration;
       latestVideoId = videoId;
+      latestDuration = duration;
+      latestTargetTime = targetTime;
+      hoverActive = true;
       metrics.pointerUpdates += 1;
 
-      // modal-player-controls paints its cold poster first. This fallback RAF is
-      // registered afterwards and restores the last decoded dynamic frame while
-      // the newest seek is being chased.
-      keepPreviewComposited(previewVideo, hasDynamicFrame);
-      if (hasDynamicFrame) {
-        if (previewImg) previewImg.style.display = 'none';
-        if (status) status.style.display = 'none';
-      } else if (status) {
-        status.textContent = 'Pobieranie klatki…';
-        status.style.display = 'block';
+      // Exact segment already rendered by modal-player-controls in the RAF that
+      // precedes this handler.  Do not cover it with the coarse fallback.
+      if (currentSegmentCached(videoId, duration, targetTime)) {
+        metrics.exactSkips += 1;
+        return;
       }
 
-      queueLatestSeek(targetTime);
+      const existingBoard = state.timelineSpriteBoard;
+      if (existingBoard?.sprite_url) {
+        metrics.existingCoarseHits += 1;
+        showCoarse(existingBoard, targetTime, duration);
+        return;
+      }
+
+      const key = cacheKey(videoId, duration);
+      const board = lruGet(coarseBoards, key);
+      if (board) {
+        metrics.coarseCacheHits += 1;
+        showCoarse(board, targetTime, duration);
+        return;
+      }
+
+      // First encounter only: start the tiny persistent sprite once.  We do not
+      // open a second full-resolution MP4 anymore, so pointer movement itself is
+      // network-free after this one sprite is ready.
+      hideMediaFallback();
+      if (status) {
+        status.textContent = 'Przygotowywanie szybkiego podglądu…';
+        status.style.display = 'block';
+      }
+      prewarmCoarse(videoId, duration).then(readyBoard => {
+        if (!readyBoard || !hoverActive) return;
+        if (videoId !== latestVideoId || Math.abs(duration - latestDuration) > 1) return;
+        if (currentSegmentCached(videoId, duration, latestTargetTime)) return;
+        showCoarse(readyBoard, latestTargetTime, duration);
+      });
     }
 
     function schedulePointer(event) {
@@ -314,25 +340,62 @@
       });
     }
 
+    function bufferedAhead(video) {
+      const helper = Number(globalThis.ArchivebatePerf?.getBufferedAhead?.(video));
+      if (Number.isFinite(helper) && helper >= 0) return helper;
+      try {
+        const nowTime = Number(video.currentTime) || 0;
+        for (let i = 0; i < video.buffered.length; i += 1) {
+          if (video.buffered.start(i) <= nowTime && video.buffered.end(i) >= nowTime) {
+            return Math.max(0, video.buffered.end(i) - nowTime);
+          }
+        }
+      } catch (_) {}
+      return 0;
+    }
+
     function schedulePrewarm() {
       if (prewarmTimer) clearTimeout(prewarmTimer);
-      prewarmTimer = setTimeout(() => {
-        prewarmTimer = null;
+      let attempts = 0;
+      const check = () => {
+        attempts += 1;
         if (!modal?.classList?.contains?.('active')) return;
         const state = appState();
-        const { videoId } = currentIdentity(mainVideo, state);
-        if (!videoId || Number(mainVideo.readyState || 0) < 3) return;
-        const bufferedAhead = Number(globalThis.ArchivebatePerf?.getBufferedAhead?.(mainVideo) || 0);
-        if (bufferedAhead < 2.0) return;
-        ensurePreviewSource(videoId, { prewarm: true });
-      }, PREWARM_DELAY_MS);
+        const { videoId, duration } = currentIdentity(mainVideo, state);
+        if (!videoId || !duration) return;
+        const ready = Number(mainVideo.readyState || 0) >= 3 && bufferedAhead(mainVideo) >= PREWARM_BUFFER_SECONDS;
+        if (!ready && attempts < 7) {
+          prewarmTimer = setTimeout(check, 300);
+          return;
+        }
+        prewarmTimer = null;
+        if (!ready) return;
+        metrics.prewarmStarts += 1;
+        prewarmCoarse(videoId, duration);
+      };
+      prewarmTimer = setTimeout(check, PREWARM_DELAY_MS);
     }
 
     timeline.addEventListener('pointerenter', schedulePointer, { passive: true });
     timeline.addEventListener('pointermove', schedulePointer, { passive: true });
-    timeline.addEventListener('pointerleave', () => resetHover(previewVideo), { passive: true });
+    timeline.addEventListener('pointerleave', () => {
+      hoverActive = false;
+      lastFrameIdentity = '';
+      if (pointerRaf) cancelAnimationFrame(pointerRaf);
+      pointerRaf = 0;
+    }, { passive: true });
+
     mainVideo.addEventListener('playing', schedulePrewarm);
-    mainVideo.addEventListener('emptied', () => resetHover(previewVideo, { clearSource: true }));
+    mainVideo.addEventListener('emptied', () => {
+      hoverActive = false;
+      latestVideoId = '';
+      latestDuration = 0;
+      latestTargetTime = 0;
+      lastFrameIdentity = '';
+      if (prewarmTimer) clearTimeout(prewarmTimer);
+      prewarmTimer = null;
+      cancelBuildsExcept('');
+    });
   }
 
   function scheduleInstall() {
@@ -347,37 +410,35 @@
 
   globalThis.ArchivebateV43TimelineFallback = {
     stats() {
-      const previewVideo = globalThis.document?.getElementById?.('modalTimelinePreviewVideo');
       return {
         installed,
         hover_active: hoverActive,
-        source_video_id: sourceVideoId,
+        source_video_id: '',
         requests: metrics.requests,
         pointer_updates: metrics.pointerUpdates,
-        seek_dispatches: metrics.seekDispatches,
-        superseded_seeks: metrics.supersededSeeks,
         frames: metrics.frames,
-        source_loads: metrics.sourceLoads,
-        prewarm_loads: metrics.prewarmLoads,
+        coarse_builds: metrics.coarseBuilds,
+        coarse_ready: metrics.coarseReady,
+        coarse_cache_hits: metrics.coarseCacheHits,
+        existing_coarse_hits: metrics.existingCoarseHits,
         exact_skips: metrics.exactSkips,
-        coarse_skips: metrics.coarseSkips,
-        not_ready_skips: metrics.notReadySkips,
-        metadata_events: metrics.metadataEvents,
-        seeked_events: metrics.seekedEvents,
-        seeked_fallback_frames: metrics.seekedFallbackFrames,
-        video_errors: metrics.videoErrors,
-        has_dynamic_frame: hasDynamicFrame,
-        last_target_time: Number(latestTargetTime.toFixed?.(3) ?? latestTargetTime),
-        last_frame_target_time: lastFrameTargetTime,
-        preview_ready_state: Number(previewVideo?.readyState || 0),
-        preview_duration: Number.isFinite(Number(previewVideo?.duration)) ? Number(previewVideo.duration) : 0,
-        preview_current_time: Number(previewVideo?.currentTime || 0),
-        move_seek_interval_ms: MOVE_SEEK_INTERVAL_MS,
+        prewarm_starts: metrics.prewarmStarts,
+        build_errors: metrics.buildErrors,
+        coarse_ready_p50_ms: percentile(metrics.coarseReadyMs, 0.50),
+        coarse_ready_p95_ms: percentile(metrics.coarseReadyMs, 0.95),
+        coarse_memory_entries: coarseBoards.size,
+        coarse_inflight: coarseBuilds.size,
+        media_seek_enabled: false,
+        frame_width: 160,
+        frame_height: 90,
       };
     },
+    prewarm(videoId, duration) {
+      return prewarmCoarse(String(videoId || ''), Number(duration));
+    },
     reset() {
-      const previewVideo = globalThis.document?.getElementById?.('modalTimelinePreviewVideo');
-      resetHover(previewVideo, { clearSource: true });
+      hoverActive = false;
+      lastFrameIdentity = '';
     },
   };
 })();
