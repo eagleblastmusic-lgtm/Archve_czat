@@ -43,7 +43,7 @@
       : [];
 
     return {
-      schema: 'archivebate-home-load-report/1',
+      schema: 'archivebate-home-load-report/2',
       generated_at: new Date().toISOString(),
       elapsed_ms: round(performance.now()),
       cards,
@@ -70,6 +70,21 @@
     };
   }
 
+  async function collectAsync() {
+    const report = collect();
+    try {
+      const response = await fetch('/api/runtime/v43', { cache: 'no-store' });
+      report.runtime_http_status = response.status;
+      report.runtime_header = response.headers.get('X-Archivebate-Runtime') || null;
+      report.runtime = response.ok ? await response.json() : null;
+    } catch (error) {
+      report.runtime_http_status = 0;
+      report.runtime_header = null;
+      report.runtime = { error: String(error?.message || error) };
+    }
+    return report;
+  }
+
   function print() {
     const report = collect();
     console.log('Archivebate home load report');
@@ -77,5 +92,12 @@
     return report;
   }
 
-  globalThis.ArchivebateHomeLoadDiagnostics = { collect, print };
+  async function printAsync() {
+    const report = await collectAsync();
+    console.log('Archivebate home load report');
+    console.log(JSON.stringify(report, null, 2));
+    return report;
+  }
+
+  globalThis.ArchivebateHomeLoadDiagnostics = { collect, collectAsync, print, printAsync };
 })();
