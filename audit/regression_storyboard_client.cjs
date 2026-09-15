@@ -161,7 +161,46 @@ const vm = require('node:vm');
   images[1].onload();
   await new Promise(resolve => setTimeout(resolve, 5));
 
-  console.log('PASS: shared segment abort/dedupe, attach gating and buffered watch-route prewarm work');
+  // If playback remains weak after all retry checks, V4.3 must give up instead
+  // of starting FFmpeg anyway. Accelerate only the 350/450 ms readiness timers;
+  // keep the 15 s warm cancellation timer real so a buggy warm would be visible.
+  const realSetTimeout = context.setTimeout;
+  const realClearTimeout = context.clearTimeout;
+  const fastTimerTokens = new Set();
+  context.setTimeout = (callback, delay, ...args) => {
+    if (delay === 350 || delay === 450) {
+      const token = {};
+      fastTimerTokens.add(token);
+      Promise.resolve().then(() => {
+        if (fastTimerTokens.delete(token)) callback(...args);
+      });
+      return token;
+    }
+    return realSetTimeout(callback, delay, ...args);
+  };
+  context.clearTimeout = (token) => {
+    if (fastTimerTokens.delete(token)) return;
+    return realClearTimeout(token);
+  };
+  context.ArchivebatePerf = { getBufferedAhead: () => 0.25 };
+  const startsBeforeWeakPlayback = segmentStarts;
+  playingHandler({
+    target: {
+      id: 'mainPlayer',
+      dataset: { videoId: 'weak-buffer-fixture' },
+      duration: 30,
+      currentTime: 2,
+      paused: false,
+      ended: false,
+      readyState: 2,
+    }
+  });
+  await new Promise(resolve => realSetTimeout(resolve, 20));
+  assert.equal(segmentStarts, startsBeforeWeakPlayback, 'weak playback must not start exact prewarm after retry budget expires');
+  context.setTimeout = realSetTimeout;
+  context.clearTimeout = realClearTimeout;
+
+  console.log('PASS: shared segment abort/dedupe, attach gating, buffered watch prewarm and weak-buffer protection work');
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
