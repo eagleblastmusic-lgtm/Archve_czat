@@ -1,9 +1,10 @@
 """V4.3 playback-safe coarse storyboard accelerator.
 
-The precise 1-fps/30s segment path remains the authoritative hover source.  This
-module only builds a tiny persistent coarse sprite after primary playback is
-healthy.  Coarse work is intentionally easy to cancel and exact hover work always
-wins: an active desired exact segment cancels QUICK extraction immediately.
+The precise 1-fps/30s segment path remains the authoritative hover source. This
+module builds a tiny persistent coarse sprite after primary playback is healthy.
+V8 coordination gives an interactive QUICK build a short reservation so stale
+background exact-prewarm work cannot clear it before it starts. A real exact
+hover can still replace that reservation and preempt QUICK immediately.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,10 +21,8 @@ from PIL import Image
 
 import storyboard_service as _sb
 
-# Four frames are enough to avoid a blank/static timeline while exact 1-fps
-# segments fill in locally.  Two parallel low-resolution seeks are a compromise
-# between first-build latency and not stealing four upstream connections from the
-# real player as the previous implementation did.
+# Runtime may override these before install(). Keep the conservative defaults
+# useful when this module is imported directly by tests.
 QUICK_FRAME_COUNT = 4
 QUICK_PARALLELISM = 2
 QUICK_MIN_SUCCESS = 3
@@ -38,12 +37,14 @@ _quick_retry_hits = 0
 _quick_builds = 0
 _quick_cancelled = 0
 _quick_failures = 0
+_quick_reservation_preemptions = 0
+_quick_missing_waits = 0
 
 _original_build_variant = _sb._build_variant
 
 
 class QuickCancelled(RuntimeError):
-    """Expected cancellation when playback/exact hover takes priority."""
+    """Expected cancellation when playback/real exact hover takes priority."""
 
 
 def _remember_ms(value: float) -> None:
@@ -61,13 +62,21 @@ def _percentile(values, p: float) -> float:
     return round(float(ordered[idx]), 2)
 
 
+def _is_quick_reservation(value) -> bool:
+    return bool(value and value.get("quick_reservation"))
+
+
 def _cancel_requested(video_id: str) -> bool:
-    # Exact hover owns the machine/network budget.  The desired-target record is
-    # set before exact FFmpeg starts, so QUICK can stop before competing with it.
+    desired = _sb._current_desired(video_id)
+    # A QUICK reservation is not a competing exact target. It exists solely to
+    # invalidate stale/queued background exact-prewarm work while the first
+    # coarse overview gets a bounded head start. A subsequent real exact target
+    # overwrites the reservation and immediately makes this return True.
+    exact_target_active = bool(desired) and not _is_quick_reservation(desired)
     return (
         _sb._worker_stop.is_set()
         or not _sb._has_live_lease(video_id)
-        or bool(_sb._current_desired(video_id))
+        or exact_target_active
     )
 
 
@@ -79,8 +88,12 @@ def runtime_stats() -> dict:
         builds = int(_quick_builds)
         cancelled = int(_quick_cancelled)
         failures = int(_quick_failures)
+        reservation_preemptions = int(_quick_reservation_preemptions)
+        missing_waits = int(_quick_missing_waits)
     with _sb._active_process_lock:
         active_quick = sum(1 for info in _sb._active_processes.values() if info.get("kind") == "quick")
+    with _sb._state_lock:
+        reservations = sum(1 for value in _sb._desired_segments.values() if _is_quick_reservation(value))
     return {
         "installed": bool(_installed),
         "frame_count": QUICK_FRAME_COUNT,
@@ -95,30 +108,105 @@ def runtime_stats() -> dict:
         "fast_keyframe_hits": fast_hits,
         "accurate_retry_hits": retry_hits,
         "exact_preempts_quick": True,
+        "quick_reservations": reservations,
+        "stale_exact_preemptions": reservation_preemptions,
+        "missing_status_waits": missing_waits,
     }
 
 
 def wait_status(video_id: str, duration: float, timeout: float = 1.2) -> dict:
-    """Long-poll QUICK state so the browser does not hammer localhost every 120 ms."""
+    """Long-poll QUICK state without a tight loop when state temporarily vanishes.
+
+    V7 live telemetry exposed 63 status requests during one failed build. The
+    previous long-poll only waited while state was exactly `building`; if stale
+    exact-prewarm work cleared that state, every request returned `missing`
+    immediately and the browser spun. Missing now also waits for one state-change
+    window before returning.
+    """
+    global _quick_missing_waits
     duration = float(duration or 0)
     cached = _sb._cached_variant(video_id, duration, "quick")
     if cached:
         return {"status": "ready", **cached, "upgrade_status": "disabled"}
 
+    bounded = max(0.0, min(float(timeout), 2.0))
     key = _sb._state_key(video_id, duration)
     with _sb._state_changed:
         state = dict(_sb._states.get(key) or {})
-        if state.get("status") == "building" and timeout > 0:
+        if state.get("status") == "building" and bounded > 0:
             _sb._state_changed.wait_for(
                 lambda: (_sb._states.get(key) or {}).get("status") != "building",
-                timeout=max(0.0, min(float(timeout), 2.0)),
+                timeout=bounded,
             )
+            state = dict(_sb._states.get(key) or {})
+        elif not state and bounded > 0:
+            with _metrics_lock:
+                _quick_missing_waits += 1
+            _sb._state_changed.wait(timeout=bounded)
             state = dict(_sb._states.get(key) or {})
 
     cached = _sb._cached_variant(video_id, duration, "quick")
     if cached:
         return {"status": "ready", **cached, "upgrade_status": "disabled"}
     return state or {"status": "missing", "upgrade_status": "disabled"}
+
+
+def _reserve_quick_slot(video_id: str, queued_at: float) -> bool:
+    """Reserve one cold-coarse slot and retire only stale background exact work.
+
+    The V7 frontend defers a *real* exact hover before this QUICK job is queued.
+    Therefore an older desired target is background playback prewarm. A desired
+    target created after this QUICK job was queued is treated as a real/new exact
+    request and QUICK yields instead of overwriting it.
+    """
+    global _quick_reservation_preemptions
+    video_key = _sb._key(video_id)
+    now = time.monotonic()
+    with _sb._state_changed:
+        current = dict(_sb._desired_segments.get(video_key) or {})
+        if current and not _is_quick_reservation(current):
+            updated = float(current.get("updated") or 0.0)
+            if updated > float(queued_at) + 0.05:
+                return False
+        generation = int(current.get("generation") or 0) + 1
+        _sb._desired_segments[video_key] = {
+            "segment": -1,
+            "direction": 0,
+            "generation": generation,
+            "updated": now,
+            "quick_reservation": True,
+        }
+        _sb._state_changed.notify_all()
+
+    victims = []
+    with _sb._active_process_lock:
+        for process_key, info in list(_sb._active_processes.items()):
+            if info.get("video_key") != video_key or info.get("kind") != "segment":
+                continue
+            proc = info.get("proc")
+            if proc is not None and proc.poll() is None:
+                _sb._preempted_processes.add(process_key)
+                victims.append(proc)
+        if victims:
+            _sb._preempted_count += len(victims)
+    for proc in victims:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    if victims:
+        with _metrics_lock:
+            _quick_reservation_preemptions += len(victims)
+    return True
+
+
+def _release_quick_slot(video_id: str) -> None:
+    video_key = _sb._key(video_id)
+    with _sb._state_changed:
+        current = _sb._desired_segments.get(video_key)
+        if _is_quick_reservation(current):
+            _sb._desired_segments.pop(video_key, None)
+            _sb._state_changed.notify_all()
 
 
 def _run_one(
@@ -137,7 +225,7 @@ def _run_one(
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
     cmd += ["-ss", f"{target:.3f}"]
     if fast:
-        # QUICK is intentionally approximate.  Keyframe-only input seeking keeps
+        # QUICK is intentionally approximate. Keyframe-only input seeking keeps
         # each request small and avoids decoding long GOPs for a 160x90 image.
         cmd += ["-noaccurate_seek", "-skip_frame", "nokey"]
     cmd += [
@@ -261,17 +349,16 @@ def _build_variant_playback_safe(video_id: str, duration: float, source_url: str
             if cancelled or _cancel_requested(video_id):
                 for future in futures:
                     future.cancel()
-                raise QuickCancelled("QUICK preempted by exact hover")
+                raise QuickCancelled("QUICK preempted by real exact hover")
 
-        # Accurate retry is intentionally serial and stops as soon as there are
-        # enough unique frames.  The old implementation could launch an accurate
-        # retry for every miss, multiplying upstream traffic during playback.
+        # Accurate retry is serial and stops as soon as there are enough unique
+        # frames. This avoids multiplying upstream traffic during playback.
         if len(successful) < QUICK_MIN_SUCCESS:
             for i, target in enumerate(requested_times):
                 if i in successful:
                     continue
                 if _cancel_requested(video_id):
-                    raise QuickCancelled("QUICK retry preempted by exact hover")
+                    raise QuickCancelled("QUICK retry preempted by real exact hover")
                 out = tmp / f"frame_{i:03d}.jpg"
                 index, path, status = _accurate_retry(
                     ffmpeg, source_url, video_id, revision, i, target, out,
@@ -358,11 +445,12 @@ def _clear_state(state_key: str) -> None:
 
 
 def _run_jobs_v43():
-    """Baseline scheduler plus graceful QUICK cancellation.
+    """Baseline scheduler plus a bounded QUICK reservation.
 
-    Unlike the previous patch, QUICK does *not* survive an exact hover target.
-    Exact work keeps the original preemption semantics and QUICK cancellation is
-    cleared to `missing` instead of poisoning the state with a 30-second error.
+    A stale playback-prewarm exact target may exist before the first real hover.
+    When the interactive QUICK job was queued first, reserve the video briefly,
+    invalidate those stale exact jobs, and build the low-resolution overview.
+    Any *new* exact target overwrites the reservation and preempts QUICK.
     """
     global _quick_cancelled, _quick_failures
     while not _sb._worker_stop.is_set():
@@ -434,7 +522,12 @@ def _run_jobs_v43():
 
             quality = str(job[7])
             state_key = _sb._state_key(video_id, duration)
-            if not _sb._has_live_lease(video_id) or _sb._current_desired(video_id):
+            if not _sb._has_live_lease(video_id):
+                _clear_state(state_key)
+                continue
+
+            reserved = _reserve_quick_slot(video_id, queued_at)
+            if not reserved:
                 _clear_state(state_key)
                 continue
             try:
@@ -453,7 +546,8 @@ def _run_jobs_v43():
             except Exception as exc:
                 with _metrics_lock:
                     _quick_failures += 1
-                if not _sb._has_live_lease(video_id) or _sb._current_desired(video_id):
+                desired = _sb._current_desired(video_id)
+                if not _sb._has_live_lease(video_id) or (desired and not _is_quick_reservation(desired)):
                     _clear_state(state_key)
                 else:
                     with _sb._state_changed:
@@ -464,6 +558,8 @@ def _run_jobs_v43():
                             "upgrade_status": "disabled",
                         }
                         _sb._state_changed.notify_all()
+            finally:
+                _release_quick_slot(video_id)
         finally:
             _sb._jobs.task_done()
 
@@ -474,8 +570,7 @@ def install() -> None:
         return
     _sb._build_variant = _build_variant_playback_safe
     _sb._run_jobs = _run_jobs_v43
-    # Keep the historical marker for compatibility with existing diagnostics,
-    # and add a more precise marker for the repaired architecture.
     _sb._v43_parallel_quick_installed = True
     _sb._v43_playback_safe_quick_installed = True
+    _sb._v43_quick_reservation_installed = True
     _installed = True
