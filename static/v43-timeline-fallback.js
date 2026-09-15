@@ -18,6 +18,9 @@
   let latestVideoId = '';
   let hasDynamicFrame = false;
   let lastFrameTargetTime = null;
+  let lastPublishedMediaTime = null;
+  let pointerRaf = 0;
+  let pendingClientX = 0;
 
   const metrics = {
     requests: 0,
@@ -29,6 +32,7 @@
     metadataEvents: 0,
     seekedEvents: 0,
     videoErrors: 0,
+    seekedFallbackFrames: 0,
   };
 
   function appState() {
@@ -94,6 +98,9 @@
     latestVideoId = '';
     hasDynamicFrame = false;
     lastFrameTargetTime = null;
+    lastPublishedMediaTime = null;
+    if (pointerRaf) cancelAnimationFrame(pointerRaf);
+    pointerRaf = 0;
     if (clearSource && previewVideo) {
       try { previewVideo.pause?.(); } catch (_) {}
       previewVideo.removeAttribute?.('src');
@@ -118,46 +125,60 @@
     previewVideo.muted = true;
     previewVideo.playsInline = true;
     previewVideo.preload = 'metadata';
+
+    function publishFrame(targetTime, { fromSeekedFallback = false } = {}) {
+      if (!hoverActive || !modal?.classList?.contains?.('active')) return false;
+      const state = appState();
+      const { videoId, duration } = currentIdentity(mainVideo, state);
+      if (!videoId || videoId !== latestVideoId || Math.abs(duration - latestDuration) > 1.0) return false;
+      if (currentSegmentCached(videoId, duration, latestTargetTime)) {
+        metrics.exactSkips += 1;
+        hideDynamicVideo(previewVideo);
+        return false;
+      }
+      if (state?.currentTimelinePrefix || state?.timelineSpriteBoard) {
+        metrics.coarseSkips += 1;
+        hideDynamicVideo(previewVideo);
+        return false;
+      }
+      if (previewVideo.readyState < 2 || previewVideo.seeking) return false;
+
+      const mediaTime = Number(previewVideo.currentTime) || 0;
+      if (lastPublishedMediaTime !== null && Math.abs(mediaTime - lastPublishedMediaTime) < 0.01) {
+        keepPreviewComposited(previewVideo, true);
+        return true;
+      }
+      lastPublishedMediaTime = mediaTime;
+      hasDynamicFrame = true;
+      lastFrameTargetTime = Number(targetTime) || mediaTime;
+      if (previewImg) previewImg.style.display = 'none';
+      if (sprite && globalThis.ArchivebateYouTubeStoryboard?.clearFrame) {
+        globalThis.ArchivebateYouTubeStoryboard.clearFrame(sprite);
+      }
+      if (status) status.style.display = 'none';
+      keepPreviewComposited(previewVideo, true);
+      metrics.frames += 1;
+      if (fromSeekedFallback) metrics.seekedFallbackFrames += 1;
+      return true;
+    }
+
     previewVideo.addEventListener('loadedmetadata', () => { metrics.metadataEvents += 1; });
-    previewVideo.addEventListener('seeked', () => { metrics.seekedEvents += 1; });
+    previewVideo.addEventListener('seeked', () => {
+      metrics.seekedEvents += 1;
+      // Chromium/webview can fail to deliver requestVideoFrameCallback for a
+      // paused auxiliary video. After seeked, wait two compositor turns and use
+      // the decoded frame directly as a robust fallback.
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        publishFrame(previewVideo.currentTime, { fromSeekedFallback: true });
+      }));
+    });
     previewVideo.addEventListener('error', () => { metrics.videoErrors += 1; });
 
     seeker = globalThis.ArchivebatePlayerCore.createPreviewSeeker(previewVideo, {
       minInterval: MIN_INTERVAL_MS,
       watchdogMs: WATCHDOG_MS,
       onFrame: (_actualTime, requestedTime) => {
-        if (!hoverActive) return;
-        if (!modal?.classList?.contains?.('active')) return;
-        const state = appState();
-        const { videoId, duration } = currentIdentity(mainVideo, state);
-        if (!videoId || videoId !== latestVideoId || Math.abs(duration - latestDuration) > 1.0) return;
-
-        // Exact sprite may have completed while the fallback seek was in flight.
-        // Never cover a ready exact frame with the lower-priority video fallback.
-        if (currentSegmentCached(videoId, duration, latestTargetTime)) {
-          metrics.exactSkips += 1;
-          hideDynamicVideo(previewVideo);
-          return;
-        }
-        if (state?.currentTimelinePrefix || state?.timelineSpriteBoard) {
-          metrics.coarseSkips += 1;
-          hideDynamicVideo(previewVideo);
-          return;
-        }
-
-        // The seeker serializes decode work, so every callback is the newest
-        // actually decoded frame even when a newer pointer target is already
-        // queued. Showing it is preferable to rejecting every in-flight frame
-        // and leaving the static poster visible until the cursor stops.
-        hasDynamicFrame = true;
-        lastFrameTargetTime = Number(requestedTime) || 0;
-        if (previewImg) previewImg.style.display = 'none';
-        if (sprite && globalThis.ArchivebateYouTubeStoryboard?.clearFrame) {
-          globalThis.ArchivebateYouTubeStoryboard.clearFrame(sprite);
-        }
-        if (status) status.style.display = 'none';
-        keepPreviewComposited(previewVideo, true);
-        metrics.frames += 1;
+        publishFrame(requestedTime);
       },
       onError: () => {
         metrics.videoErrors += 1;
@@ -174,21 +195,20 @@
       seeker?.reset?.();
       hasDynamicFrame = false;
       lastFrameTargetTime = null;
+      lastPublishedMediaTime = null;
       sourceVideoId = videoId;
       const src = `/api/video/stream?id=${encodeURIComponent(videoId)}&owner=preview&priority=low&reason=timeline_preview`;
       if (previewVideo.dataset) previewVideo.dataset.v43PreviewVideoId = videoId;
       previewVideo.src = src;
       previewVideo.preload = 'metadata';
-      // Critical: compositor-backed frame callbacks require the media element to
-      // participate in rendering. It is almost transparent until decoding wins.
       keepPreviewComposited(previewVideo, false);
       try { previewVideo.load(); } catch (_) {}
       metrics.sourceLoads += 1;
       return true;
     }
 
-    function requestFromPointer(event) {
-      if (!event || !modal?.classList?.contains?.('active')) return;
+    function requestFromClientX(clientX) {
+      if (!modal?.classList?.contains?.('active')) return;
       const state = appState();
       if (!state || state.currentTimelinePrefix) return;
       const { videoId, duration } = currentIdentity(mainVideo, state);
@@ -196,12 +216,9 @@
 
       const rect = timeline.getBoundingClientRect?.();
       if (!rect?.width) return;
-      const pos = Math.max(0, Math.min(1, (Number(event.clientX) - rect.left) / rect.width));
+      const pos = Math.max(0, Math.min(1, (Number(clientX) - rect.left) / rect.width));
       const targetTime = pos * duration;
 
-      // The exact sprite and any already-prepared coarse board stay above this
-      // fallback. We only open the extra media source when the UI would
-      // otherwise show the same static poster at every position.
       if (currentSegmentCached(videoId, duration, targetTime)) {
         metrics.exactSkips += 1;
         seeker?.reset?.();
@@ -214,9 +231,6 @@
         hideDynamicVideo(previewVideo);
         return;
       }
-
-      // Do not compete with click-to-first-frame. The main player must already
-      // have decoded useful media before the fallback opens a second range stream.
       if (Number(mainVideo.readyState || 0) < 2) {
         metrics.notReadySkips += 1;
         return;
@@ -228,10 +242,10 @@
       latestDuration = duration;
       latestVideoId = videoId;
 
-      // modal-player-controls shows the poster on every pointermove. Our handler
-      // runs afterwards, restoring the last decoded frame immediately while the
-      // next seek is pending. Before the first frame we stay composited at tiny
-      // opacity so requestVideoFrameCallback can fire.
+      // modal-player-controls performs its own timeline render in RAF and, on
+      // the cold path, explicitly hides previewVideo and re-shows the poster.
+      // This V4.3 handler is itself scheduled in RAF *after* that renderer, so
+      // the dynamic frame wins the final composited state for this pointer frame.
       keepPreviewComposited(previewVideo, hasDynamicFrame);
       if (hasDynamicFrame) {
         if (previewImg) previewImg.style.display = 'none';
@@ -245,19 +259,27 @@
       seeker.request(targetTime);
     }
 
-    timeline.addEventListener('pointerenter', requestFromPointer, { passive: true });
-    timeline.addEventListener('pointermove', requestFromPointer, { passive: true });
+    function schedulePointer(event) {
+      if (!event) return;
+      pendingClientX = Number(event.clientX) || 0;
+      if (pointerRaf) return;
+      pointerRaf = requestAnimationFrame(() => {
+        pointerRaf = 0;
+        requestFromClientX(pendingClientX);
+      });
+    }
+
+    // These listeners are registered after modal-player-controls. Its RAF is
+    // queued first; ours is queued second, preventing the normal cold-poster
+    // renderer from hiding the dynamic video after every pointermove.
+    timeline.addEventListener('pointerenter', schedulePointer, { passive: true });
+    timeline.addEventListener('pointermove', schedulePointer, { passive: true });
     timeline.addEventListener('pointerleave', () => resetSeeker(previewVideo), { passive: true });
 
-    // Switching/closing the primary player is a hard lifecycle boundary for the
-    // low-priority preview source as well.
     mainVideo.addEventListener('emptied', () => resetSeeker(previewVideo, { clearSource: true }));
   }
 
   function scheduleInstall() {
-    // modal-player-controls.js registers its handlers earlier in index.html. Run
-    // after DOMContentLoaded listeners so its normal exact-sprite path executes
-    // first and this module remains only a fallback layer.
     setTimeout(install, 0);
   }
 
@@ -282,6 +304,7 @@
         not_ready_skips: metrics.notReadySkips,
         metadata_events: metrics.metadataEvents,
         seeked_events: metrics.seekedEvents,
+        seeked_fallback_frames: metrics.seekedFallbackFrames,
         video_errors: metrics.videoErrors,
         has_dynamic_frame: hasDynamicFrame,
         last_target_time: Number(latestTargetTime.toFixed?.(3) ?? latestTargetTime),
