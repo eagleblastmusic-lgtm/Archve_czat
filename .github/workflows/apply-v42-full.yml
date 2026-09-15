@@ -81,16 +81,17 @@ jobs:
         run: python -m compileall -q .
       - name: V4.2 full regression
         run: python audit/regression_v42_full.py
-      - name: Persist V4.2 candidate implementation
+      - name: Persist V4.2 core candidate implementation
         run: |
           rm -f v42_apply.log
+          git restore --source=HEAD -- .github/workflows/ci.yml
           git add -A
           git status --short
           if git diff --cached --quiet; then
             echo "No candidate changes to commit"
             exit 1
           fi
-          git commit -m "Implement V4.2 security and runtime hardening"
+          git commit -m "Implement V4.2 core security and runtime hardening"
           git push origin HEAD:v4.2-security-runtime-hardening
       - name: Existing audit-fix regression
         shell: bash
