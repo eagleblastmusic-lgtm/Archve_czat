@@ -1,0 +1,4 @@
+  File "/home/runner/work/Archve_czat/Archve_czat/tools/apply_v42_full.py", line 381
+    CREATE TABLE revisions(revision INTEGER PRIMARY KEY, complete INTEGER, failed INTEGER, is_active INTEGER, published_at REAL, updated_at REAL, created_at REAL, video_count INTEGER, error TEXT, published_hash TEXT);
+IndentationError: unexpected indent
+APPLY_RC=1
