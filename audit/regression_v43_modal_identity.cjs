@@ -58,4 +58,22 @@ const otherVideo = { id: 'mainPlayer', dataset: {} };
 listeners.get('play')({ target: otherVideo });
 assert.equal(otherVideo.dataset.videoId, undefined, 'bridge is modal-specific');
 
-console.log('PASS V4.3 MODAL IDENTITY BRIDGE');
+// Visual correctness gate: V4.3 must not fall back to one static poster while
+// the pointer moves over uncached Archivebate timeline segments. The dedicated
+// fallback uses a low-priority seekable stream and keeps exact storyboard
+// segments above it when they are ready.
+const fallbackSource = fs.readFileSync('static/v43-timeline-fallback.js', 'utf8');
+assert.doesNotThrow(() => new vm.Script(fallbackSource, { filename: 'v43-timeline-fallback.js' }));
+assert.match(fallbackSource, /createPreviewSeeker\(previewVideo/);
+assert.match(fallbackSource, /owner=preview&priority=low&reason=timeline_preview/);
+assert.match(fallbackSource, /getSegmentFromCache/);
+assert.match(fallbackSource, /Number\(mainVideo\.readyState \|\| 0\) < 2/);
+assert.match(fallbackSource, /timeline\.addEventListener\('pointerleave'/);
+assert.match(fallbackSource, /meta\.isLatest === false/);
+assert.doesNotMatch(fallbackSource, /cold QUICK/i, 'fallback must not re-enable cold QUICK generation');
+
+const runtimeSource = fs.readFileSync('runtime_app.py', 'utf8');
+assert.match(runtimeSource, /v43-timeline-fallback\.js/);
+assert.match(runtimeSource, /dynamic_timeline_fallback["']:\s*True/);
+
+console.log('PASS V4.3 MODAL IDENTITY + DYNAMIC TIMELINE FALLBACK');
