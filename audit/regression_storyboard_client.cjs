@@ -46,9 +46,13 @@ const vm = require('node:vm');
   assert.ok(api, 'ArchivebateYouTubeStoryboard should be exported');
 
   let segmentStarts = 0;
+  let demandPosts = 0;
+  let demandDeletes = 0;
   context.ArchivebateAPI = {
-    request: async (url) => {
+    request: async (url, options = {}) => {
       if (String(url).includes('/api/storyboard/demand')) {
+        if (String(options.method || 'GET').toUpperCase() === 'DELETE') demandDeletes += 1;
+        else demandPosts += 1;
         return { ok: true, json: async () => ({ ok: true }) };
       }
       if (String(url).includes('/api/storyboard/segment')) {
@@ -200,7 +204,40 @@ const vm = require('node:vm');
   context.setTimeout = realSetTimeout;
   context.clearTimeout = realClearTimeout;
 
-  console.log('PASS: shared segment abort/dedupe, attach gating, buffered watch prewarm and weak-buffer protection work');
+  // A real hover signal owns a persistent per-video lease in addition to the
+  // exact segment lease. The exact entry may finish and release its lease, but
+  // the hover lease must stay alive so directional backend prefetch is not
+  // cancelled immediately. Pointerleave (signal abort) releases the final lease.
+  context.ArchivebatePerf = { getBufferedAhead: () => 3.5 };
+  const hoverAbort = new AbortController();
+  let hoverReady = false;
+  const postsBeforeHover = demandPosts;
+  const deletesBeforeHover = demandDeletes;
+  api.requestSegment({
+    videoId: 'hover-lease-fixture',
+    duration: 90,
+    targetTime: 35,
+    signal: hoverAbort.signal,
+    onReady: () => { hoverReady = true; }
+  });
+  for (let i = 0; i < 60 && images.length < 3; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+  assert.equal(images.length, 3, 'hover exact request should reach sprite preload');
+  images[2].onload();
+  for (let i = 0; i < 30 && !hoverReady; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+  assert.equal(hoverReady, true, 'hover segment should become ready');
+  assert.equal(demandPosts - postsBeforeHover, 2, 'hover uses one persistent target lease plus one exact-entry lease');
+  assert.equal(demandDeletes - deletesBeforeHover, 1, 'exact-entry lease may close while hover target lease stays alive');
+  assert.equal(api.stats().target_leases, 1, 'target lease must remain while pointer signal is alive');
+  hoverAbort.abort();
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(demandDeletes - deletesBeforeHover, 2, 'pointerleave releases the persistent hover lease');
+  assert.equal(api.stats().target_leases, 0, 'no hover lease may leak after pointerleave');
+
+  console.log('PASS: segment dedupe, safe prewarm, weak-buffer protection and persistent hover lease lifecycle work');
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
