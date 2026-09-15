@@ -44,6 +44,7 @@ const vm = require('node:vm');
 
   const api = context.window.ArchivebateYouTubeStoryboard;
   assert.ok(api, 'ArchivebateYouTubeStoryboard should be exported');
+  assert.ok(api.HOVER_INTENT_MS >= 100, 'hover intent gate should suppress fly-over segments');
 
   let segmentStarts = 0;
   let demandPosts = 0;
@@ -57,9 +58,10 @@ const vm = require('node:vm');
       }
       if (String(url).includes('/api/storyboard/segment')) {
         segmentStarts += 1;
+        const held = String(url).includes('cleanup-fixture');
         return {
           ok: true,
-          json: async () => ({
+          json: async () => held ? { status: 'building' } : ({
             status: 'ready',
             type: 'segment',
             segment_index: 0,
@@ -85,9 +87,6 @@ const vm = require('node:vm');
   firstAbort.abort();
   await assert.rejects(first, { name: 'AbortError' });
 
-  // Backend start and Image creation are asynchronous microtasks. Wait until the
-  // surviving consumer has reached sprite preload instead of asserting in the
-  // same tick as the abort.
   for (let i = 0; i < 50 && images.length === 0; i += 1) {
     await new Promise(resolve => setTimeout(resolve, 2));
   }
@@ -101,6 +100,9 @@ const vm = require('node:vm');
   const warm = await api.prepareSegment({ videoId: 'fixture', duration: 30, segmentIndex: 0 });
   assert.equal(warm.sprite_url, '/sprite-1');
   assert.equal(segmentStarts, 1, 'warm cache must not restart backend work');
+  const hitsBeforeDirectLookup = api.stats().cache_hits;
+  assert.ok(api.getSegmentFromCache('fixture', 30, 0), 'prepared segment should be available to timeline lookup');
+  assert.equal(api.stats().cache_hits, hitsBeforeDirectLookup + 1, 'timeline cache lookup must count a cache hit');
 
   // `attach` may inspect an already cached QUICK board, but pointer-enter/play
   // must not independently start an exact FFmpeg segment before playback has a
@@ -110,6 +112,9 @@ const vm = require('node:vm');
     if (String(url).startsWith('/api/storyboard?')) {
       statusGets += 1;
       return { ok: true, json: async () => ({ status: 'missing' }) };
+    }
+    if (String(url).startsWith('/api/storyboard/segment?')) {
+      return { ok: true, json: async () => ({ status: 'building' }) };
     }
     throw new Error(`Unexpected fetch: ${url}`);
   };
@@ -206,8 +211,7 @@ const vm = require('node:vm');
 
   // A real hover signal owns a persistent per-video lease in addition to the
   // exact segment lease. The exact entry may finish and release its lease, but
-  // the hover lease must stay alive so directional backend prefetch is not
-  // cancelled immediately. Pointerleave (signal abort) releases the final lease.
+  // the hover lease stays alive until pointerleave.
   context.ArchivebatePerf = { getBufferedAhead: () => 3.5 };
   const hoverAbort = new AbortController();
   let hoverReady = false;
@@ -220,24 +224,79 @@ const vm = require('node:vm');
     signal: hoverAbort.signal,
     onReady: () => { hoverReady = true; }
   });
-  for (let i = 0; i < 60 && images.length < 3; i += 1) {
-    await new Promise(resolve => setTimeout(resolve, 2));
+  for (let i = 0; i < 120 && images.length < 3; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 3));
   }
-  assert.equal(images.length, 3, 'hover exact request should reach sprite preload');
+  assert.equal(images.length, 3, 'settled hover intent should reach sprite preload');
   images[2].onload();
-  for (let i = 0; i < 30 && !hoverReady; i += 1) {
-    await new Promise(resolve => setTimeout(resolve, 2));
+  for (let i = 0; i < 40 && !hoverReady; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 3));
   }
   assert.equal(hoverReady, true, 'hover segment should become ready');
   assert.equal(demandPosts - postsBeforeHover, 2, 'hover uses one persistent target lease plus one exact-entry lease');
   assert.equal(demandDeletes - deletesBeforeHover, 1, 'exact-entry lease may close while hover target lease stays alive');
   assert.equal(api.stats().target_leases, 1, 'target lease must remain while pointer signal is alive');
   hoverAbort.abort();
-  await new Promise(resolve => setTimeout(resolve, 5));
+  await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(demandDeletes - deletesBeforeHover, 2, 'pointerleave releases the persistent hover lease');
   assert.equal(api.stats().target_leases, 0, 'no hover lease may leak after pointerleave');
 
-  console.log('PASS: segment dedupe, safe prewarm, weak-buffer protection and persistent hover lease lifecycle work');
+  // Rapid fly-over across many 30-second segments must not translate into one
+  // FFmpeg start per crossed segment. Only the final settled intent may start.
+  const rapidAbort = new AbortController();
+  const startsBeforeRapid = segmentStarts;
+  const cancelledBeforeRapid = api.stats().intent_cancelled_before_start;
+  for (let i = 0; i < 20; i += 1) {
+    api.requestSegment({
+      videoId: 'rapid-fixture',
+      duration: 900,
+      targetTime: i * 30 + 1,
+      signal: rapidAbort.signal,
+      onReady: () => {}
+    });
+  }
+  await new Promise(resolve => setTimeout(resolve, 60));
+  assert.equal(segmentStarts, startsBeforeRapid, 'fly-over intents must not start backend work before dwell threshold');
+  for (let i = 0; i < 80 && segmentStarts === startsBeforeRapid; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 3));
+  }
+  assert.equal(segmentStarts, startsBeforeRapid + 1, 'only final settled fly-over segment may start backend work');
+  const rapidImage = images[images.length - 1];
+  rapidImage.onload();
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.ok(api.stats().intent_cancelled_before_start >= cancelledBeforeRapid + 19, 'crossed segments must be cancelled before FFmpeg starts');
+  rapidAbort.abort();
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  // Pointerleave must also cancel an independent playback prewarm for the same
+  // video; otherwise that extra lease can keep stale hover FFmpeg alive server-side.
+  const cleanupStartsBefore = segmentStarts;
+  const cleanupWarm = api.warm({ videoId: 'cleanup-fixture', duration: 90, targetTime: 1 });
+  for (let i = 0; i < 50 && segmentStarts === cleanupStartsBefore; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+  assert.equal(segmentStarts, cleanupStartsBefore + 1, 'cleanup fixture prewarm should start one backend segment');
+  const cleanupHover = new AbortController();
+  api.requestSegment({
+    videoId: 'cleanup-fixture',
+    duration: 90,
+    targetTime: 35,
+    signal: cleanupHover.signal,
+    onReady: () => {}
+  });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  cleanupHover.abort();
+  await cleanupWarm;
+  for (let i = 0; i < 40 && (api.stats().segment_inflight || api.stats().warm_inflight || api.stats().target_leases); i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 3));
+  }
+  const cleanupStats = api.stats();
+  assert.equal(cleanupStats.segment_inflight, 0, 'pointerleave must abort all exact segment consumers for the video');
+  assert.equal(cleanupStats.warm_inflight, 0, 'pointerleave must abort playback prewarm for the video');
+  assert.equal(cleanupStats.target_leases, 0, 'pointerleave must leave no target lease');
+  assert.equal(cleanupStats.active_target_requests, 0, 'pointerleave must leave no pending hover intent');
+
+  console.log('PASS: debounce suppresses fly-over FFmpeg starts, cache telemetry works and pointerleave drains client storyboard work');
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
