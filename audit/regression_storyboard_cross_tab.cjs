@@ -2,109 +2,104 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 
-// Dwie izolowane karty współdzielą kanał i localStorage. Test sprawdza, że
-// tylko właściciel dzierżawy odpytuje status, a druga karta dostaje ten sam
-// gotowy manifest i obraz.
+// V4.3 removed QUICK→FULL cross-tab polling entirely. This regression now
+// protects the replacement invariant: one exact-segment backend operation is
+// shared by concurrent consumers, and aborting one consumer does not kill the
+// work while another consumer is still waiting.
 const source = fs.readFileSync('static/youtube-storyboard.js', 'utf8');
-const channelGroups = new Map();
-const storageData = new Map();
+let demandPosts = 0;
+let segmentPosts = 0;
+let demandDeletes = 0;
+let imageLoads = 0;
 
-class FakeBroadcastChannel {
-  constructor(name) {
-    this.name = name;
-    this.listeners = new Set();
-    if (!channelGroups.has(name)) channelGroups.set(name, new Set());
-    channelGroups.get(name).add(this);
+class FakeImage {
+  constructor() { this.style = {}; }
+  set src(value) {
+    this._src = value;
+    imageLoads += 1;
+    setTimeout(() => this.onload?.(), 5);
   }
-  addEventListener(type, listener) {
-    if (type === 'message') this.listeners.add(listener);
-  }
-  removeEventListener(type, listener) {
-    if (type === 'message') this.listeners.delete(listener);
-  }
-  postMessage(data) {
-    for (const peer of channelGroups.get(this.name) || []) {
-      if (peer === this) continue;
-      setTimeout(() => {
-        for (const listener of peer.listeners) listener({ data });
-      }, 0);
-    }
-  }
-  close() { channelGroups.get(this.name)?.delete(this); }
+  get src() { return this._src; }
 }
 
-const sharedStorage = {
-  getItem(key) { return storageData.has(key) ? storageData.get(key) : null; },
-  setItem(key, value) { storageData.set(key, String(value)); },
-  removeItem(key) { storageData.delete(key); }
+const context = {
+  console,
+  Map,
+  Set,
+  AbortController,
+  DOMException,
+  Image: FakeImage,
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+  performance,
+  crypto: { randomUUID: () => `uuid-${Math.random()}` },
+  document: {
+    querySelector() { return null; },
+    createElement() { return { style: {}, dataset: {}, querySelector: () => null, replaceChildren() {} }; }
+  }
 };
-
-let statusCalls = 0;
-function makeImageClass() {
-  return class FakeImage {
-    set src(value) {
-      this._src = value;
-      setTimeout(() => this.onload?.(), 0);
+context.window = context;
+context.ArchivebateAPI = {
+  request: async (url, options = {}) => {
+    const method = String(options.method || 'GET').toUpperCase();
+    if (String(url).includes('/api/storyboard/demand')) {
+      if (method === 'DELETE') demandDeletes += 1;
+      else demandPosts += 1;
+      return { ok: true, json: async () => ({ ok: true }) };
     }
-    get src() { return this._src; }
-  };
-}
-
-function makeContext() {
-  const context = {
-    console,
-    Map,
-    Set,
-    AbortController,
-    BroadcastChannel: FakeBroadcastChannel,
-    localStorage: sharedStorage,
-    Image: makeImageClass(),
-    setTimeout,
-    clearTimeout,
-    setInterval,
-    clearInterval,
-    queueMicrotask,
-    performance,
-    crypto: { randomUUID: () => `${Math.random()}-${Date.now()}` },
-    __ARCHIVEBATE_STORYBOARD_TEST__: true,
-    fetch: async (url) => {
-      if (String(url).includes('/api/storyboard?')) {
-        statusCalls += 1;
-        return {
-          ok: true,
-          json: async () => statusCalls < 2
-            ? { status: 'building', quality: 'quick' }
-            : { status: 'ready', quality: 'full', sprite_url: '/fixture/full.jpg', frame_count: 8 }
-        };
-      }
-      throw new Error(`Unexpected request: ${url}`);
+    if (String(url).includes('/api/storyboard/segment')) {
+      segmentPosts += 1;
+      await new Promise(resolve => setTimeout(resolve, 10));
+      return {
+        ok: true,
+        json: async () => ({
+          status: 'ready',
+          type: 'segment',
+          segment_index: 4,
+          frame_count: 3,
+          columns: 3,
+          rows: 1,
+          frame_width: 160,
+          frame_height: 90,
+          times: [120, 121, 122],
+          sprite_url: '/fixture/segment-4.jpg'
+        })
+      };
     }
-  };
-  context.window = context;
-  vm.createContext(context);
-  vm.runInContext(source, context, { filename: 'youtube-storyboard.js' });
-  return context;
-}
+    throw new Error(`Unexpected request ${method} ${url}`);
+  }
+};
+context.fetch = async url => { throw new Error(`Unexpected GET ${url}`); };
+
+vm.createContext(context);
+vm.runInContext(source, context, { filename: 'youtube-storyboard.js' });
 
 (async () => {
-  const first = makeContext();
-  const second = makeContext();
+  const api = context.window.ArchivebateYouTubeStoryboard;
+  assert.ok(api);
+  assert.equal(api.stats().full_upgrade_enabled, false, 'FULL upgrade must remain disabled');
+
   const a = new AbortController();
   const b = new AbortController();
-  const delivered = [0, 0];
-  const base = { videoId: 'cross-tab-fixture', duration: 30, key: 'cross-tab-fixture:30' };
+  const first = api.prepareSegment({ videoId: 'shared-fixture', duration: 180, segmentIndex: 4, signal: a.signal });
+  const second = api.prepareSegment({ videoId: 'shared-fixture', duration: 180, segmentIndex: 4, signal: b.signal });
 
-  first.window.ArchivebateYouTubeStoryboard.__startUpgradeWatcher({
-    ...base, signal: a.signal, onUpgrade: () => { delivered[0] += 1; }
-  });
-  second.window.ArchivebateYouTubeStoryboard.__startUpgradeWatcher({
-    ...base, signal: b.signal, onUpgrade: () => { delivered[1] += 1; }
-  });
-
-  await new Promise(resolve => setTimeout(resolve, 2200));
-  assert.equal(statusCalls, 2, 'one tab should poll pending then ready');
-  assert.deepEqual(delivered, [1, 1], 'both tabs should receive the same full board');
   a.abort();
-  b.abort();
-  console.log('PASS: one QUICK→FULL status watcher shared across two tabs; manifest delivered to both');
-})().catch(error => { console.error(error); process.exitCode = 1; });
+  await assert.rejects(first, { name: 'AbortError' });
+  const board = await second;
+  assert.equal(board.segment_index, 4);
+  assert.equal(demandPosts, 1, 'concurrent consumers should share one lease');
+  assert.equal(segmentPosts, 1, 'concurrent consumers should share one segment start');
+  assert.equal(imageLoads, 1, 'concurrent consumers should share one sprite load');
+
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(demandDeletes, 1, 'shared lease should be released exactly once');
+  assert.equal(api.stats().segment_inflight, 0, 'in-flight registry should be empty after completion');
+
+  console.log('PASS: V4.3 shared exact-segment operation survives one consumer abort and cleans up once');
+})().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});
