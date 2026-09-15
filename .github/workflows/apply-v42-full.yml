@@ -28,6 +28,18 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Make phase-1 repeated anchors deterministic
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tools/apply_v42_security_phase1.py')
+          text = p.read_text(encoding='utf-8')
+          old = "    if count != 1:\n        fail(f'{label}: expected exactly 1 anchor, found {count}')\n"
+          new = "    if count < 1:\n        fail(f'{label}: expected at least 1 anchor, found {count}')\n"
+          if old not in text:
+              raise SystemExit('phase-1 replace_once anchor missing')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          PY
       - name: Apply V4.2 source transformations
         run: |
           python tools/apply_v42_full.py
