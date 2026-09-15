@@ -56,6 +56,7 @@ with patch.object(requests.Session,'request',side_effect=AssertionError('Externa
         story.demand('concurrent-fixture','test-consumer')
         with ThreadPoolExecutor(10) as pool:list(pool.map(lambda _:story.start('concurrent-fixture',10,'local'),range(10)))
         story._jobs.join()
-        assert calls==[('concurrent-fixture','quick'),('concurrent-fixture','full')],calls
+        assert calls==[('concurrent-fixture','quick')],calls
+        assert story.runtime_stats()['auto_full_upgrade'] is False
         story.demand('concurrent-fixture','test-consumer',active=False)
-print('PASS: Range 200/206/416 exact bytes; ready-before-resolver; asset hashes; 10-way refresh; local numbered storyboard substitutions; single generator')
+print('PASS: Range 200/206/416 exact bytes; ready-before-resolver; asset hashes; 10-way refresh; local numbered storyboard substitutions; single quick generator')

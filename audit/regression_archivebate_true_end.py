@@ -33,6 +33,10 @@ class DummyArchiveSession:
         self.session = DummyHttp()
         self.csrf_token = None
 
+    def request(self, method, url, **kwargs):
+        assert str(method).upper() == "GET"
+        return self.session.get(url, **kwargs)
+
     def call_livewire(self, *args, **kwargs):
         return ""
 

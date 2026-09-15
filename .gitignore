@@ -23,6 +23,7 @@ audit/nextgen_*
 audit/audit_fixes_*
 audit/package_b_*
 audit/deep_fixture_*
+audit/v42full_*
 
 data/catalog.db
 data/catalog.db-wal
@@ -30,3 +31,6 @@ data/catalog.db-shm
 
 # Local repair backups
 *.bak_*
+
+# Runtime model-tag enrichment (seed is tracked separately)
+data/model_tags.local.json

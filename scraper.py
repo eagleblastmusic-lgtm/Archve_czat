@@ -137,9 +137,7 @@ def extract_video_tags(v: Dict[str, Any]) -> List[str]:
                 tags.add(tag_name.capitalize())
                 break
                 
-    if not any(t in tags for t in ["Trans", "Female", "Male", "Couple"]):
-        tags.add("Female")
-    elif "Trans" in tags and "Female" in tags:
+    if "Trans" in tags and "Female" in tags:
         tags.remove("Female")
         
     res_tags = sorted(list(tags))
@@ -229,6 +227,9 @@ class ArchivebateScraper:
         self.session = session
         self._cache: Dict[str, Any] = {}
         self._projection_cache: Dict[str, Any] = {}
+
+    def clone_for_background(self) -> "ArchivebateScraper":
+        return ArchivebateScraper(self.session.clone_for_background())
 
     def _preferences_version(self) -> int:
         try:
@@ -366,7 +367,7 @@ class ArchivebateScraper:
             return []
         url = f"https://archivebate.com?page={p}" if p > 1 else "https://archivebate.com"
         try:
-            r = self.session.session.get(url, timeout=10)
+            r = self.session.request("GET", url, timeout=10)
             if strict: r.raise_for_status()
             html = r.text
             self._sync_csrf(html, url)
@@ -572,7 +573,7 @@ class ArchivebateScraper:
         def _fetch_page(p):
             url = f"https://archivebate.com/profile/{clean_user}?page={p}"
             try:
-                r = self.session.session.get(url, timeout=(2.5, 4.0))
+                r = self.session.request("GET", url, timeout=(2.5, 4.0))
                 if r.status_code >= 400:
                     return []
                 html = r.text
@@ -630,7 +631,7 @@ class ArchivebateScraper:
 
         url = f"https://archivebate.com/profile/{username}?page={page}"
         try:
-            r = self.session.session.get(url, timeout=5)
+            r = self.session.request("GET", url, timeout=5)
             if r.status_code >= 500:
                 result = FetchResult.error_result(f"Archivebate HTTP {r.status_code}", source="archivebate", page=page)
                 return result if typed else []
@@ -694,7 +695,7 @@ class ArchivebateScraper:
         valid_response = False
         last_error = None
         try:
-            r = self.session.session.get(
+            r = self.session.request("GET", 
                 f"https://archivebate.com/api/v1/search?query={clean_q}&page={page}",
                 headers=headers,
                 timeout=5
@@ -718,7 +719,7 @@ class ArchivebateScraper:
             extra_chars = [' ', '-', '_']
             for c in extra_chars:
                 try:
-                    r2 = self.session.session.get(
+                    r2 = self.session.request("GET", 
                         f"https://archivebate.com/api/v1/search?query={clean_q}{c}&page=1",
                         headers=headers,
                         timeout=3
@@ -1293,7 +1294,7 @@ class ArchivebateScraper:
             url = f"https://archivebate.com/watch/{clean_id}"
 
         try:
-            r = self.session.session.get(url, timeout=12)
+            r = self.session.request("GET", url, timeout=12)
             html = r.text
 
             # Mixdrop iframe
@@ -1343,7 +1344,7 @@ class ArchivebateScraper:
             direct_mp4_url = ""
             if embed_url:
                 try:
-                    mixdrop_res = self.session.session.get(embed_url, timeout=10)
+                    mixdrop_res = self.session.request("GET", embed_url, timeout=10)
                     direct_mp4_url = unpack_mixdrop(mixdrop_res.text) or ""
                 except Exception as e:
                     logger.error(f"Błąd pobierania direct stream z Mixdrop: {e}")
@@ -1390,13 +1391,13 @@ class ArchivebateScraper:
         def fetch_page(p: int):
             url = f"https://archivebate.com/{endpoint}?page={p}" if p > 1 else f"https://archivebate.com/{endpoint}"
             try:
-                r = self.session.session.get(url, timeout=12)
+                r = self.session.request("GET", url, timeout=12)
                 if hasattr(r, "raise_for_status"):
                     r.raise_for_status()
                 if "login" in str(getattr(r, "url", "")):
                     if not self.session.login():
                         raise RuntimeError("account_auth_failed")
-                    r = self.session.session.get(url, timeout=12)
+                    r = self.session.request("GET", url, timeout=12)
                     if hasattr(r, "raise_for_status"):
                         r.raise_for_status()
                     if "login" in str(getattr(r, "url", "")):
@@ -1431,7 +1432,7 @@ class ArchivebateScraper:
         """Send toggleSave and report confirmed/failed/unknown instead of a false success."""
         try:
             watch_url = f"https://archivebate.com/watch/{video_id}"
-            r = self.session.session.get(watch_url, timeout=10)
+            r = self.session.request("GET", watch_url, timeout=10)
             if r.status_code >= 400:
                 return {"status": "failed", "error": f"Archivebate HTTP {r.status_code}"}
             for m in re.finditer(r'wire:id="([^"]+)" wire:initial-data="([^"]+)"', r.text):

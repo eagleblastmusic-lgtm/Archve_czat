@@ -2,6 +2,7 @@ import requests
 import re
 import json
 import logging
+import threading
 from typing import Optional, Dict, Any
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -16,6 +17,8 @@ class ArchivebateSession:
         self.email = email
         self.password = password
         self.session = requests.Session()
+        self._request_lock = threading.RLock()
+        self._auth_lock = threading.RLock()
         
         # Kontrolowana pula połączeń i ograniczony budżet retry, aby nie blokować pętli zdarzeń
         retries = Retry(total=1, connect=1, read=0, backoff_factor=0.2, status_forcelist=[502, 503, 504])
@@ -33,10 +36,26 @@ class ArchivebateSession:
         self.is_logged_in: bool = False
         self.last_login_error: str = ""
 
+    def request(self, method: str, url: str, **kwargs):
+        """Serialize access to the mutable requests.Session state."""
+        with self._request_lock:
+            return self.session.request(method, url, **kwargs)
+
+    def clone_for_background(self) -> "ArchivebateSession":
+        """Create an independent HTTP pool with an atomic cookie/header snapshot."""
+        clone = ArchivebateSession(email=self.email, password=self.password)
+        with self._request_lock:
+            clone.session.headers.update(dict(self.session.headers))
+            clone.session.cookies.update(self.session.cookies)
+            clone.csrf_token = self.csrf_token
+            clone.is_logged_in = self.is_logged_in
+            clone.last_login_error = self.last_login_error
+        return clone
+
     def refresh_csrf(self) -> Optional[str]:
         """Pobiera świeży token CSRF ze strony głównej."""
         try:
-            r = self.session.get(f"{self.BASE_URL}/login", timeout=10)
+            r = self.request("GET", f"{self.BASE_URL}/login", timeout=10)
             match = re.search(r'name="_token"\s+value="([^"]+)"', r.text) or re.search(r'csrf-token"\s+content="([^"]+)"', r.text)
             if match:
                 self.csrf_token = match.group(1)
@@ -47,6 +66,11 @@ class ArchivebateSession:
         return None
 
     def login(self) -> bool:
+        """Serialize login/CSRF transitions so cookies and auth state change atomically."""
+        with self._auth_lock:
+            return self._login_locked()
+
+    def _login_locked(self) -> bool:
         """Loguje użytkownika do konta Archivebate i zachowuje czytelny powód błędu."""
         self.last_login_error = ""
         if not self.email or not self.password:
@@ -75,7 +99,7 @@ class ArchivebateSession:
             # Najpierw wykonujemy POST bez automatycznego redirectu. Laravel zwykle
             # odpowiada 302 po prawidłowym logowaniu; dzięki temu nie uzależniamy
             # sukcesu od obecności konkretnego napisu w HTML strony docelowej.
-            r = self.session.post(login_url, data=payload, timeout=12, allow_redirects=False)
+            r = self.request("POST", login_url, data=payload, timeout=12, allow_redirects=False)
             location = str(r.headers.get("Location", ""))
             redirect_away_from_login = (
                 r.status_code in (301, 302, 303, 307, 308)
@@ -85,7 +109,7 @@ class ArchivebateSession:
 
             # Weryfikacja na sekcji wymagającej konta. To jest stabilniejsze niż
             # wcześniejsze szukanie słów logout/watchlater/history w HTML POST-a.
-            verify = self.session.get(f"{self.BASE_URL}/watchlater", timeout=12, allow_redirects=True)
+            verify = self.request("GET", f"{self.BASE_URL}/watchlater", timeout=12, allow_redirects=True)
             verify_url = str(verify.url).rstrip("/").lower()
             redirected_to_login = "/login" in verify_url
             html = verify.text.lower()
@@ -169,7 +193,7 @@ class ArchivebateSession:
             ]
         }
         try:
-            r = self.session.post(url, json=payload, headers=headers, timeout=(3.0, 8.0))
+            r = self.request("POST", url, json=payload, headers=headers, timeout=(3.0, 8.0))
             if r.status_code == 200:
                 data = r.json()
                 effects = data.get("effects", {})

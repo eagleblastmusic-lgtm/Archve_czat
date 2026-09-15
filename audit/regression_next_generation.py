@@ -233,7 +233,8 @@ def test_background_worker_lifecycle() -> None:
             storyboard.demand("lifecycle-video", "consumer")
             storyboard.start("lifecycle-video", 10, "fixture")
             storyboard._jobs.join()
-            assert calls == [("lifecycle-video", "quick"), ("lifecycle-video", "full")]
+            assert calls == [("lifecycle-video", "quick")]
+            assert storyboard.runtime_stats()["auto_full_upgrade"] is False
             storyboard.demand("lifecycle-video", "consumer", active=False)
             storyboard.shutdown(timeout=3)
             assert storyboard._worker_thread is None
@@ -242,7 +243,7 @@ def test_background_worker_lifecycle() -> None:
             storyboard.demand("lifecycle-restart", "consumer")
             storyboard.start("lifecycle-restart", 10, "fixture")
             storyboard._jobs.join()
-            assert calls[-2:] == [("lifecycle-restart", "quick"), ("lifecycle-restart", "full")]
+            assert calls[-1:] == [("lifecycle-restart", "quick")]
             storyboard.demand("lifecycle-restart", "consumer", active=False)
     finally:
         try:

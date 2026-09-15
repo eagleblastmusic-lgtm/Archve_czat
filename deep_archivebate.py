@@ -26,6 +26,7 @@ DISCOVERY_PAGE_SPLIT_THRESHOLD = 30
 DISCOVERY_MAX_PREFIX_DEPTH = 6
 PROFILE_EMPTY_END_THRESHOLD = 3
 PROFILE_REPEAT_END_THRESHOLD = 3
+PROFILE_MAX_RETRIES = 9
 
 
 def _clean_author(value: str) -> str:
@@ -85,6 +86,7 @@ class DeepArchivebateService:
                     last_signature TEXT,
                     repeated_signatures INTEGER NOT NULL DEFAULT 0,
                     crawl_complete INTEGER NOT NULL DEFAULT 0,
+                    crawl_state TEXT NOT NULL DEFAULT 'pending',
                     end_reason TEXT,
                     last_error TEXT
                 )
@@ -136,6 +138,9 @@ class DeepArchivebateService:
                 conn.execute("ALTER TABLE archivebate_models ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
             if "retry_at" not in model_columns:
                 conn.execute("ALTER TABLE archivebate_models ADD COLUMN retry_at REAL")
+            if "crawl_state" not in model_columns:
+                conn.execute("ALTER TABLE archivebate_models ADD COLUMN crawl_state TEXT NOT NULL DEFAULT 'pending'")
+            conn.execute("UPDATE archivebate_models SET crawl_state='done' WHERE crawl_complete=1 AND crawl_state='pending'")
             queue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(archivebate_discovery_queue)")}
             if "retry_at" not in queue_columns:
                 conn.execute("ALTER TABLE archivebate_discovery_queue ADD COLUMN retry_at REAL")
@@ -654,6 +659,7 @@ class DeepArchivebateService:
                 """
                 SELECT * FROM archivebate_models
                 WHERE crawl_complete = 0
+                  AND crawl_state IN ('pending', 'retry')
                   AND (retry_at IS NULL OR retry_at <= ?)
                 ORDER BY priority DESC, pages_scanned DESC, updated_at ASC, model_key ASC
                 LIMIT 1
@@ -675,13 +681,22 @@ class DeepArchivebateService:
                     conn = self._get_conn()
                     failed_at = time.time()
                     retry_count = int(row["retry_count"] or 0) + 1
-                    retry_delay = max(
-                        float(result.retry_after or 0.0),
-                        min(300.0, 2.0 ** min(retry_count, 8)),
-                    )
+                    lowered = str(error_text or "").lower()
+                    terminal_unavailable = any(token in lowered for token in ("404", "410", "not found", "gone"))
+                    auth_blocked = any(token in lowered for token in ("401", "403", "unauthorized", "forbidden"))
+                    quarantined = retry_count >= PROFILE_MAX_RETRIES
+                    if terminal_unavailable:
+                        crawl_state, crawl_complete, retry_at, end_reason = "unavailable", 1, None, "unavailable"
+                    elif auth_blocked:
+                        crawl_state, crawl_complete, retry_at, end_reason = "auth_blocked", 1, None, "auth_blocked"
+                    elif quarantined:
+                        crawl_state, crawl_complete, retry_at, end_reason = "quarantined", 1, None, "retry_limit"
+                    else:
+                        retry_delay = max(float(result.retry_after or 0.0), min(300.0, 2.0 ** min(retry_count, 8)))
+                        crawl_state, crawl_complete, retry_at, end_reason = "retry", 0, failed_at + retry_delay, None
                     conn.execute(
-                        "UPDATE archivebate_models SET retry_count=?, retry_at=?, last_error=?, updated_at=? WHERE model_key=?",
-                        (retry_count, failed_at + retry_delay, error_text, failed_at, model_key),
+                        "UPDATE archivebate_models SET retry_count=?, retry_at=?, crawl_state=?, crawl_complete=?, end_reason=?, last_error=?, updated_at=? WHERE model_key=?",
+                        (retry_count, retry_at, crawl_state, crawl_complete, end_reason, error_text, failed_at, model_key),
                     )
                     self._progress["last_error"] = error_text
                 return True
@@ -701,7 +716,7 @@ class DeepArchivebateService:
                             SET pages_scanned=pages_scanned+1, videos_found=videos_found+?,
                                 last_signature=?, repeated_signatures=?, empty_streak=0,
                                 crawl_complete=1, end_reason='repeated_page', last_error=NULL,
-                                retry_count=0, retry_at=NULL, updated_at=?
+                                retry_count=0, retry_at=NULL, crawl_state='done', updated_at=?
                             WHERE model_key=?
                             """,
                             (new_count, signature, repeated, now, model_key),
@@ -712,7 +727,7 @@ class DeepArchivebateService:
                             UPDATE archivebate_models
                             SET next_page=?, pages_scanned=pages_scanned+1, videos_found=videos_found+?,
                                 last_signature=?, repeated_signatures=?, empty_streak=0,
-                                last_error=NULL, retry_count=0, retry_at=NULL, updated_at=?
+                                last_error=NULL, retry_count=0, retry_at=NULL, crawl_state='pending', updated_at=?
                             WHERE model_key=?
                             """,
                             (page + 1, new_count, signature, repeated, now, model_key),
@@ -724,13 +739,14 @@ class DeepArchivebateService:
                         """
                         UPDATE archivebate_models
                         SET next_page=?, pages_scanned=pages_scanned+1, empty_streak=?,
-                            crawl_complete=?, end_reason=?, last_error=NULL, updated_at=?
+                            crawl_complete=?, crawl_state=?, end_reason=?, last_error=NULL, retry_count=0, retry_at=NULL, updated_at=?
                         WHERE model_key=?
                         """,
                         (
                             page + 1,
                             empty_streak,
                             int(complete),
+                            "done" if complete else "pending",
                             f"consecutive_empty_pages:{PROFILE_EMPTY_END_THRESHOLD}:{page}" if complete else None,
                             now,
                             model_key,
@@ -744,10 +760,11 @@ class DeepArchivebateService:
                 conn = self._get_conn()
                 failed_at = time.time()
                 retry_count = int(row["retry_count"] or 0) + 1
+                quarantined = retry_count >= PROFILE_MAX_RETRIES
                 retry_delay = min(300.0, 2.0 ** min(retry_count, 8))
                 conn.execute(
-                    "UPDATE archivebate_models SET retry_count=?, retry_at=?, last_error=?, updated_at=? WHERE model_key=?",
-                    (retry_count, failed_at + retry_delay, str(exc), failed_at, model_key),
+                    "UPDATE archivebate_models SET retry_count=?, retry_at=?, crawl_state=?, crawl_complete=?, end_reason=?, last_error=?, updated_at=? WHERE model_key=?",
+                    (retry_count, None if quarantined else failed_at + retry_delay, "quarantined" if quarantined else "retry", int(quarantined), "retry_limit" if quarantined else None, str(exc), failed_at, model_key),
                 )
                 self._progress["last_error"] = str(exc)
             return True
@@ -760,6 +777,8 @@ class DeepArchivebateService:
             models = int(conn.execute("SELECT COUNT(*) AS cnt FROM archivebate_models").fetchone()["cnt"] or 0)
             completed_models = int(conn.execute("SELECT COUNT(*) AS cnt FROM archivebate_models WHERE crawl_complete=1").fetchone()["cnt"] or 0)
             deep_items = int(conn.execute("SELECT COUNT(*) AS cnt FROM archivebate_deep_items").fetchone()["cnt"] or 0)
+            state_rows = conn.execute("SELECT crawl_state, COUNT(*) AS cnt FROM archivebate_models GROUP BY crawl_state").fetchall()
+            model_states = {str(row["crawl_state"] or "pending"): int(row["cnt"] or 0) for row in state_rows}
             q = conn.execute(
                 "SELECT status, COUNT(*) AS cnt FROM archivebate_discovery_queue GROUP BY status"
             ).fetchall()
@@ -770,6 +789,11 @@ class DeepArchivebateService:
                 "models_discovered": models,
                 "models_complete": completed_models,
                 "models_pending": max(0, models - completed_models),
+                "models_by_state": model_states,
+                "models_retry": model_states.get("retry", 0),
+                "models_unavailable": model_states.get("unavailable", 0),
+                "models_quarantined": model_states.get("quarantined", 0),
+                "models_auth_blocked": model_states.get("auth_blocked", 0),
                 "deep_items": deep_items,
                 "discovery": queue,
                 "target_revisions": list(targets),

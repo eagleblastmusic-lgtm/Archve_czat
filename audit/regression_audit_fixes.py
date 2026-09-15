@@ -85,7 +85,7 @@ finally:
     svc.close()
 print("PASS audit-fix 5: catalog hard cap cannot publish complete")
 
-# 6. Main account outcome is typed and async GETs use offload/coalescing helper.
+# 6. Main account outcome is typed and account GETs remain read-only.
 import main
 main.session.email = "configured@example.invalid"
 main.session.password = "configured"
@@ -94,9 +94,11 @@ with patch.object(main.session, "login", return_value=False):
     outcome = main.sync_account_data()
 assert outcome["success"] is False and outcome["status"] == "auth_failed"
 import inspect
-assert "await _ensure_account_synced()" in inspect.getsource(main.get_account_summary)
+assert "await _ensure_account_synced()" not in inspect.getsource(main.get_account_summary)
 assert "asyncio.to_thread(sync_account_data)" in inspect.getsource(main._ensure_account_synced)
-print("PASS audit-fix 6: account sync exposes failure and async GET path offloads")
+account_js_contract = (ROOT / "static/account.js").read_text(encoding="utf-8")
+assert "postJSON('/api/account/sync'" in account_js_contract
+print("PASS audit-fix 6: account sync is explicit and GET summary is read-only")
 
 # 7. Remote favorite failure is not reported as fully successful.
 with patch.object(main.storage, "toggle_favorite", return_value=True), \
@@ -114,8 +116,9 @@ print("PASS audit-fix 7: favorite remote failure is explicit")
 for rel in ("desktop_app.py", "run.py", "start.bat", "URUCHOM_PROGRAM.bat", "Uruchom_Desktop.bat"):
     text = (ROOT / rel).read_text(encoding="utf-8").lower()
     assert "taskkill" not in text, rel
-assert "pywebview" in (ROOT / "requirements.txt").read_text(encoding="utf-8").lower()
-print("PASS audit-fix 8: launch paths are non-destructive and desktop dependency is declared")
+dependency_contract = (ROOT / "requirements.lock.txt").read_text(encoding="utf-8").lower()
+assert "pywebview" in dependency_contract
+print("PASS audit-fix 8: launch paths are non-destructive and desktop dependency is locked")
 
 # 9. Legacy checked-in result files cannot masquerade as current evidence.
 assert not (ROOT / "audit/frontend_results.json").exists()
