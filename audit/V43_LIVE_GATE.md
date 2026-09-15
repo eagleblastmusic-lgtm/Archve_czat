@@ -1,39 +1,55 @@
 # Archivebate V4.3 — live Windows gate
 
-This gate is intentionally run against a real Archivebate stream after CI is green. It does not write playback position/history and does not mutate the catalog database.
+This gate is intentionally run against a real Archivebate stream after CI is green. It does not save playback position, add watched markers or mutate the catalog database.
+
+The current V4.3 timeline architecture is progressive: **exact 1-fps segment > playback-safe coarse sprite > poster**. Pointer movement never seeks a second full-resolution MP4.
 
 ## Setup
 
-1. Run the branch `v4.3-performance-playback` with the normal desktop launcher.
-2. Open an Archivebate video (not Camwhores) and let playback begin.
-3. After the player has buffered at least a couple of seconds, move the timeline cursor across the current 30-second segment, then jump to a distant segment, then immediately jump again to another distant segment.
-4. Return to a segment that was already prepared and scrub across several consecutive seconds.
-5. Leave the timeline for at least two seconds.
+1. Run branch `v4.3-performance-playback` with the normal Desktop launcher (`desktop_app.py`) or the guarded browser launcher. Do not run `uvicorn main:app`, because that bypasses V4.3 runtime wiring.
+2. Open an Archivebate video (not Camwhores) that has not just been tested repeatedly from cache.
+3. Observe click-to-first-frame before touching the timeline.
+4. Hover the timeline immediately, then leave it. The cold tooltip must retain the poster/status; it must **never become a black preview surface**.
+5. Let playback continue for about 8–12 seconds. When playback has a healthy buffer, the tiny coarse sprite may be prepared in the background.
+6. Move across several distant timeline positions. A ready coarse sprite should change locally without media seeks. Stop for >140 ms at a distant position so the exact 30-second segment can replace coarse/poster when ready.
+7. Leave the timeline for at least 3 seconds, then collect the report.
 
 ## Collect the report
 
 Open DevTools Console and run:
 
 ```js
-await import('/static/v43-live-report.js');
-await ArchivebateV43Diagnostics.print();
+await import('/static/v43-live-report.js?v=' + Date.now());
+JSON.stringify(await ArchivebateV43Diagnostics.print(), null, 2)
 ```
 
-Copy the returned JSON object for the release evidence.
+`archivebate-v43-live-report/3` contains exact client/server metrics, V4.3 fallback metrics and coarse-server metrics in one object.
 
 ## Required observations
 
-- `timeline.client.full_upgrade_enabled` is `false`.
-- `timeline.client.cold_quick_generation_enabled` is `false`.
-- Prepared/warm segments change frames immediately while scrubbing; frame selection is already covered by the automated <= 1 s time-error contract.
-- Revisiting a prepared segment increases client cache hits and does not create another backend segment build.
-- After rapid distant jumps, stale work is preempted/cancelled instead of accumulating; `timeline.server.preempted_processes` and/or `cancelled_processes` may increase.
-- After leaving the timeline and waiting, `timeline.client.segment_inflight` and `active_target_requests` return to `0`, and server `active_processes` returns to `0` once the cancellation has drained.
-- `timeline.server.queue_size` does not continue growing after cursor movement stops.
-- Playback still starts normally. Compare `playback.click_to_first_frame` with the pre-V4.3/local baseline if one is available; V4.3 must not introduce a material regression.
+- `timeline.fallback.media_seek_enabled` is `false`.
+- `timeline.fallback.black_fallback_enabled` is `false`, and the real UI confirms that cold hover shows a poster/status rather than black.
+- `timeline.fallback.status_requests` stays low and does not scale with `pointer_updates`; pointer motion must not create a polling storm.
+- `timeline.coarse_server.parallelism` is `2`, `frame_count` is `4`, `active_quick_processes <= 2`, and `exact_preempts_quick` is `true`.
+- If playback is fragile, `playback_protect_skips`, `low_buffer_cancels` or `coarse_build_aborts` may increase. That is expected: playback outranks speculative preview work.
+- Prepared/warm exact segments change frames immediately while scrubbing; `timeline.exact_client.exact_ready_p95_ms` should remain near the previous warm result (~49 ms) when the requested segment is already prepared.
+- Revisiting a prepared exact segment increases cache hits and does not create another backend segment build.
+- After rapid distant jumps, stale exact work is preempted/cancelled instead of accumulating; server preempted/cancelled counters may increase.
+- After leaving the timeline and waiting, exact `segment_inflight`, `active_target_requests`, server `active_processes`, `building_jobs`, and coarse `active_quick_processes` all return to `0` after cancellation drains.
+- `timeline.exact_server.queue_size` does not keep growing after cursor movement stops.
+- Playback startup must not materially regress. Compare several `playback.click_to_first_frame` samples with the pre-coarse V4.3 live samples (roughly 1.9–2.5 s on the previously tested source); do not decide from one noisy network sample.
 
-## Useful metrics
+## Failure conditions
 
-`timeline.client.exact_ready_p50_ms/p95_ms` measure cold exact-segment readiness including sprite image load. `timeline.server.segment_ffmpeg_p50_ms/p95_ms` isolate backend FFmpeg cost. `timeline.server.queue_wait_p50_ms/p95_ms` expose scheduler contention. `playback.click_to_first_frame` measures the full user-visible playback startup path.
+Keep PR #4 in Draft if any of these occur:
 
-Do not merge only because one warm-cache run looks fast. Keep the PR draft if cold exact-segment generation repeatedly stalls, stale work remains active after hover cancellation, queue depth grows without draining, or click-to-first-frame visibly regresses.
+- black cold-hover preview,
+- auxiliary full-resolution preview stream/media seeks return,
+- pointer motion produces a status-request storm,
+- more than 2 QUICK FFmpeg processes run concurrently,
+- QUICK continues while exact hover is active instead of yielding,
+- playback startup/stability visibly regresses,
+- stale work remains active after hover/close,
+- queue depth grows without draining.
+
+The detailed root-cause analysis and corrective design are documented in `audit/V43_TIMELINE_DEEP_AUDIT.md`.
