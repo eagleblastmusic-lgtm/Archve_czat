@@ -7,6 +7,8 @@ import urllib.request
 import uvicorn
 import webview
 
+from fast_grouped_feed import install as install_grouped_feed_fast_path
+
 os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--autoplay-policy=no-user-gesture-required"
 
 
@@ -26,6 +28,7 @@ def ensure_port_available(host="127.0.0.1", port=8000):
 
 
 def start_server():
+    install_grouped_feed_fast_path()
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False, log_level="warning")
 
 
