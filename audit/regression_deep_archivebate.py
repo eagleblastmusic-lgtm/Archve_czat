@@ -4,6 +4,8 @@ import os
 from contextlib import contextmanager
 from pathlib import Path
 
+os.environ["DEEP_ARCHIVEBATE_PUBLISH_MIN_ITEMS"] = "1"
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from catalog_service import CatalogService

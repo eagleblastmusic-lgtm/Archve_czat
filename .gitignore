@@ -27,3 +27,6 @@ audit/deep_fixture_*
 data/catalog.db
 data/catalog.db-wal
 data/catalog.db-shm
+
+# Local repair backups
+*.bak_*

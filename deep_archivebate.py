@@ -101,7 +101,8 @@ class DeepArchivebateService:
                     total INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL,
-                    last_error TEXT
+                    last_error TEXT,
+                    retry_at REAL
                 )
                 """
             )
@@ -135,6 +136,9 @@ class DeepArchivebateService:
                 conn.execute("ALTER TABLE archivebate_models ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
             if "retry_at" not in model_columns:
                 conn.execute("ALTER TABLE archivebate_models ADD COLUMN retry_at REAL")
+            queue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(archivebate_discovery_queue)")}
+            if "retry_at" not in queue_columns:
+                conn.execute("ALTER TABLE archivebate_discovery_queue ADD COLUMN retry_at REAL")
 
     def close(self) -> None:
         with self._lock:
@@ -260,10 +264,12 @@ class DeepArchivebateService:
                 """
                 SELECT * FROM archivebate_discovery_queue
                 WHERE status IN ('pending', 'paging', 'retry')
+                  AND (retry_at IS NULL OR retry_at <= ?)
                 ORDER BY CASE status WHEN 'paging' THEN 0 WHEN 'retry' THEN 1 ELSE 2 END,
                          depth ASC, updated_at ASC, prefix ASC
                 LIMIT 1
-                """
+                """,
+                (time.time(),),
             ).fetchone()
             if not row:
                 return False
@@ -299,17 +305,17 @@ class DeepArchivebateService:
                             (child, depth + 1, now),
                         )
                     conn.execute(
-                        "UPDATE archivebate_discovery_queue SET status='split', total=?, last_page=?, attempts=attempts+1, updated_at=?, last_error=NULL WHERE prefix=?",
+                        "UPDATE archivebate_discovery_queue SET status='split', total=?, last_page=?, attempts=attempts+1, updated_at=?, last_error=NULL, retry_at=NULL WHERE prefix=?",
                         (total, last_page, now, prefix),
                     )
                 elif page >= last_page:
                     conn.execute(
-                        "UPDATE archivebate_discovery_queue SET status='done', total=?, last_page=?, next_page=?, attempts=attempts+1, updated_at=?, last_error=NULL WHERE prefix=?",
+                        "UPDATE archivebate_discovery_queue SET status='done', total=?, last_page=?, next_page=?, attempts=attempts+1, updated_at=?, last_error=NULL, retry_at=NULL WHERE prefix=?",
                         (total, last_page, page + 1, now, prefix),
                     )
                 else:
                     conn.execute(
-                        "UPDATE archivebate_discovery_queue SET status='paging', total=?, last_page=?, next_page=?, attempts=attempts+1, updated_at=?, last_error=NULL WHERE prefix=?",
+                        "UPDATE archivebate_discovery_queue SET status='paging', total=?, last_page=?, next_page=?, attempts=attempts+1, updated_at=?, last_error=NULL, retry_at=NULL WHERE prefix=?",
                         (total, last_page, page + 1, now, prefix),
                     )
                 self._progress["last_activity"] = now
@@ -320,9 +326,13 @@ class DeepArchivebateService:
                 conn = self._get_conn()
                 attempts = int(row["attempts"] or 0) + 1
                 terminal = attempts >= 8
+                failed_at = time.time()
+                retry_delay = min(300.0, 2.0 ** min(attempts, 8))
+                retry_at = None if terminal else failed_at + retry_delay
                 conn.execute(
-                    "UPDATE archivebate_discovery_queue SET status=?, attempts=?, updated_at=?, last_error=? WHERE prefix=?",
-                    ("error" if terminal else "retry", attempts, time.time(), str(exc), prefix),
+                    "UPDATE archivebate_discovery_queue "
+                    "SET status=?, attempts=?, updated_at=?, last_error=?, retry_at=? WHERE prefix=?",
+                    ("error" if terminal else "retry", attempts, failed_at, str(exc), retry_at, prefix),
                 )
                 self._progress["last_error"] = str(exc)
             return True
@@ -361,76 +371,239 @@ class DeepArchivebateService:
         return hashlib.sha256("\n".join(sorted(ids)).encode("utf-8")).hexdigest()
 
     def _publish_deep_revision_locked(self, new_records: List[Tuple[Any, ...]]) -> Optional[int]:
-        """Copy the last snapshot plus deep rows into a fresh immutable revision."""
-        if not new_records:
-            return None
+        """Publish Deep discoveries in bounded batches instead of cloning the catalog per page."""
         conn = self._get_conn()
-        base_row = conn.execute(
-            "SELECT revision FROM revisions WHERE complete = 1 AND failed = 0 ORDER BY revision DESC LIMIT 1"
-        ).fetchone()
-        if base_row:
-            base_revision = int(base_row["revision"])
-        else:
-            base_row = conn.execute(
-                "SELECT revision FROM revisions WHERE failed = 0 ORDER BY revision DESC LIMIT 1"
-            ).fetchone()
-            base_revision = int(base_row["revision"]) if base_row else 0
-        next_revision = int(conn.execute("SELECT COALESCE(MAX(revision), 0) AS revision FROM revisions").fetchone()["revision"] or 0) + 1
         now = time.time()
-        conn.execute("BEGIN IMMEDIATE")
+
         try:
-            conn.execute(
-                "INSERT INTO revisions(revision, created_at, updated_at, complete, is_active, failed, video_count, error, published_hash, published_at) "
-                "VALUES(?, ?, ?, 0, 0, 0, 0, NULL, NULL, NULL)",
-                (next_revision, now, now),
+            min_items = max(1, int(os.getenv("DEEP_ARCHIVEBATE_PUBLISH_MIN_ITEMS", "1000")))
+        except (TypeError, ValueError):
+            min_items = 1000
+        try:
+            max_delay = max(30.0, float(os.getenv("DEEP_ARCHIVEBATE_PUBLISH_INTERVAL_SECONDS", "900")))
+        except (TypeError, ValueError):
+            max_delay = 900.0
+
+        pending_hint = int(getattr(self, "_deep_publish_pending_hint", 0) or 0) + len(new_records)
+        self._deep_publish_pending_hint = pending_hint
+        last_check = float(getattr(self, "_deep_publish_last_check", 0.0) or 0.0)
+
+        # Cheap fast path: do not scan the durable Deep table for every crawled page.
+        if last_check > 0.0 and pending_hint < min_items and (now - last_check) < max_delay:
+            return None
+
+        base_row = conn.execute(
+            "SELECT revision FROM revisions "
+            "WHERE complete = 1 AND failed = 0 AND is_active = 1 "
+            "ORDER BY revision DESC LIMIT 1"
+        ).fetchone()
+        if not base_row:
+            base_row = conn.execute(
+                "SELECT revision FROM revisions "
+                "WHERE complete = 1 AND failed = 0 "
+                "ORDER BY revision DESC LIMIT 1"
+            ).fetchone()
+        if not base_row:
+            self._deep_publish_last_check = now
+            return None
+
+        base_revision = int(base_row["revision"])
+        pending_row = conn.execute(
+            """
+            SELECT COUNT(*) AS cnt, MIN(d.discovered_at) AS oldest
+            FROM archivebate_deep_items d
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM catalog_items c
+                WHERE c.revision = ? AND c.canonical_key = d.canonical_key
             )
-            if base_revision:
-                conn.execute(
-                    """
-                    INSERT INTO catalog_items(
-                        canonical_key, source, video_id, author, author_clean,
-                        published_at, duration_seconds, duration_str, poster, url,
-                        preview_video, title, platform, raw_json, revision
-                    )
-                    SELECT canonical_key, source, video_id, author, author_clean,
-                           published_at, duration_seconds, duration_str, poster, url,
-                           preview_video, title, platform, raw_json, ?
-                    FROM catalog_items WHERE revision = ?
-                    """,
-                    (next_revision, base_revision),
+            """,
+            (base_revision,),
+        ).fetchone()
+        pending_count = int(pending_row["cnt"] or 0) if pending_row else 0
+        oldest = float(pending_row["oldest"] or now) if pending_row else now
+        self._deep_publish_pending_hint = pending_count
+        self._deep_publish_last_check = now
+
+        if pending_count <= 0:
+            return None
+        if pending_count < min_items and (now - oldest) < max_delay:
+            return None
+
+        # Serialize revision allocation, cloning and activation with every other DB writer.
+        conn.execute("BEGIN IMMEDIATE")
+        next_revision = None
+        try:
+            base_row = conn.execute(
+                "SELECT revision FROM revisions "
+                "WHERE complete = 1 AND failed = 0 AND is_active = 1 "
+                "ORDER BY revision DESC LIMIT 1"
+            ).fetchone()
+            if not base_row:
+                base_row = conn.execute(
+                    "SELECT revision FROM revisions "
+                    "WHERE complete = 1 AND failed = 0 "
+                    "ORDER BY revision DESC LIMIT 1"
+                ).fetchone()
+            if not base_row:
+                conn.execute("ROLLBACK")
+                return None
+            base_revision = int(base_row["revision"])
+
+            # Re-check after taking the write lock. Another publisher may have already
+            # incorporated the same Deep rows while we were waiting.
+            pending_row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt, MIN(d.discovered_at) AS oldest
+                FROM archivebate_deep_items d
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM catalog_items c
+                    WHERE c.revision = ? AND c.canonical_key = d.canonical_key
                 )
-            conn.executemany(
+                """,
+                (base_revision,),
+            ).fetchone()
+            pending_count = int(pending_row["cnt"] or 0) if pending_row else 0
+            oldest = float(pending_row["oldest"] or now) if pending_row else now
+            self._deep_publish_pending_hint = pending_count
+            if pending_count <= 0 or (pending_count < min_items and (now - oldest) < max_delay):
+                conn.execute("ROLLBACK")
+                return None
+
+            # Use the same allocator as the normal catalog. BEGIN IMMEDIATE above
+            # serializes revision IDs across both independent SQLite connections.
+            from catalog_service import allocate_revision_in_transaction
+            next_revision = allocate_revision_in_transaction(conn, now=now)
+
+            conn.execute(
+                """
+                INSERT INTO catalog_items(
+                    canonical_key, source, video_id, author, author_clean,
+                    published_at, duration_seconds, duration_str, poster, url,
+                    preview_video, title, platform, raw_json, revision
+                )
+                SELECT canonical_key, source, video_id, author, author_clean,
+                       published_at, duration_seconds, duration_str, poster, url,
+                       preview_video, title, platform, raw_json, ?
+                FROM catalog_items
+                WHERE revision = ?
+                """,
+                (next_revision, base_revision),
+            )
+            base_count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM catalog_items WHERE revision = ?",
+                    (next_revision,),
+                ).fetchone()["cnt"] or 0
+            )
+
+            # Overlay every durable Deep item. INSERT OR IGNORE also repairs a normal
+            # catalog refresh that did not contain older Deep discoveries.
+            conn.execute(
                 """
                 INSERT OR IGNORE INTO catalog_items(
                     canonical_key, source, video_id, author, author_clean,
                     published_at, duration_seconds, duration_str, poster, url,
                     preview_video, title, platform, raw_json, revision
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                )
+                SELECT canonical_key, source, video_id, author, author_clean,
+                       published_at, duration_seconds, duration_str, poster, url,
+                       preview_video, title, platform, raw_json, ?
+                FROM archivebate_deep_items
                 """,
-                [record[:-1] + (next_revision,) for record in new_records],
+                (next_revision,),
             )
-            count = int(conn.execute("SELECT COUNT(*) AS cnt FROM catalog_items WHERE revision = ?", (next_revision,)).fetchone()["cnt"] or 0)
+
+            count = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM catalog_items WHERE revision = ?",
+                    (next_revision,),
+                ).fetchone()["cnt"] or 0
+            )
+            added = max(0, count - base_count)
+            if added <= 0:
+                conn.execute("ROLLBACK")
+                self._deep_publish_pending_hint = 0
+                return None
+
             digest = hashlib.sha256()
             for row in conn.execute(
-                "SELECT canonical_key FROM catalog_items WHERE revision = ? ORDER BY canonical_key ASC",
+                "SELECT canonical_key FROM catalog_items "
+                "WHERE revision = ? ORDER BY canonical_key ASC",
                 (next_revision,),
             ):
                 digest.update(str(row["canonical_key"]).encode("utf-8"))
                 digest.update(b"\n")
+
             conn.execute("UPDATE revisions SET is_active = 0")
             conn.execute(
-                "UPDATE revisions SET complete = 1, is_active = 1, video_count = ?, published_hash = ?, published_at = ?, updated_at = ? WHERE revision = ?",
+                "UPDATE revisions SET complete = 1, is_active = 1, failed = 0, "
+                "video_count = ?, error = NULL, published_hash = ?, "
+                "published_at = ?, updated_at = ? WHERE revision = ?",
                 (count, digest.hexdigest(), now, now, next_revision),
             )
             conn.execute(
-                "INSERT OR REPLACE INTO source_runs(revision, source, cursor, pages_scanned, items_found, complete, failed, error, end_reason, updated_at) "
-                "VALUES(?, 'archivebate_deep', 0, 0, ?, 1, 0, NULL, 'deep_publish', ?)",
-                (next_revision, len(new_records), now),
+                "INSERT OR REPLACE INTO source_runs("
+                "revision, source, cursor, pages_scanned, items_found, complete, "
+                "failed, error, end_reason, updated_at"
+                ") VALUES(?, 'archivebate_deep', 0, 0, ?, 1, 0, NULL, 'deep_publish', ?)",
+                (next_revision, added, now),
             )
+
+            # Keep snapshot history bounded. Never delete incomplete revisions because
+            # a normal catalog worker may be building one concurrently.
+            try:
+                keep_count = max(
+                    1,
+                    int(os.getenv("ARCHIVEBATE_CATALOG_REVISIONS_KEEP", "2")),
+                )
+            except (TypeError, ValueError):
+                keep_count = 2
+
+            completed = conn.execute(
+                "SELECT revision FROM revisions "
+                "WHERE complete = 1 AND failed = 0 "
+                "ORDER BY is_active DESC, published_at DESC, revision DESC"
+            ).fetchall()
+            keep_revisions = [int(row["revision"]) for row in completed[:keep_count]]
+            if next_revision not in keep_revisions:
+                keep_revisions.insert(0, next_revision)
+
+            placeholders = ",".join("?" for _ in keep_revisions)
+            stale_rows = conn.execute(
+                f"SELECT revision FROM revisions "
+                f"WHERE complete = 1 AND failed = 0 AND is_active = 0 "
+                f"AND revision NOT IN ({placeholders})",
+                keep_revisions,
+            ).fetchall()
+            stale_revisions = [int(row["revision"]) for row in stale_rows]
+            if stale_revisions:
+                stale_placeholders = ",".join("?" for _ in stale_revisions)
+                conn.execute(
+                    f"DELETE FROM catalog_items WHERE revision IN ({stale_placeholders})",
+                    stale_revisions,
+                )
+                conn.execute(
+                    f"DELETE FROM source_runs WHERE revision IN ({stale_placeholders})",
+                    stale_revisions,
+                )
+                conn.execute(
+                    f"DELETE FROM revisions WHERE revision IN ({stale_placeholders})",
+                    stale_revisions,
+                )
+
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+        self._deep_publish_pending_hint = 0
+        self._deep_publish_last_check = now
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.OperationalError:
+            pass
         return next_revision
 
     def _store_videos_locked(self, videos: List[Dict[str, Any]]) -> int:
@@ -481,9 +654,11 @@ class DeepArchivebateService:
                 """
                 SELECT * FROM archivebate_models
                 WHERE crawl_complete = 0
+                  AND (retry_at IS NULL OR retry_at <= ?)
                 ORDER BY priority DESC, pages_scanned DESC, updated_at ASC, model_key ASC
                 LIMIT 1
-                """
+                """,
+                (time.time(),),
             ).fetchone()
             if not row:
                 return False
@@ -498,9 +673,15 @@ class DeepArchivebateService:
                 error_text = result.error or result.status
                 with self._lock:
                     conn = self._get_conn()
+                    failed_at = time.time()
+                    retry_count = int(row["retry_count"] or 0) + 1
+                    retry_delay = max(
+                        float(result.retry_after or 0.0),
+                        min(300.0, 2.0 ** min(retry_count, 8)),
+                    )
                     conn.execute(
-                        "UPDATE archivebate_models SET retry_count=COALESCE(retry_count, 0)+1, retry_at=?, last_error=?, updated_at=? WHERE model_key=?",
-                        (time.time() + (result.retry_after or 1.0), error_text, time.time(), model_key),
+                        "UPDATE archivebate_models SET retry_count=?, retry_at=?, last_error=?, updated_at=? WHERE model_key=?",
+                        (retry_count, failed_at + retry_delay, error_text, failed_at, model_key),
                     )
                     self._progress["last_error"] = error_text
                 return True
@@ -561,9 +742,12 @@ class DeepArchivebateService:
         except Exception as exc:
             with self._lock:
                 conn = self._get_conn()
+                failed_at = time.time()
+                retry_count = int(row["retry_count"] or 0) + 1
+                retry_delay = min(300.0, 2.0 ** min(retry_count, 8))
                 conn.execute(
-                    "UPDATE archivebate_models SET last_error=?, updated_at=? WHERE model_key=?",
-                    (str(exc), time.time(), model_key),
+                    "UPDATE archivebate_models SET retry_count=?, retry_at=?, last_error=?, updated_at=? WHERE model_key=?",
+                    (retry_count, failed_at + retry_delay, str(exc), failed_at, model_key),
                 )
                 self._progress["last_error"] = str(exc)
             return True
@@ -603,6 +787,14 @@ class DeepArchivebateService:
                 if self._stop.wait(self.request_delay):
                     break
                 worked = self.crawl_step(self._scraper) or worked
+
+                # Flush aged Deep discoveries even when the latest profile page did not
+                # itself cross the item threshold. The method has a cheap in-memory gate.
+                with self._lock:
+                    published = self._publish_deep_revision_locked([])
+                    if published is not None:
+                        self._last_targets = (published,)
+
                 self._refresh_targets()
                 if self._stop.wait(self.request_delay if worked else max(2.0, self.request_delay)):
                     break
