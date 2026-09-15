@@ -434,10 +434,14 @@
       const fromData = String(video.dataset?.videoId || '').trim();
       if (fromData) return fromData;
       try {
-        return String(new URLSearchParams(globalThis.location?.search || '').get('id') || '').trim();
-      } catch (_) {
-        return '';
-      }
+        const fromQuery = String(new URLSearchParams(globalThis.location?.search || '').get('id') || '').trim();
+        if (fromQuery) return fromQuery;
+        const parts = String(globalThis.location?.pathname || '').split('/').filter(Boolean);
+        if (parts.length >= 2 && parts[0].toLowerCase() === 'watch') {
+          return decodeURIComponent(parts[parts.length - 1] || '').trim();
+        }
+      } catch (_) {}
+      return '';
     }
     return '';
   }
