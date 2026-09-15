@@ -59,6 +59,33 @@
   function setPlaybackBusy(value) { playbackBusy=!!value; drain(); }
   globalThis.document?.addEventListener('visibilitychange',drain);
 
+  // V4.3 compatibility bridge: the modular modal stores the active video in
+  // currentVideoDetails, while exact storyboard hover/prewarm historically read
+  // currentVideoId. Synchronize the identity at the earliest media lifecycle
+  // event, before `playing` and before a user can hover the timeline.
+  function bridgeModalVideoIdentity(video) {
+    if (!video || video.id !== 'modalVideo') return '';
+    const appState = globalThis.ArchivebateAppContext?.state || null;
+    const legacyState = globalThis.state || null;
+    const videoId = String(
+      appState?.currentVideoDetails?.id ||
+      appState?.currentVideoId ||
+      legacyState?.currentVideoDetails?.id ||
+      legacyState?.currentVideoId ||
+      video.dataset?.videoId ||
+      ''
+    ).trim();
+    if (!videoId) return '';
+    if (appState) appState.currentVideoId = videoId;
+    if (legacyState && legacyState !== appState) legacyState.currentVideoId = videoId;
+    if (video.dataset) video.dataset.videoId = videoId;
+    return videoId;
+  }
+
+  globalThis.document?.addEventListener?.('play', event => {
+    bridgeModalVideoIdentity(event?.target);
+  }, true);
+
   async function prefetchUrls(urls, {concurrency=4,signal}={}) {
     const queue=[...new Set((urls||[]).filter(Boolean))];
     let cursor=0;
@@ -270,6 +297,7 @@
     updatePlaybackBuffer,
     calculatePercentiles,
     sessionHistory,
+    bridgeModalVideoIdentity,
     getActiveSession: () => activeSession
   };
 })();
