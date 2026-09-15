@@ -4,7 +4,7 @@ on:
   push:
     branches: [v4.2-security-runtime-hardening]
     paths:
-      - tools/fix_v42_legacy.py
+      - tools/fix_v42_nextgen.py
       - .github/workflows/v42-fix-and-test.yml
 
 permissions:
@@ -27,12 +27,12 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      - name: Migrate legacy regression expectations
-        run: python tools/fix_v42_legacy.py
+      - name: Migrate next-generation storyboard expectations
+        run: python tools/fix_v42_nextgen.py
       - name: Persist compatibility migration
         run: |
           git add -A
-          git commit -m "Align legacy regressions with V4.2 HTTP semantics"
+          git commit -m "Align next-generation regressions with V4.2 storyboard"
           git push origin HEAD:v4.2-security-runtime-hardening
       - name: Install locked dependencies
         run: |
@@ -40,20 +40,9 @@ jobs:
           python -m pip install -r requirements.lock.txt
           python -m pip check
       - name: Run compatibility suite
-        shell: bash
         run: |
-          set +e
-          {
-            python audit/regression_audit_fixes.py
-            python audit/regression_catalog_v41.py
-            python -m unittest test_suite -q
-          } > v42_compat_failure.log 2>&1
-          rc=$?
-          cat v42_compat_failure.log
-          if [ "$rc" -ne 0 ]; then
-            git add v42_compat_failure.log
-            git commit -m "Record V4.2 compatibility failure"
-            git push origin HEAD:v4.2-security-runtime-hardening
-            exit "$rc"
-          fi
-          rm -f v42_compat_failure.log
+          python audit/regression_next_generation.py
+          python audit/regression_audit_fixes.py
+          python audit/regression_archivebate_true_end.py
+          python audit/regression_catalog_v41.py
+          python -m unittest test_suite -q
