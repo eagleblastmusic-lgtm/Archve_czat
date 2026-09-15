@@ -10,6 +10,13 @@ from fast_grouped_feed_v2 import install as install_grouped_feed_fast_path
 import fast_storyboard_quick as _quick_storyboard
 
 install_grouped_feed_fast_path()
+
+# V7 cold-hover overview: eight low-resolution anchors are enough to make a
+# full-width sweep visibly change while remaining dramatically cheaper than the
+# historical full-resolution preview seeker. Parallelism stays capped at two.
+_quick_storyboard.QUICK_FRAME_COUNT = 8
+_quick_storyboard.QUICK_PARALLELISM = 2
+_quick_storyboard.QUICK_MIN_SUCCESS = 4
 _quick_storyboard.install()
 
 import main as _main  # noqa: E402  (patches must be installed before main binds entry points)
@@ -18,10 +25,10 @@ app = _main.app
 RUNTIME_ID = "v4.3-fast2"
 
 # V4.3 timeline layer is deliberately injected only by this runtime instead of
-# changing the V4.2/master HTML. It never seeks a second full-resolution MP4.
-# Cold hover retains the poster; a tiny 160x90 coarse sprite is prepared only
-# when playback has a safe buffer, and exact 1-fps segments always outrank it.
-_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback.js?v=6"></script>'
+# changing the V4.2/master HTML. V7 coordinates the first cold hover so the
+# persistent coarse sprite gets a bounded head start before exact 1-fps work.
+# It never seeks a second full-resolution browser <video>.
+_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback-v7.js?v=7"></script>'
 _original_versioned_html = _main._versioned_html
 
 
@@ -63,6 +70,9 @@ def v43_runtime_marker():
         # Compatibility marker retained for older diagnostics.
         "parallel_quick_storyboard": bool(getattr(storyboard_service, "_v43_parallel_quick_installed", False)),
         "playback_safe_quick_storyboard": bool(getattr(storyboard_service, "_v43_playback_safe_quick_installed", False)),
+        "timeline_coordinator_version": 7,
+        "quick_frame_count": int(_quick_storyboard.QUICK_FRAME_COUNT),
+        "quick_parallelism": int(_quick_storyboard.QUICK_PARALLELISM),
         "media_seek_fallback": False,
     }
 
