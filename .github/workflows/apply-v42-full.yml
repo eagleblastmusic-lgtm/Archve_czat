@@ -81,20 +81,32 @@ jobs:
         run: python -m compileall -q .
       - name: V4.2 full regression
         run: python audit/regression_v42_full.py
-      - name: Existing audit-fix regression
-        run: python audit/regression_audit_fixes.py
-      - name: V4.1 catalog concurrency regression
-        run: python audit/regression_catalog_v41.py
-      - name: Unit tests
-        run: python -m unittest test_suite -q
-      - name: Commit applied V4.2 implementation
+      - name: Persist V4.2 candidate implementation
         run: |
           rm -f v42_apply.log
           git add -A
           git status --short
           if git diff --cached --quiet; then
-            echo "No changes to commit"
+            echo "No candidate changes to commit"
             exit 1
           fi
           git commit -m "Implement V4.2 security and runtime hardening"
           git push origin HEAD:v4.2-security-runtime-hardening
+      - name: Existing audit-fix regression
+        shell: bash
+        run: |
+          set +e
+          python audit/regression_audit_fixes.py > v42_legacy_failure.log 2>&1
+          rc=$?
+          cat v42_legacy_failure.log
+          if [ "$rc" -ne 0 ]; then
+            git add v42_legacy_failure.log
+            git commit -m "Record V4.2 legacy regression failure"
+            git push origin HEAD:v4.2-security-runtime-hardening
+            exit "$rc"
+          fi
+          rm -f v42_legacy_failure.log
+      - name: V4.1 catalog concurrency regression
+        run: python audit/regression_catalog_v41.py
+      - name: Unit tests
+        run: python -m unittest test_suite -q
