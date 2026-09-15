@@ -5,19 +5,20 @@ launch the same FastAPI app.
 """
 
 from fast_grouped_feed_v2 import install as install_grouped_feed_fast_path
+from fast_storyboard_quick import install as install_parallel_quick_storyboard
 
 install_grouped_feed_fast_path()
+install_parallel_quick_storyboard()
 
-import main as _main  # noqa: E402  (patch must be installed before main imports the singleton)
+import main as _main  # noqa: E402  (patches must be installed before main binds entry points)
 
 app = _main.app
 RUNTIME_ID = "v4.3-fast2"
 
 # V4.3 timeline fallback is deliberately injected only by this runtime instead
-# of changing the V4.2/master HTML. It loads after the ordinary application
-# scripts and supplies a changing low-priority video frame only while an exact
-# storyboard segment is still cold.
-_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback.js?v=4"></script>'
+# of changing the V4.2/master HTML. It uses a precomputed 160x90 QUICK sprite
+# instead of seeking a second full-resolution MP4 on pointer movement.
+_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback.js?v=5"></script>'
 _original_versioned_html = _main._versioned_html
 
 
@@ -50,11 +51,13 @@ _FA_EVENT_HASH = "'sha256-MhtPZXr7+LpJUY5qtMutB+qWfQtMaPccfe7QXtCcEYc='"
 def v43_runtime_marker():
     """Small local marker used by the launcher/live gate to reject stale port-8000 servers."""
     from catalog_service import CatalogService
+    import storyboard_service
 
     return {
         "runtime": RUNTIME_ID,
         "grouped_fast_path_v2": bool(getattr(CatalogService, "_v43_grouped_fast_v2_installed", False)),
         "dynamic_timeline_fallback": True,
+        "parallel_quick_storyboard": bool(getattr(storyboard_service, "_v43_parallel_quick_installed", False)),
     }
 
 
