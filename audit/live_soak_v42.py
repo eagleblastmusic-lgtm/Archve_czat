@@ -86,6 +86,8 @@ def connect_db(db_path: Path) -> sqlite3.Connection:
     uri = f"file:{db_path.as_posix()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -95,25 +97,26 @@ def table_exists(conn: sqlite3.Connection, table: str) -> bool:
     ).fetchone() is not None
 
 
-def check_db(db_path: Path) -> dict:
+def check_db(db_path: Path, *, run_quick_check: bool = False) -> dict:
     conn = connect_db(db_path)
     try:
-        quick = conn.execute("PRAGMA quick_check").fetchone()[0]
-        if str(quick).lower() != "ok":
-            fail(f"SQLite quick_check failed: {quick}")
+        quick = None
+        if run_quick_check:
+            quick = conn.execute("PRAGMA quick_check").fetchone()[0]
+            if str(quick).lower() != "ok":
+                fail(f"SQLite quick_check failed: {quick}")
 
-        if not table_exists(conn, "catalog_revisions") or not table_exists(conn, "catalog_items"):
-            fail("catalog schema is missing catalog_revisions/catalog_items")
+        if not table_exists(conn, "revisions") or not table_exists(conn, "catalog_items"):
+            fail("catalog schema is missing revisions/catalog_items")
 
         rows = conn.execute(
             """
             SELECT r.revision, r.complete, r.is_active, r.failed, r.video_count,
                    COUNT(i.canonical_key) AS physical_rows
-            FROM catalog_revisions r
+            FROM revisions r
             LEFT JOIN catalog_items i ON i.revision = r.revision
             GROUP BY r.revision
             ORDER BY r.revision DESC
-            LIMIT 8
             """
         ).fetchall()
         if not rows:
@@ -124,7 +127,7 @@ def check_db(db_path: Path) -> dict:
         if len(active) != 1:
             fail(f"expected exactly one active healthy revision, found {len(active)}")
         if len(complete) > 2:
-            fail(f"more than two healthy complete revisions retained in recent set: {len(complete)}")
+            fail(f"more than two healthy complete revisions retained: {len(complete)}")
 
         for row in complete:
             expected = int(row["video_count"] or 0)
@@ -132,20 +135,31 @@ def check_db(db_path: Path) -> dict:
             if expected != physical:
                 fail(f"revision {row['revision']} video_count={expected} but physical_rows={physical}")
 
-        incomplete = conn.execute(
-            "SELECT COUNT(*) FROM catalog_revisions WHERE complete=0 AND failed=0"
-        ).fetchone()[0]
-        failed = conn.execute(
-            "SELECT COUNT(*) FROM catalog_revisions WHERE failed=1"
-        ).fetchone()[0]
+        active_revision = int(active[0]["revision"])
+        stale_partials = [
+            row for row in rows
+            if int(row["complete"] or 0) == 0
+            and int(row["failed"] or 0) == 0
+            and int(row["revision"]) < active_revision
+        ]
+        if stale_partials:
+            fail(
+                "stale incomplete revision(s) below active floor: "
+                + ",".join(str(row["revision"]) for row in stale_partials)
+            )
+
+        failed = [row for row in rows if int(row["failed"] or 0) == 1]
+        stale_failed = [row for row in failed if int(row["revision"]) < active_revision]
+        if stale_failed:
+            fail(
+                "stale failed revision(s) below active floor: "
+                + ",".join(str(row["revision"]) for row in stale_failed)
+            )
 
         total_items = int(conn.execute("SELECT COUNT(*) FROM catalog_items").fetchone()[0])
-        complete_total = int(sum(int(row["physical_rows"] or 0) for row in complete))
-        if incomplete == 0 and failed == 0 and total_items != complete_total:
-            fail(
-                f"catalog_items contains unexpected rows: total={total_items}, "
-                f"healthy_complete_rows={complete_total}"
-            )
+        known_rows = int(sum(int(row["physical_rows"] or 0) for row in rows))
+        if total_items != known_rows:
+            fail(f"catalog row accounting mismatch: catalog_items={total_items}, revision_rows={known_rows}")
 
         page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
         freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
@@ -155,24 +169,36 @@ def check_db(db_path: Path) -> dict:
         if table_exists(conn, "archivebate_deep_items"):
             deep_items = int(conn.execute("SELECT COUNT(*) FROM archivebate_deep_items").fetchone()[0])
 
+        models = {}
+        if table_exists(conn, "archivebate_models"):
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(archivebate_models)")}
+            if "crawl_state" in columns:
+                for row in conn.execute(
+                    "SELECT COALESCE(crawl_state, 'NULL') AS state, COUNT(*) AS n "
+                    "FROM archivebate_models GROUP BY crawl_state ORDER BY crawl_state"
+                ):
+                    models[str(row["state"])] = int(row["n"])
+
         queue = {}
-        if table_exists(conn, "archivebate_deep_discovery_queue"):
-            cols = {row[1] for row in conn.execute("PRAGMA table_info(archivebate_deep_discovery_queue)")}
-            if "status" in cols:
+        if table_exists(conn, "archivebate_discovery_queue"):
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(archivebate_discovery_queue)")}
+            if "status" in columns:
                 for row in conn.execute(
                     "SELECT COALESCE(status, 'NULL') AS status, COUNT(*) AS n "
-                    "FROM archivebate_deep_discovery_queue GROUP BY status ORDER BY status"
+                    "FROM archivebate_discovery_queue GROUP BY status ORDER BY status"
                 ):
                     queue[str(row["status"])] = int(row["n"])
 
         return {
-            "active_revision": int(active[0]["revision"]),
+            "quick_check": quick,
+            "active_revision": active_revision,
             "active_rows": int(active[0]["physical_rows"] or 0),
             "healthy_complete_revisions": len(complete),
-            "incomplete_revisions": int(incomplete),
-            "failed_revisions": int(failed),
+            "incomplete_revisions": sum(1 for row in rows if int(row["complete"] or 0) == 0 and int(row["failed"] or 0) == 0),
+            "failed_revisions": len(failed),
             "catalog_items": total_items,
             "deep_items": deep_items,
+            "deep_models": models,
             "deep_queue": queue,
             "allocated_mb": round(page_count * page_size / 1024 / 1024, 1),
             "freelist_mb": round(freelist * page_size / 1024 / 1024, 1),
@@ -205,7 +231,7 @@ def main() -> int:
     while True:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         http_state = check_http(args.base_url)
-        db_state = check_db(db_path)
+        db_state = check_db(db_path, run_quick_check=not samples)
         sample = {"time": stamp, "http": http_state, "db": db_state}
         samples.append(sample)
         print(json.dumps(sample, ensure_ascii=False, sort_keys=True))
@@ -213,6 +239,10 @@ def main() -> int:
         if time.monotonic() >= deadline:
             break
         time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+    # Re-run SQLite quick_check once at the end so the soak brackets the live interval.
+    final_db = check_db(db_path, run_quick_check=True)
+    samples[-1]["db"] = final_db
 
     first = samples[0]["db"]
     last = samples[-1]["db"]
