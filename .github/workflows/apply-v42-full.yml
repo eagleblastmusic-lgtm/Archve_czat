@@ -28,10 +28,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-      - name: Make phase-1 repeated anchors deterministic
+      - name: Repair executor source literals and repeated anchors
         run: |
           python - <<'PY'
           from pathlib import Path
+
           p = Path('tools/apply_v42_security_phase1.py')
           text = p.read_text(encoding='utf-8')
           old = "    if count != 1:\n        fail(f'{label}: expected exactly 1 anchor, found {count}')\n"
@@ -39,6 +40,16 @@ jobs:
           if old not in text:
               raise SystemExit('phase-1 replace_once anchor missing')
           p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+
+          p = Path('tools/apply_v42_full.py')
+          text = p.read_text(encoding='utf-8')
+          opener = "    content = r'''import os\n"
+          closer = "print(\"PASS ARCHIVEBITE V4.2 FULL HARDENING REGRESSION\")\n'''\n    write(path, content)\n"
+          if opener not in text or closer not in text:
+              raise SystemExit('full executor regression literal anchors missing')
+          text = text.replace(opener, '    content = r"""import os\n', 1)
+          text = text.replace(closer, 'print("PASS ARCHIVEBITE V4.2 FULL HARDENING REGRESSION")\n"""\n    write(path, content)\n', 1)
+          p.write_text(text, encoding='utf-8', newline='\n')
           PY
       - name: Apply V4.2 source transformations
         shell: bash
