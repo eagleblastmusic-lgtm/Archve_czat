@@ -118,10 +118,22 @@ with story._state_lock:
     story._desired_segments.clear()
 print('PASS 5: identical in-flight segment requests are deduplicated')
 
-# 6. Background prefetch is stale while a different fresh urgent target exists.
-generation = story._set_desired_segment('direction-fixture', 7)
-assert story._job_is_superseded('direction-fixture', 8, generation, 1) is True
-assert story._job_is_superseded('direction-fixture', 7, generation, 1) is False
-print('PASS 6: background work cannot outrank a different current hover target')
+# 6. Background work is restricted to the current target or the one predicted
+# directional neighbor and is invalidated immediately by a new generation.
+with story._state_lock:
+    story._desired_segments.clear()
+neutral_generation = story._set_desired_segment('direction-fixture', 7)
+assert story._job_is_superseded('direction-fixture', 8, neutral_generation, 1) is True
+assert story._job_is_superseded('direction-fixture', 7, neutral_generation, 1) is False
+
+story._set_desired_segment('direction-fixture', 6)
+forward_generation = story._set_desired_segment('direction-fixture', 7)
+assert story._job_is_superseded('direction-fixture', 8, forward_generation, 1) is False
+assert story._job_is_superseded('direction-fixture', 9, forward_generation, 1) is True
+
+new_generation = story._set_desired_segment('direction-fixture', 9)
+assert new_generation > forward_generation
+assert story._job_is_superseded('direction-fixture', 8, forward_generation, 1) is True
+print('PASS 6: background work is limited to the predicted neighbor and stale generations are rejected')
 
 print('PASS V4.3 STORYBOARD SCHEDULER')
