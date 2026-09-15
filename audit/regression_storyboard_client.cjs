@@ -4,6 +4,7 @@ const vm = require('node:vm');
 
 (async () => {
   const images = [];
+  const documentEvents = new Map();
   class ImageMock {
     constructor() { this.style = {}; }
     set src(value) { this.url = value; images.push(this); }
@@ -26,8 +27,15 @@ const vm = require('node:vm');
     Math,
     Number,
     String,
+    URLSearchParams,
+    decodeURIComponent,
+    location: { search: '', pathname: '/watch/watch-fixture' },
     crypto: { randomUUID: () => `id-${Math.random()}` },
-    document: { querySelector: () => null, createElement: () => ({ style: {} }) },
+    document: {
+      querySelector: () => null,
+      createElement: () => ({ style: {} }),
+      addEventListener(name, callback) { documentEvents.set(name, callback); }
+    },
     fetch: async () => { throw new Error('unexpected fetch'); }
   };
   context.window = context;
@@ -57,7 +65,7 @@ const vm = require('node:vm');
             frame_width: 160,
             frame_height: 90,
             times: [0, 1],
-            sprite_url: '/sprite'
+            sprite_url: `/sprite-${segmentStarts}`
           })
         };
       }
@@ -84,10 +92,10 @@ const vm = require('node:vm');
   images[0].onload();
 
   const board = await second;
-  assert.equal(board.sprite_url, '/sprite');
+  assert.equal(board.sprite_url, '/sprite-1');
 
   const warm = await api.prepareSegment({ videoId: 'fixture', duration: 30, segmentIndex: 0 });
-  assert.equal(warm.sprite_url, '/sprite');
+  assert.equal(warm.sprite_url, '/sprite-1');
   assert.equal(segmentStarts, 1, 'warm cache must not restart backend work');
 
   // `attach` may inspect an already cached QUICK board, but pointer-enter/play
@@ -126,7 +134,34 @@ const vm = require('node:vm');
   assert.equal(segmentStarts, 1, 'attach pointer-enter must not start exact segment work');
   attachAbort.abort();
 
-  console.log('PASS: shared segment abort/dedupe works and attach cannot start unbuffered exact work');
+  // The buffered-playing hook must resolve /watch/<id> from pathname. Without
+  // this contract the standalone watch page would never receive the safe
+  // post-buffer prewarm after removing attach's eager warm.
+  context.ArchivebatePerf = { getBufferedAhead: () => 3.5 };
+  const playingHandler = documentEvents.get('playing');
+  assert.equal(typeof playingHandler, 'function', 'global playing prewarm hook must be installed');
+  const watchVideo = {
+    id: 'mainPlayer',
+    dataset: {},
+    duration: 30,
+    currentTime: 3,
+    paused: false,
+    ended: false,
+    readyState: 4,
+  };
+  playingHandler({ target: watchVideo });
+  for (let i = 0; i < 80 && segmentStarts < 2; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.equal(segmentStarts, 2, 'buffered watch playback must prewarm exact segment using pathname video id');
+  for (let i = 0; i < 20 && images.length < 2; i += 1) {
+    await new Promise(resolve => setTimeout(resolve, 2));
+  }
+  assert.equal(images.length, 2, 'watch prewarm should reach shared sprite preload');
+  images[1].onload();
+  await new Promise(resolve => setTimeout(resolve, 5));
+
+  console.log('PASS: shared segment abort/dedupe, attach gating and buffered watch-route prewarm work');
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;
