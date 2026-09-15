@@ -45,6 +45,8 @@ jobs:
         run: node audit/regression_accessibility.cjs
       - name: Home loading regression
         run: node audit/regression_home_loading.cjs
+      - name: V4.3 home scope guard
+        run: python audit/regression_v43_home_scope.py
       - name: Block without reload regression
         run: node audit/regression_block_no_reload.cjs
       - name: Pagination regression
