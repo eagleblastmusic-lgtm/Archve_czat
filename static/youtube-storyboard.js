@@ -546,7 +546,9 @@
     const begin = () => {
       if (started || signal?.aborted || !Number.isFinite(video.duration) || video.duration <= 0) return;
       started = true;
-      warm({ videoId, duration: video.duration, targetTime: Number(video.currentTime) || 0 });
+      // Do not start exact FFmpeg work here. Exact prewarm is deliberately
+      // scheduled by the global `playing` hook only after useful media buffer
+      // exists, while pointer hover requests its exact target explicitly.
       if (typeof onBoard === 'function') {
         prepare({ videoId, duration: video.duration, signal }).then(board => {
           if (!signal?.aborted) onBoard(board);
