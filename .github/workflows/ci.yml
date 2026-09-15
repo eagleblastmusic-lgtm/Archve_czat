@@ -13,7 +13,7 @@ permissions:
 jobs:
   offline-regression:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,12 +22,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Install dependencies
+      - name: Install locked dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lock.txt
+          pip check
       - name: Compile Python
         run: python -m compileall -q .
+      - name: V4.2 local security regression
+        run: python audit/regression_security_v42.py
+      - name: V4.2 full hardening regression
+        run: python audit/regression_v42_full.py
       - name: Consolidated audit-fix regressions
         run: python audit/regression_audit_fixes.py
       - name: Core backend regression
@@ -93,7 +98,7 @@ jobs:
 
   windows-contracts:
     runs-on: windows-2022
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: "utf-8"
@@ -105,11 +110,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Install dependencies
+      - name: Install locked dependencies
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lock.txt
+          pip check
       - name: Secret and destructive-launch negative controls
         shell: pwsh
         run: |
@@ -121,6 +127,10 @@ jobs:
           if ($realHits.Count -gt 0) { $realHits | Write-Error; exit 1 }
       - name: Compile Python
         run: python -m compileall -q .
+      - name: V4.2 local security regression
+        run: python audit/regression_security_v42.py
+      - name: V4.2 full hardening regression
+        run: python audit/regression_v42_full.py
       - name: Next-generation contract regression
         run: python audit/regression_next_generation.py
       - name: Consolidated audit-fix regression
@@ -135,5 +145,40 @@ jobs:
         run: node audit/regression_catalog_partial_frontend.cjs
       - name: Local search scope regression
         run: node audit/regression_local_search.cjs
+      - name: Unit tests
+        run: python -m unittest -v test_suite.py
+
+  windows-python314:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install locked dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock.txt
+          pip check
+      - name: Compile Python
+        run: python -m compileall -q .
+      - name: V4.2 local security regression
+        run: python audit/regression_security_v42.py
+      - name: V4.2 full hardening regression
+        run: python audit/regression_v42_full.py
+      - name: V4.1 catalog concurrency regression
+        run: python audit/regression_catalog_v41.py
+      - name: Active frontend regression
+        run: node audit/regression_frontend.cjs
+      - name: Accessibility and player-controls regression
+        run: node audit/regression_accessibility.cjs
       - name: Unit tests
         run: python -m unittest -v test_suite.py
