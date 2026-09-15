@@ -35,6 +35,8 @@ jobs:
         run: python audit/regression_v42_full.py
       - name: V4.3 storyboard scheduler regression
         run: python audit/regression_v43_storyboard_scheduler.py
+      - name: V4.3 grouped feed fast-path regression
+        run: python audit/regression_v43_grouped_fast.py
       - name: Consolidated audit-fix regressions
         run: python audit/regression_audit_fixes.py
       - name: Core backend regression
@@ -141,6 +143,8 @@ jobs:
         run: python audit/regression_v42_full.py
       - name: V4.3 storyboard scheduler regression
         run: python audit/regression_v43_storyboard_scheduler.py
+      - name: V4.3 grouped feed fast-path regression
+        run: python audit/regression_v43_grouped_fast.py
       - name: Next-generation contract regression
         run: python audit/regression_next_generation.py
       - name: Consolidated audit-fix regression
@@ -190,6 +194,8 @@ jobs:
         run: python audit/regression_v42_full.py
       - name: V4.3 storyboard scheduler regression
         run: python audit/regression_v43_storyboard_scheduler.py
+      - name: V4.3 grouped feed fast-path regression
+        run: python audit/regression_v43_grouped_fast.py
       - name: V4.1 catalog concurrency regression
         run: python audit/regression_catalog_v41.py
       - name: Active frontend regression
