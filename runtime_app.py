@@ -11,12 +11,13 @@ import fast_storyboard_quick as _quick_storyboard
 
 install_grouped_feed_fast_path()
 
-# V7 cold-hover overview: eight low-resolution anchors are enough to make a
-# full-width sweep visibly change while remaining dramatically cheaper than the
-# historical full-resolution preview seeker. Parallelism stays capped at two.
-_quick_storyboard.QUICK_FRAME_COUNT = 8
+# Cold-hover overview is a bridge, not the final precise timeline. Keep only four
+# logical anchors and accept two unique decoded anchors for the first persistent
+# sprite. This lets two low-resolution range seeks run as one batch; exact 1-fps
+# segments immediately take over the hovered 30-second region afterwards.
+_quick_storyboard.QUICK_FRAME_COUNT = 4
 _quick_storyboard.QUICK_PARALLELISM = 2
-_quick_storyboard.QUICK_MIN_SUCCESS = 4
+_quick_storyboard.QUICK_MIN_SUCCESS = 2
 _quick_storyboard.install()
 
 import main as _main  # noqa: E402  (patches must be installed before main binds entry points)
@@ -70,9 +71,12 @@ def v43_runtime_marker():
         # Compatibility marker retained for older diagnostics.
         "parallel_quick_storyboard": bool(getattr(storyboard_service, "_v43_parallel_quick_installed", False)),
         "playback_safe_quick_storyboard": bool(getattr(storyboard_service, "_v43_playback_safe_quick_installed", False)),
+        "quick_reservation_scheduler": bool(getattr(storyboard_service, "_v43_quick_reservation_installed", False)),
         "timeline_coordinator_version": 7,
+        "quick_scheduler_revision": 8,
         "quick_frame_count": int(_quick_storyboard.QUICK_FRAME_COUNT),
         "quick_parallelism": int(_quick_storyboard.QUICK_PARALLELISM),
+        "quick_min_success": int(_quick_storyboard.QUICK_MIN_SUCCESS),
         "media_seek_fallback": False,
     }
 
