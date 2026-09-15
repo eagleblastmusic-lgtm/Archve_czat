@@ -7,7 +7,7 @@ import urllib.request
 import uvicorn
 import webview
 
-from fast_grouped_feed import install as install_grouped_feed_fast_path
+from fast_grouped_feed_v2 import install as install_grouped_feed_fast_path
 
 os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = "--autoplay-policy=no-user-gesture-required"
 
