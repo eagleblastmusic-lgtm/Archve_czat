@@ -60,27 +60,28 @@ assert.equal(otherVideo.dataset.videoId, undefined, 'bridge is modal-specific');
 
 const fallbackSource = fs.readFileSync('static/v43-timeline-fallback.js', 'utf8');
 assert.doesNotThrow(() => new vm.Script(fallbackSource, { filename: 'v43-timeline-fallback.js' }));
-assert.match(fallbackSource, /owner=preview&priority=low&reason=timeline_preview/);
-assert.match(fallbackSource, /getSegmentFromCache/);
-assert.match(fallbackSource, /Number\(mainVideo\.readyState \|\| 0\) < 2/);
-assert.match(fallbackSource, /timeline\.addEventListener\('pointerleave'/);
-assert.match(fallbackSource, /keepPreviewComposited\(previewVideo, false\)/);
-assert.match(fallbackSource, /pointerRaf = requestAnimationFrame/);
-assert.match(fallbackSource, /previewVideo\.currentTime = target/,
-  'new pointer targets must supersede obsolete seeks instead of waiting for them');
-assert.match(fallbackSource, /if \(previewVideo\.seeking\) metrics\.supersededSeeks \+= 1/);
-assert.match(fallbackSource, /MOVE_SEEK_INTERVAL_MS = 100/,
-  'dynamic preview must rate-limit real media seeks independently from pointer events');
-assert.match(fallbackSource, /PREWARM_DELAY_MS = 1400/,
-  'preview metadata should be prewarmed only after primary playback is healthy');
-assert.match(fallbackSource, /seek_dispatches/);
-assert.doesNotMatch(fallbackSource, /createPreviewSeeker\(previewVideo/,
-  'shared preview seeker serializes old range seeks and is too slow for timeline pointer motion');
-assert.doesNotMatch(fallbackSource, /requestSegment\s*\(/);
-assert.doesNotMatch(fallbackSource, /\/api\/storyboard\/segment/);
+assert.match(fallbackSource, /\/api\/storyboard\?id=/,
+  'cold timeline must build one persistent QUICK sprite');
+assert.match(fallbackSource, /ArchivebateYouTubeStoryboard\.applyFrame/,
+  'pointer motion must select frames locally from the sprite');
+assert.match(fallbackSource, /getSegmentFromCache/,
+  'exact 1-fps segment remains above the coarse fallback');
+assert.match(fallbackSource, /frame_width:\s*160/);
+assert.match(fallbackSource, /frame_height:\s*90/);
+assert.match(fallbackSource, /media_seek_enabled:\s*false/);
+assert.match(fallbackSource, /PREWARM_BUFFER_SECONDS = 3\.0/,
+  'coarse generation must wait until primary playback has a useful buffer');
+assert.match(fallbackSource, /timeline\.addEventListener\('pointermove'/);
+assert.doesNotMatch(fallbackSource, /\/api\/video\/stream\?id=.*owner=preview/,
+  'timeline pointer motion must not seek a second full-resolution MP4');
+assert.doesNotMatch(fallbackSource, /previewVideo\.currentTime\s*=/,
+  'timeline pointer motion must be network-free once the sprite is ready');
+assert.doesNotMatch(fallbackSource, /requestSegment\s*\(/,
+  'fallback itself must not duplicate exact-segment scheduling');
 
 const runtimeSource = fs.readFileSync('runtime_app.py', 'utf8');
-assert.match(runtimeSource, /v43-timeline-fallback\.js\?v=4/);
-assert.match(runtimeSource, /dynamic_timeline_fallback["']:\s*True/);
+assert.match(runtimeSource, /v43-timeline-fallback\.js\?v=5/);
+assert.match(runtimeSource, /parallel_quick_storyboard["']:\s*bool/);
+assert.match(runtimeSource, /fast_storyboard_quick/);
 
-console.log('PASS V4.3 MODAL IDENTITY + LATEST-TARGET-WINS TIMELINE FALLBACK');
+console.log('PASS V4.3 MODAL IDENTITY + YOUTUBE-STYLE COARSE SPRITE FALLBACK');
