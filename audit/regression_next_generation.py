@@ -237,7 +237,7 @@ def test_background_worker_lifecycle() -> None:
             assert storyboard.runtime_stats()["auto_full_upgrade"] is False
             storyboard.demand("lifecycle-video", "consumer", active=False)
             storyboard.shutdown(timeout=3)
-            assert storyboard._worker_thread is None
+            assert storyboard._worker_threads == []
 
             # A clean shutdown must permit a later explicit start in the same process.
             storyboard.demand("lifecycle-restart", "consumer")
