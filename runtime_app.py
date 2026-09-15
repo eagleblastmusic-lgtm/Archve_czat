@@ -4,21 +4,24 @@ Keeps V4.3-only performance wiring outside main.py while both browser and deskto
 launch the same FastAPI app.
 """
 
+from urllib.parse import quote
+
 from fast_grouped_feed_v2 import install as install_grouped_feed_fast_path
-from fast_storyboard_quick import install as install_parallel_quick_storyboard
+import fast_storyboard_quick as _quick_storyboard
 
 install_grouped_feed_fast_path()
-install_parallel_quick_storyboard()
+_quick_storyboard.install()
 
 import main as _main  # noqa: E402  (patches must be installed before main binds entry points)
 
 app = _main.app
 RUNTIME_ID = "v4.3-fast2"
 
-# V4.3 timeline fallback is deliberately injected only by this runtime instead
-# of changing the V4.2/master HTML. It uses a precomputed 160x90 QUICK sprite
-# instead of seeking a second full-resolution MP4 on pointer movement.
-_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback.js?v=5"></script>'
+# V4.3 timeline layer is deliberately injected only by this runtime instead of
+# changing the V4.2/master HTML. It never seeks a second full-resolution MP4.
+# Cold hover retains the poster; a tiny 160x90 coarse sprite is prepared only
+# when playback has a safe buffer, and exact 1-fps segments always outrank it.
+_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback.js?v=6"></script>'
 _original_versioned_html = _main._versioned_html
 
 
@@ -49,7 +52,7 @@ _FA_EVENT_HASH = "'sha256-MhtPZXr7+LpJUY5qtMutB+qWfQtMaPccfe7QXtCcEYc='"
 
 @app.get("/api/runtime/v43")
 def v43_runtime_marker():
-    """Small local marker used by the launcher/live gate to reject stale port-8000 servers."""
+    """Marker used by launchers/live gates to reject stale port-8000 servers."""
     from catalog_service import CatalogService
     import storyboard_service
 
@@ -57,8 +60,40 @@ def v43_runtime_marker():
         "runtime": RUNTIME_ID,
         "grouped_fast_path_v2": bool(getattr(CatalogService, "_v43_grouped_fast_v2_installed", False)),
         "dynamic_timeline_fallback": True,
+        # Compatibility marker retained for older diagnostics.
         "parallel_quick_storyboard": bool(getattr(storyboard_service, "_v43_parallel_quick_installed", False)),
+        "playback_safe_quick_storyboard": bool(getattr(storyboard_service, "_v43_playback_safe_quick_installed", False)),
+        "media_seek_fallback": False,
     }
+
+
+@app.get("/api/runtime/v43/storyboard/quick")
+def v43_quick_storyboard_status(id: str, duration: float, wait_ms: int = 1200):
+    """Long-poll the tiny QUICK storyboard without browser-side busy polling.
+
+    This is read-only. Building is still started through the protected
+    POST /api/storyboard route, so the V4.2 mutation security contract remains
+    unchanged.
+    """
+    clean_id = _main._resolve_clean_video_id(id)
+    duration = float(duration or 0)
+    if not clean_id or duration <= 0 or duration > 43200:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Invalid ID or duration")
+    bounded_wait = max(0, min(int(wait_ms or 0), 2000)) / 1000.0
+    data = dict(_quick_storyboard.wait_status(clean_id, duration, timeout=bounded_wait) or {})
+    if data.get("status") == "ready":
+        data["sprite_url"] = (
+            f"/api/storyboard/image?id={quote(clean_id, safe='')}"
+            f"&q=quick&v={data.get('created_at', 0)}"
+        )
+    return data
+
+
+@app.get("/api/runtime/v43/storyboard/stats")
+def v43_quick_storyboard_stats():
+    """Small live-gate view over V4.3 coarse-generation cost and concurrency."""
+    return _quick_storyboard.runtime_stats()
 
 
 @app.middleware("http")
