@@ -1,6 +1,6 @@
 """Browser launcher for the local Archivebate server."""
 
-from fast_grouped_feed import install as install_grouped_feed_fast_path
+from fast_grouped_feed_v2 import install as install_grouped_feed_fast_path
 
 # Install before Uvicorn imports main:app so the existing CatalogService singleton
 # uses the V4.3 grouped query path from its first request.
