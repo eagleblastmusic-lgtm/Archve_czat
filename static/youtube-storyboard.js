@@ -12,12 +12,14 @@
   const segmentMemory = new Map();
   const segmentInFlight = new Map();
   const recentTargets = new Map();
+  const activeTargetRequests = new Map();
 
   const metrics = {
     cacheHits: 0,
     cacheMisses: 0,
     requests: 0,
     abortedConsumers: 0,
+    targetSwitches: 0,
     exactReadyMs: [],
     imageReadyMs: [],
   };
@@ -202,9 +204,13 @@
     if (cached) return cached;
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
+    // Exact timeline work always has priority over the approximate QUICK board.
+    if (segmentInFlight.size > 0) throw new Error('Exact segment has priority');
+
     const consumer = createConsumerToken('quick');
-    const leaseUrl = await acquireLease(videoId, consumer, signal);
+    let leaseUrl = '';
     try {
+      leaseUrl = await acquireLease(videoId, consumer, signal);
       const startResponse = await mutationRequest(
         `/api/storyboard?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}`,
         { method: 'POST', cache: 'no-store', signal }
@@ -252,8 +258,8 @@
     entry.promise = (async () => {
       metrics.requests += 1;
       const consumer = createConsumerToken(`seg-${segmentIndex}`);
-      entry.leaseUrl = await acquireLease(videoId, consumer, controller.signal);
       try {
+        entry.leaseUrl = await acquireLease(videoId, consumer, controller.signal);
         // V4.3 deliberately disables blind prefetch_next. The backend scheduler
         // receives only the exact segment that the user currently asks for.
         const postUrl = `/api/storyboard/segment?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}&segment=${encodeURIComponent(segmentIndex)}&prefetch_next=false`;
@@ -285,7 +291,7 @@
         throw new Error('Przekroczono czas przygotowania segmentu');
       } finally {
         releaseLease(entry.leaseUrl);
-        segmentInFlight.delete(key);
+        if (segmentInFlight.get(key) === entry) segmentInFlight.delete(key);
       }
     })();
 
@@ -355,24 +361,75 @@
     return direction;
   }
 
+  function linkAbort(parentSignal, childController) {
+    if (!parentSignal) return () => {};
+    if (parentSignal.aborted) {
+      childController.abort();
+      return () => {};
+    }
+    const abort = () => childController.abort();
+    parentSignal.addEventListener('abort', abort, { once: true });
+    return () => parentSignal.removeEventListener('abort', abort);
+  }
+
+  function cancelActiveTarget(videoId) {
+    const active = activeTargetRequests.get(videoId);
+    if (!active) return;
+    activeTargetRequests.delete(videoId);
+    active.unlink?.();
+    if (!active.controller.signal.aborted) active.controller.abort();
+  }
+
   function requestSegment({ videoId, duration, targetTime, signal, onReady }) {
     const segmentIndex = Math.max(0, Math.floor((Number(targetTime) || 0) / SEGMENT_DURATION));
     const key = segmentKey(videoId, duration, segmentIndex);
     noteTarget(videoId, targetTime);
+
     const cached = lruGet(segmentMemory, key);
     if (cached) {
       metrics.cacheHits += 1;
+      const active = activeTargetRequests.get(videoId);
+      if (active && active.segmentIndex !== segmentIndex) {
+        metrics.targetSwitches += 1;
+        cancelActiveTarget(videoId);
+      }
       if (typeof onReady === 'function') onReady(cached);
       return cached;
     }
+
+    let active = activeTargetRequests.get(videoId);
+    if (active && active.segmentIndex === segmentIndex && !active.controller.signal.aborted) {
+      if (typeof onReady === 'function') active.callbacks.add(onReady);
+      return null;
+    }
+
+    if (active) {
+      metrics.targetSwitches += 1;
+      cancelActiveTarget(videoId);
+    }
+
+    const controller = new AbortController();
+    const callbacks = new Set();
+    if (typeof onReady === 'function') callbacks.add(onReady);
+    const unlink = linkAbort(signal, controller);
     const started = now();
-    prepareSegment({ videoId, duration, segmentIndex, signal })
+    active = { segmentIndex, controller, callbacks, unlink, promise: null };
+    activeTargetRequests.set(videoId, active);
+
+    active.promise = prepareSegment({ videoId, duration, segmentIndex, signal: controller.signal })
       .then(segment => {
-        if (signal?.aborted) return;
+        if (controller.signal.aborted) return segment;
         rememberSample(metrics.exactReadyMs, now() - started);
-        if (typeof onReady === 'function') onReady(segment);
+        for (const callback of [...callbacks]) {
+          try { callback(segment); } catch (_) {}
+        }
+        return segment;
       })
-      .catch(() => {});
+      .catch(() => null)
+      .finally(() => {
+        if (activeTargetRequests.get(videoId) === active) activeTargetRequests.delete(videoId);
+        unlink();
+      });
     return null;
   }
 
@@ -469,8 +526,10 @@
       cache_misses: metrics.cacheMisses,
       requests: metrics.requests,
       aborted_consumers: metrics.abortedConsumers,
+      target_switches: metrics.targetSwitches,
       segment_cache_entries: segmentMemory.size,
       segment_inflight: segmentInFlight.size,
+      active_target_requests: activeTargetRequests.size,
       preload_entries: preloadMemory.size,
       exact_ready_p50_ms: percentile(metrics.exactReadyMs, 0.50),
       exact_ready_p95_ms: percentile(metrics.exactReadyMs, 0.95),
@@ -489,6 +548,7 @@
     getSegmentFromCache,
     requestSegment,
     prepareSegment,
+    cancelActiveTarget,
     stats,
     SEGMENT_DURATION,
   };
