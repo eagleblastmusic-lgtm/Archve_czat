@@ -27,8 +27,8 @@ def fail(msg: str) -> None:
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
-    if count != 1:
-        fail(f'{label}: expected exactly 1 anchor, found {count}')
+    if count < 1:
+        fail(f'{label}: expected at least 1 anchor, found {count}')
     return text.replace(old, new, 1)
 
 

@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from client import ArchivebateSession
 from scraper import ArchivebateScraper, POPULAR_TAGS, extract_video_tags
@@ -27,7 +28,7 @@ from config import get_archivebate_credentials
 from cache_store import (
     THUMBS_CACHE_DIR, FEED_CACHE_DIR, DETAILS_CACHE_DIR, STREAM_CACHE_DIR, STORYBOARD_CACHE_DIR,
     atomic_write_json, read_json_cache, cache_age_seconds, safe_cache_key,
-    is_safe_remote_url, trim_cache_directory,
+    is_safe_remote_url, response_peer_is_global, trim_cache_directory,
 )
 from video_identity import VideoKey
 from storyboard_service import (
@@ -200,7 +201,7 @@ async def lifespan(app: FastAPI):
             # It discovers profiles and walks their historical pages with durable checkpoints.
             try:
                 from deep_archivebate import deep_archivebate_service
-                deep_archivebate_service.start(scraper)
+                deep_archivebate_service.start(scraper.clone_for_background())
             except Exception as exc:
                 print(f"[Deep Archivebate] Błąd startu: {exc}")
         except Exception as e:
@@ -251,6 +252,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Archivebate Video Browser", lifespan=lifespan)
 
+# V4.2: reject foreign Host headers on every request, not only mutations.
+# This is the primary browser-side DNS-rebinding barrier for the localhost app.
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+)
+
 # Duże feedy JSON/CSS/JS są kompresowane; dla lokalnego UI zmniejsza to koszt kopiowania
 # i szczególnie pomaga, gdy aplikacja jest otwierana z innego urządzenia w LAN.
 app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
@@ -268,18 +276,37 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def local_mutation_security_gate(request: Request, call_next):
-    """Require same-local-origin and a per-process mutation token for state changes."""
+async def local_security_gate(request: Request, call_next):
+    """Reject foreign Host on every request; protect state changes with Origin + token."""
+    raw_host = (request.headers.get("host") or "").strip().lower()
+    host = raw_host
+    if raw_host.startswith("["):
+        host = raw_host.split("]", 1)[0].lstrip("[")
+    elif ":" in raw_host:
+        host = raw_host.rsplit(":", 1)[0]
+    if host not in ALLOWED_LOCAL_HOSTS:
+        return JSONResponse({"success": False, "error": "foreign_host"}, status_code=403)
+
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-        host = (request.headers.get("host") or "").split(":", 1)[0].strip().lower()
         origin = request.headers.get("origin")
-        if host not in ALLOWED_LOCAL_HOSTS:
-            return JSONResponse({"success": False, "error": "foreign_host"}, status_code=403)
         if origin and not _is_allowed_local_origin(origin, request):
             return JSONResponse({"success": False, "error": "foreign_origin"}, status_code=403)
         if request.headers.get("x-archivebate-mutation-token") != LOCAL_MUTATION_TOKEN:
             return JSONResponse({"success": False, "error": "mutation_token_required"}, status_code=403)
-    return await call_next(request)
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+        "font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data: blob: https:; "
+        "media-src 'self' blob: https:; connect-src 'self' https:; object-src 'none'; "
+        "base-uri 'none'; frame-ancestors 'none'",
+    )
+    return response
 
 class NoCacheStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope):
@@ -522,20 +549,28 @@ def _validated_session_get(http_session, url: str, *, headers=None, timeout=8, s
     """GET z walidacją każdego redirectu i pamięcią podręczną rozwiązanego URL dla błyskawicznego streamingu."""
     # 1. Błyskawiczny skrót: jeśli URL był już wcześniej rozwiązany, łączymy się bezpośrednio z docelowym CDN
     cached_target = get_cached_redirect(url)
-    if cached_target and is_safe_remote_url(cached_target):
+    if cached_target and is_safe_remote_url(cached_target, fresh=True):
         try:
             res = http_session.get(cached_target, headers=headers, timeout=timeout, stream=stream, allow_redirects=False)
+            if not response_peer_is_global(res):
+                res.close()
+                raise HTTPException(status_code=400, detail="Połączenie z adresem prywatnym zostało zablokowane")
             if res.status_code in (200, 206):
                 return res
             res.close()
+        except HTTPException:
+            raise
         except Exception:
             pass
 
     current = url
     for _ in range(max_redirects + 1):
-        if not is_safe_remote_url(current):
+        if not is_safe_remote_url(current, fresh=True):
             raise HTTPException(status_code=400, detail="Niedozwolony adres zdalny")
         res = http_session.get(current, headers=headers, timeout=timeout, stream=stream, allow_redirects=False)
+        if not response_peer_is_global(res):
+            res.close()
+            raise HTTPException(status_code=400, detail="Połączenie z adresem prywatnym zostało zablokowane")
         if res.status_code not in (301, 302, 303, 307, 308):
             if current != url:
                 set_cached_redirect(url, current)
@@ -548,7 +583,7 @@ def _validated_session_get(http_session, url: str, *, headers=None, timeout=8, s
     raise HTTPException(status_code=502, detail="Zbyt wiele przekierowań zdalnego zasobu")
 
 _thumb_fetch_guard = threading.Lock()
-_thumb_fetch_locks = {}
+_thumb_fetch_locks = OrderedDict()
 _thumb_disk_writes = 0
 _last_thumb_trim_time = 0.0
 
@@ -556,21 +591,37 @@ def _thumb_fetch_lock(url_hash: str) -> threading.Lock:
     with _thumb_fetch_guard:
         lock = _thumb_fetch_locks.get(url_hash)
         if lock is None:
-            if len(_thumb_fetch_locks) > 2000:
-                _thumb_fetch_locks.clear()
             lock = threading.Lock()
             _thumb_fetch_locks[url_hash] = lock
+        _thumb_fetch_locks.move_to_end(url_hash)
+        while len(_thumb_fetch_locks) > 2000:
+            evicted = False
+            for old_key, old_lock in list(_thumb_fetch_locks.items()):
+                if old_key == url_hash or old_lock.locked():
+                    continue
+                _thumb_fetch_locks.pop(old_key, None)
+                evicted = True
+                break
+            if not evicted:
+                break
         return lock
 
 _thumb_failures = OrderedDict()
 MEMORY_CACHE_BYTES = 64 * 1024 * 1024
+_memory_cache_bytes = 0
 
 
 def _remember_thumbnail(key, content, content_type):
+    global _memory_cache_bytes
+    previous = MEMORY_CACHE.pop(key, None)
+    if previous is not None:
+        _memory_cache_bytes = max(0, _memory_cache_bytes - len(previous[0]))
     MEMORY_CACHE[key] = (content, content_type)
     MEMORY_CACHE.move_to_end(key)
-    while len(MEMORY_CACHE)>MEMORY_CACHE_MAX or sum(len(v[0]) for v in MEMORY_CACHE.values())>MEMORY_CACHE_BYTES:
-        MEMORY_CACHE.popitem(last=False)
+    _memory_cache_bytes += len(content)
+    while len(MEMORY_CACHE) > MEMORY_CACHE_MAX or _memory_cache_bytes > MEMORY_CACHE_BYTES:
+        _, evicted = MEMORY_CACHE.popitem(last=False)
+        _memory_cache_bytes = max(0, _memory_cache_bytes - len(evicted[0]))
 
 
 @app.get("/api/thumb")
@@ -691,9 +742,7 @@ async def _ensure_account_synced():
 
 @app.get("/api/account/summary")
 async def get_account_summary():
-    """Zwraca podsumowanie panelu konta."""
-    if not storage.data.get("last_synced"):
-        await _ensure_account_synced()
+    """Read-only account summary. Synchronization is explicit POST /api/account/sync."""
     return {
         **_account_counts(),
         **storage.get_blocked_stats(),
@@ -703,9 +752,6 @@ async def get_account_summary():
 async def get_account_favorites(page: int = Query(1, ge=1), per_page: int = Query(280, ge=1, le=1000)):
     """Zwraca listę ulubionych wideo z obsługą stron."""
     favs = storage.get_favorites(include_blocked=False)
-    if len(favs) == 0 and not storage.data.get("last_synced"):
-        await _ensure_account_synced()
-        favs = storage.get_favorites(include_blocked=False)
 
     total = len(favs)
     last_page = max(1, math.ceil(total / per_page))
@@ -805,9 +851,6 @@ def toggle_favorite(video: dict = Body(...)):
 async def get_account_history(page: int = Query(1, ge=1), per_page: int = Query(280, ge=1, le=1000)):
     """Zwraca historię oglądanych wideo z obsługą stron."""
     hist = storage.get_history(include_blocked=False)
-    if len(hist) == 0 and not storage.data.get("last_synced"):
-        await _ensure_account_synced()
-        hist = storage.get_history(include_blocked=False)
 
     total = len(hist)
     last_page = max(1, math.ceil(total / per_page))
@@ -850,9 +893,6 @@ def clear_history():
 async def get_account_following(page: int = Query(1, ge=1), per_page: int = Query(280, ge=1, le=1000)):
     """Zwraca wideo z obserwowanych kanałów z obsługą stron."""
     foll = storage.get_following(include_blocked=False)
-    if len(foll) == 0 and not storage.data.get("last_synced"):
-        await _ensure_account_synced()
-        foll = storage.get_following(include_blocked=False)
 
     total = len(foll)
     last_page = max(1, math.ceil(total / per_page))
@@ -1141,7 +1181,7 @@ def get_videos(
         active_rev = _published_catalog_revision(catalog_service)
     refresh_revision = None
     if force_refresh:
-        refresh_revision = catalog_service.build_revision_background(_catalog_fetchers(), force=True)
+        raise HTTPException(status_code=405, detail="Odświeżenie katalogu wymaga POST /api/catalog/refresh")
     available_rev = _available_catalog_revision(catalog_service)
     if active_rev is not None or available_rev is not None:
         is_grouped = group_authors in (True, "1", "true", "True")
@@ -1293,7 +1333,7 @@ def progressive_feed(
         active_rev = _published_catalog_revision(catalog_service)
     refresh_revision = None
     if force_refresh:
-        refresh_revision = catalog_service.build_revision_background(_catalog_fetchers(), force=True)
+        raise HTTPException(status_code=405, detail="Odświeżenie katalogu wymaga POST /api/catalog/refresh")
     available_rev = _available_catalog_revision(catalog_service)
     if active_rev is not None or available_rev is not None:
         rev_to_use = revision
@@ -1325,6 +1365,20 @@ def progressive_feed(
         return result
 
     return _feed_snapshot(source, author_filter, group_authors, snapshot_id, force_refresh).read(page)
+
+
+@app.post("/api/catalog/refresh")
+def refresh_catalog():
+    """Start a standard catalog rebuild through a mutation-protected endpoint."""
+    from catalog_service import catalog_service
+    active_revision = _published_catalog_revision(catalog_service)
+    refresh_revision = catalog_service.build_revision_background(_catalog_fetchers(), force=True)
+    return {
+        "success": True,
+        "active_revision": active_revision,
+        "refresh_revision": refresh_revision,
+        "refresh_pending": bool(refresh_revision and refresh_revision != active_revision),
+    }
 
 
 @app.get("/api/catalog/groups/{author_key}/members")
@@ -1851,23 +1905,30 @@ def _refresh_details_in_background(video_id: str) -> None:
 
 @app.get("/api/video/details")
 def get_video_details(id: str = Query(...), force_refresh: bool = Query(False)):
-    """Detale z persistent cache i puli wątków; zapobiega blokowaniu pętli asyncio FastAPI."""
+    """Read cached/fresh details without allowing a state-changing force refresh over GET."""
+    if force_refresh:
+        raise HTTPException(status_code=405, detail="Wymuszone odświeżenie wymaga POST /api/video/details/refresh")
     clean_id = _resolve_clean_video_id(id)
     cached, metadata_mtime, stream_mtime = _read_video_caches(clean_id)
     metadata_age = cache_age_seconds(metadata_mtime)
     stream_age = cache_age_seconds(cached.get("direct_url_fetched_at") or stream_mtime) if isinstance(cached, dict) else float("inf")
 
-    if force_refresh:
-        _clear_no_stream(clean_id)
-    if isinstance(cached, dict) and cached and not force_refresh and metadata_age <= DETAILS_CACHE_STALE_SECONDS:
+    if isinstance(cached, dict) and cached and metadata_age <= DETAILS_CACHE_STALE_SECONDS:
         details = cached
         if metadata_age > DETAILS_CACHE_FRESH_SECONDS or (cached.get("direct_url") and stream_age > STREAM_URL_FRESH_SECONDS):
             _refresh_details_in_background(clean_id)
-    elif force_refresh:
-        details = _fetch_details_singleflight(clean_id, force=True)
     else:
         details = _fetch_details_singleflight(clean_id)
 
+    return _normalize_video_details(clean_id, details)
+
+
+@app.post("/api/video/details/refresh")
+def refresh_video_details(id: str = Query(...)):
+    """Force provider/cache refresh only through the mutation security gate."""
+    clean_id = _resolve_clean_video_id(id)
+    _clear_no_stream(clean_id)
+    details = _fetch_details_singleflight(clean_id, force=True)
     return _normalize_video_details(clean_id, details)
 
 
@@ -1949,7 +2010,7 @@ def stream_video_proxy(
 
     if not url:
         raise HTTPException(status_code=400, detail="Brak URL lub ID wideo do odtworzenia")
-    if not is_safe_remote_url(url) and not (url.startswith("http://127.0.0.1:") or url.startswith("http://localhost:")):
+    if not is_safe_remote_url(url):
         raise HTTPException(status_code=400, detail="Niedozwolony adres strumienia")
 
     referer = embed_url or "https://mixdrop.ag/"
@@ -2266,7 +2327,7 @@ def estimate_model_total_videos(username: str) -> int:
     def check_ab():
         try:
             url = f"https://archivebate.com/profile/{clean_u}"
-            r_ab = session.session.get(url, timeout=2.5)
+            r_ab = session.request("GET", url, timeout=2.5)
             if r_ab.status_code == 200:
                 html = r_ab.text
                 scraper._sync_csrf(html, url)
@@ -2432,6 +2493,7 @@ async def get_diagnostics():
     from catalog_service import catalog_service
     from deep_archivebate import deep_archivebate_service
     from fast_scan import quick_scan_supervisor
+    from storyboard_service import runtime_stats as storyboard_runtime_stats
     health = _public_store_health()
     try:
         configured_port = int(os.getenv("ARCHIVEBATE_PORT") or os.getenv("PORT") or "8000")
@@ -2454,6 +2516,7 @@ async def get_diagnostics():
         "jobs": _redact_diagnostic_value({
             "quick_scan": quick_scan_supervisor.status(),
             "deep_archivebate": deep_archivebate_service.status(),
+            "storyboard": storyboard_runtime_stats(),
         }),
     }
 

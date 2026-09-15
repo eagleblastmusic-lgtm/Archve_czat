@@ -30,3 +30,6 @@ data/catalog.db-shm
 
 # Local repair backups
 *.bak_*
+
+# Runtime model-tag enrichment (seed is tracked separately)
+data/model_tags.local.json

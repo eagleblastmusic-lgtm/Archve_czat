@@ -64,7 +64,9 @@
     if (accountBootstrapStarted || !baseStatus || (!baseStatus.logged_in && !baseStatus.last_synced)) return;
     accountBootstrapStarted = true;
     try {
-      const summary = await ArchivebateAPI.getJSON('/api/account/summary', { timeoutMs: 120000 });
+      const summary = (!baseStatus.last_synced && baseStatus.logged_in)
+        ? await ArchivebateAPI.postJSON('/api/account/sync', {}, { timeoutMs: 120000 })
+        : await ArchivebateAPI.getJSON('/api/account/summary', { timeoutMs: 120000 });
       updateUserStatus({ ...baseStatus, ...summary });
       if (global.ArchivebateHomeStats && typeof global.ArchivebateHomeStats.update === 'function') {
         await global.ArchivebateHomeStats.update();

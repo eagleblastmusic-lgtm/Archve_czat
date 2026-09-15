@@ -325,7 +325,7 @@ def harden_ci(text: str) -> str:
 
 def create_regression() -> None:
     path = ROOT / "audit" / "regression_v42_full.py"
-    content = r'''import os
+    content = r"""import os
 import sqlite3
 import subprocess
 import sys
@@ -433,7 +433,7 @@ assert 'python-version: "3.14"' in ci and "requirements.lock.txt" in ci
 print("PASS v4.2 full 12: Python 3.14 + locked dependency CI")
 
 print("PASS ARCHIVEBITE V4.2 FULL HARDENING REGRESSION")
-'''
+"""
     write(path, content)
 
 

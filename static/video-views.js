@@ -408,7 +408,11 @@
       const initialItemsParam = !cachedPage && !isSamePageRefresh
         ? `&initial_items=${HOME_INITIAL_ITEM_LIMIT}`
         : '';
-      const params = `page=${page}&source=${src}&author_filter=${af}&group_authors=${grp}${force ? '&force_refresh=true' : ''}${revParam}${initialItemsParam}`;
+      if (force) {
+        await api().postJSON('/api/catalog/refresh', {}, { timeoutMs: HOME_FEED_HANDSHAKE_TIMEOUT_MS, signal: controller.signal });
+        if (generation !== state.viewGeneration) return;
+      }
+      const params = `page=${page}&source=${src}&author_filter=${af}&group_authors=${grp}${revParam}${initialItemsParam}`;
       const data = await api().getJSON(`/api/feed?${params}${snapshot ? `&snapshot_id=${encodeURIComponent(snapshot)}` : ''}`, { timeoutMs: HOME_FEED_HANDSHAKE_TIMEOUT_MS, signal: controller.signal });
       if (generation !== state.viewGeneration) return;
       state.feedSpecKey = specKey;

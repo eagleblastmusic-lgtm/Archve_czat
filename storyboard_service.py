@@ -23,7 +23,7 @@ from cache_store import (
 )
 
 # v5: progressive storyboard. Najpierw bardzo lekki QUICK, potem FULL w tle.
-STORYBOARD_VERSION = 6
+STORYBOARD_VERSION = 7
 FRAME_WIDTH = 160
 FRAME_HEIGHT = 90
 QUICK_FRAMES = 8
@@ -47,6 +47,73 @@ _worker_started = False
 _worker_thread: Optional[threading.Thread] = None
 _worker_stop = threading.Event()
 _leases: Dict[str, Dict[str, float]] = {}
+_active_process_lock = threading.Lock()
+_active_processes: Dict[str, subprocess.Popen] = {}
+_cancelled_processes = 0
+
+
+def _has_live_lease(video_id: str) -> bool:
+    now = time.monotonic()
+    with _state_lock:
+        entries = _leases.get(_key(video_id)) or {}
+        return any(expiry > now for expiry in entries.values())
+
+
+def _run_cancellable_process(cmd, *, timeout: float, process_key: str, text: bool = False, cancel_check=None):
+    global _cancelled_processes
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=text,
+        errors="replace" if text else None,
+    )
+    with _active_process_lock:
+        _active_processes[process_key] = proc
+    deadline = time.monotonic() + max(0.1, float(timeout))
+    try:
+        while True:
+            if cancel_check is not None and cancel_check():
+                _cancelled_processes += 1
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                stderr = proc.stderr.read() if proc.stderr else ("" if text else b"")
+                return -15, stderr, True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                stderr = proc.stderr.read() if proc.stderr else ("" if text else b"")
+                return -9, stderr, False
+            try:
+                _, stderr = proc.communicate(timeout=min(0.20, remaining))
+                return proc.returncode, stderr, False
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        with _active_process_lock:
+            _active_processes.pop(process_key, None)
+
+
+def runtime_stats() -> dict:
+    with _active_process_lock:
+        active_processes = len(_active_processes)
+        cancelled = int(_cancelled_processes)
+    with _state_lock:
+        building = sum(1 for value in _states.values() if value.get("status") == "building")
+        active_leases = sum(1 for entries in _leases.values() if any(expiry > time.monotonic() for expiry in entries.values()))
+    return {
+        "queue_size": _jobs.qsize(),
+        "queue_capacity": _jobs.maxsize,
+        "active_processes": active_processes,
+        "cancelled_processes": cancelled,
+        "building_jobs": building,
+        "active_leases": active_leases,
+        "auto_full_upgrade": False,
+        "storyboard_version": STORYBOARD_VERSION,
+    }
 
 
 def _key(video_id: str) -> str:
@@ -244,6 +311,8 @@ def _run_segment_extract(
     tmp_dir: Path,
     timeout: int,
     seek_before_input: bool,
+    cancel_check=None,
+    process_key: str = "segment",
 ) -> Tuple[List[Path], List[float], bool]:
     _cleanup_segment_frames(tmp_dir)
     vf = (
@@ -266,24 +335,19 @@ def _run_segment_extract(
         "-y", str(tmp_dir / "frame_%03d.jpg"),
     ]
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            timeout=timeout,
-            text=True,
-            errors="replace",
+        returncode, stderr, cancelled = _run_cancellable_process(
+            cmd, timeout=timeout, process_key=process_key, text=True, cancel_check=cancel_check
         )
     except Exception:
         _cleanup_segment_frames(tmp_dir)
         return [], [], False
 
     frames = sorted(tmp_dir.glob("frame_*.jpg"))
-    if result.returncode != 0 or not frames or any(not _valid_segment_frame(frame) for frame in frames):
+    if cancelled or returncode != 0 or not frames or any(not _valid_segment_frame(frame) for frame in frames):
         _cleanup_segment_frames(tmp_dir)
         return [], [], False
 
-    stderr = result.stderr or ""
+    stderr = stderr or ""
     pts = []
     for match in re.finditer(r"pts_time:([+-]?(?:\d+(?:\.\d*)?|\.\d+))", stderr):
         try:
@@ -299,57 +363,22 @@ def _run_segment_extract(
 
 
 def _extract_segment_frames_with_times(
-    ffmpeg: str, source_url: str, start_time: float, target_duration: float, tmp_dir: Path, timeout: int = 25
+    ffmpeg: str, source_url: str, start_time: float, target_duration: float, tmp_dir: Path, timeout: int = 25,
+    cancel_check=None, process_key: str = "segment"
 ) -> Tuple[List[Path], List[float], bool]:
-    """Extract a dense segment safely using the source-proven FFmpeg command shape.
-
-    A segment is accepted only when FFmpeg reports success and every produced
-    JPEG decodes at the expected dimensions. Timing is nominal 1 fps, so the
-    manifest must mark it as approximate instead of claiming decoded precision.
-    """
-    vf = (
-        f"fps={SEGMENT_FPS},"
-        f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={FRAME_WIDTH}:{FRAME_HEIGHT}"
+    """Extract one dense 30-second segment in a cancellable FFmpeg process."""
+    first = _run_segment_extract(
+        ffmpeg, source_url, start_time, target_duration, tmp_dir, timeout, True,
+        cancel_check=cancel_check, process_key=process_key,
     )
-
-    def run(seek_before_input: bool) -> Tuple[List[Path], List[float], bool]:
-        _cleanup_segment_frames(tmp_dir)
-        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
-        if seek_before_input:
-            cmd += ["-ss", f"{start_time:.3f}", "-t", f"{target_duration:.3f}", "-i", source_url]
-        else:
-            cmd += ["-i", source_url, "-ss", f"{start_time:.3f}", "-t", f"{target_duration:.3f}"]
-        cmd += [
-            "-vf", vf,
-            "-an", "-sn", "-dn",
-            "-threads", "1",
-            "-q:v", "7",
-            "-y", str(tmp_dir / "frame_%03d.jpg"),
-        ]
-        try:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-            )
-        except Exception:
-            _cleanup_segment_frames(tmp_dir)
-            return [], [], False
-
-        frames = sorted(tmp_dir.glob("frame_*.jpg"))
-        if result.returncode != 0 or not frames or any(not _valid_segment_frame(frame) for frame in frames):
-            _cleanup_segment_frames(tmp_dir)
-            return [], [], False
-
-        times = [float(start_time) + i * (1.0 / SEGMENT_FPS) for i in range(len(frames))]
-        return frames, times, False
-
-    first = run(True)
     if first[0]:
         return first
-    return run(False)
+    if cancel_check is not None and cancel_check():
+        return [], [], False
+    return _run_segment_extract(
+        ffmpeg, source_url, start_time, target_duration, tmp_dir, timeout, False,
+        cancel_check=cancel_check, process_key=process_key,
+    )
 
 
 def _extract_segment_frames(
@@ -458,7 +487,9 @@ def _build_segment(video_id: str, duration: float, segment_index: int, source_ur
         tmp = Path(tmp_dir)
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
         frames, decoded_times, precise_timing = _extract_segment_frames_with_times(
-            ffmpeg, source_url, start_time, seg_duration, tmp
+            ffmpeg, source_url, start_time, seg_duration, tmp,
+            cancel_check=lambda: _worker_stop.is_set() or not _has_live_lease(video_id),
+            process_key=f"{_key(video_id)}:seg:{segment_index}",
         )
         if not frames:
             raise RuntimeError(f"FFmpeg nie wygenerował poprawnych klatek dla segmentu {segment_index}")
@@ -578,13 +609,8 @@ def _run_jobs():
                 _states[k] = {
                     "status": "ready",
                     **result,
-                    "upgrade_status": "ready" if quality == "full" else "queued",
+                    "upgrade_status": "disabled",
                 }
-                if quality == "quick":
-                    if not _jobs.full():
-                        _jobs.put_nowait((1, next(_sequence), video_id, duration, source_url, "full"))
-                    else:
-                        _states[k]["upgrade_status"] = "error"
         except Exception as exc:
             with _state_lock:
                 if quality == "full":
@@ -613,12 +639,10 @@ def start(video_id: str, duration: float, source_url: str, force: bool = False) 
             return dict(current)
         if _jobs.full():
             return {"status": "error", "error": "Storyboard queue is full"}
-        quality = "full" if quick and not force else "quick"
-        state = (
-            {"status": "ready", **quick, "upgrade_status": "queued"}
-            if quality == "full"
-            else {"status": "building", "stage": "quick"}
-        )
+        if quick and not force:
+            return {"status": "ready", **quick, "upgrade_status": "disabled"}
+        quality = "quick"
+        state = {"status": "building", "stage": "quick", "upgrade_status": "disabled"}
         for old_key in list(_states):
             old = _states[old_key]
             if len(_states) < 256:

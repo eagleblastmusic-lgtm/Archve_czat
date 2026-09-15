@@ -37,7 +37,13 @@
   };
 
   const api = global.ArchivebateAPI || {
-    getJSON: (url, opts) => fetch(url, opts).then(r => r.json())
+    getJSON: (url, opts) => fetch(url, opts).then(r => r.json()),
+    postJSON: (url, body, opts = {}) => fetch(url, {
+      ...opts,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(opts.headers || {}) },
+      body: JSON.stringify(body ?? {})
+    }).then(r => r.json())
   };
 
   // Pamięć podręczna detali wideo dla natychmiastowego startu po kliknięciu
@@ -276,8 +282,9 @@
     if (!key || !detailsAreUnavailable(initialDetails) || signal?.aborted) return initialDetails;
     if (unavailableConfirmInflight.has(key)) return unavailableConfirmInflight.get(key);
 
-    const request = api.getJSON(
-      `/api/video/details?id=${encodeURIComponent(videoId)}&force_refresh=true`,
+    const request = api.postJSON(
+      `/api/video/details/refresh?id=${encodeURIComponent(videoId)}`,
+      {},
       { timeoutMs: 12000, signal }
     ).then(fresh => {
       if (fresh && !signal?.aborted) videoDetailsCache.set(videoId, fresh);

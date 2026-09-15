@@ -65,21 +65,30 @@ def safe_cache_key(value: str) -> str:
     return hashlib.sha256(str(value).encode("utf-8", "ignore")).hexdigest()
 
 
-def is_safe_remote_url(url: str) -> bool:
+def is_safe_remote_url(url: str, *, fresh: bool = False) -> bool:
     """SSRF guard: only public http/https targets, never localhost/private/link-local."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        try:
+            port = parsed.port
+        except ValueError:
+            return False
+        if port is not None and not (1 <= int(port) <= 65535):
             return False
         host = parsed.hostname.lower().rstrip(".")
         if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
             return False
 
         now = time.time()
-        with _host_cache_lock:
-            cached = _host_safety_cache.get(host)
-            if cached and now - cached[1] < _HOST_CACHE_TTL:
-                return cached[0]
+        if not fresh:
+            with _host_cache_lock:
+                cached = _host_safety_cache.get(host)
+                if cached and now - cached[1] < _HOST_CACHE_TTL:
+                    return cached[0]
 
         # Literal IP albo jednorazowa walidacja DNS; wynik hosta cache'ujemy, żeby
         # zabezpieczenie SSRF nie dokładało osobnego DNS lookupu do każdej miniatury.
@@ -96,6 +105,24 @@ def is_safe_remote_url(url: str) -> bool:
         with _host_cache_lock:
             _host_safety_cache[host] = (safe, now)
         return safe
+    except Exception:
+        return False
+
+
+def response_peer_is_global(response) -> bool:
+    """Best-effort post-connect check against DNS rebinding/TOCTOU.
+
+    If urllib3 exposes the connected peer, it must be a public/global address.
+    Unknown peer metadata is treated as unsafe for the local proxy path.
+    """
+    try:
+        raw = getattr(response, "raw", None)
+        connection = getattr(raw, "_connection", None) or getattr(raw, "connection", None)
+        sock = getattr(connection, "sock", None)
+        if sock is None:
+            return False
+        peer = sock.getpeername()[0]
+        return ipaddress.ip_address(peer).is_global
     except Exception:
         return False
 

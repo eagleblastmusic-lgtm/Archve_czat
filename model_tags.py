@@ -12,7 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 logger = logging.getLogger("model_tags")
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-MODEL_TAGS_FILE = os.path.join(DATA_DIR, "model_tags.json")
+MODEL_TAGS_SEED_FILE = os.path.join(DATA_DIR, "model_tags.seed.json")
+MODEL_TAGS_FILE = os.path.join(DATA_DIR, "model_tags.local.json")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 HEADERS = {
@@ -60,15 +61,17 @@ class ModelTagManager:
             for k, v in INITIAL_SEED.items():
                 self._db[k.lower()] = v.copy()
 
-            if os.path.exists(MODEL_TAGS_FILE):
+            for source_path in (MODEL_TAGS_SEED_FILE, MODEL_TAGS_FILE):
+                if not os.path.exists(source_path):
+                    continue
                 try:
-                    with open(MODEL_TAGS_FILE, "r", encoding="utf-8") as f:
+                    with open(source_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
                         if isinstance(data, dict):
                             for k, v in data.items():
                                 self._db[k.lower()] = v
                 except Exception as e:
-                    logger.warning(f"Błąd odczytu model_tags.json: {e}")
+                    logger.warning(f"Błąd odczytu {os.path.basename(source_path)}: {e}")
 
     def _save(self) -> bool:
         try:
@@ -188,8 +191,8 @@ class ModelTagManager:
             self.set_model(username, gender, list(tags))
             return self.get_model(username) or {"username": username, "gender": gender, "tags": list(tags)}
 
-        # Domyślnie Female jeśli nie wykryto nic innego
-        return {"username": username, "gender": "Female", "tags": ["Female"]}
+        # Brak wiarygodnego sygnału to Unknown, nigdy automatyczne "Female".
+        return {"username": username, "gender": None, "tags": [], "confidence": 0.0, "sources": []}
 
     def resolve_models_async(self, usernames: List[str]):
         """Rozpoznaje profile modelek w puli wątków w tle bez blokowania odpowiedzi."""
