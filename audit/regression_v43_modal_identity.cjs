@@ -58,10 +58,6 @@ const otherVideo = { id: 'mainPlayer', dataset: {} };
 listeners.get('play')({ target: otherVideo });
 assert.equal(otherVideo.dataset.videoId, undefined, 'bridge is modal-specific');
 
-// Visual correctness gate: V4.3 must not fall back to one static poster while
-// the pointer moves over uncached Archivebate timeline segments. The dedicated
-// fallback uses a low-priority seekable stream and keeps exact storyboard
-// segments above it when they are ready.
 const fallbackSource = fs.readFileSync('static/v43-timeline-fallback.js', 'utf8');
 assert.doesNotThrow(() => new vm.Script(fallbackSource, { filename: 'v43-timeline-fallback.js' }));
 assert.match(fallbackSource, /createPreviewSeeker\(previewVideo/);
@@ -69,15 +65,20 @@ assert.match(fallbackSource, /owner=preview&priority=low&reason=timeline_preview
 assert.match(fallbackSource, /getSegmentFromCache/);
 assert.match(fallbackSource, /Number\(mainVideo\.readyState \|\| 0\) < 2/);
 assert.match(fallbackSource, /timeline\.addEventListener\('pointerleave'/);
-assert.match(fallbackSource, /keepPreviewComposited\(previewVideo, false\)/, 'preview video must remain compositor-visible before first frame');
-assert.match(fallbackSource, /opacity = visible \? '1' : '0\.001'/, 'cold preview must not use display:none while waiting for requestVideoFrameCallback');
-assert.match(fallbackSource, /hasDynamicFrame/, 'last decoded frame should remain visible while the next seek is pending');
-assert.doesNotMatch(fallbackSource, /meta\.isLatest === false/, 'intermediate decoded frames must not all be discarded while pointer is moving');
-assert.doesNotMatch(fallbackSource, /requestSegment\s*\(/, 'dynamic fallback must not start exact FFmpeg jobs itself');
-assert.doesNotMatch(fallbackSource, /\/api\/storyboard\/segment/, 'dynamic fallback must use the media proxy, not cold storyboard generation');
+assert.match(fallbackSource, /keepPreviewComposited\(previewVideo, false\)/);
+assert.match(fallbackSource, /opacity = visible \? '1' : '0\.001'/);
+assert.match(fallbackSource, /hasDynamicFrame/);
+assert.match(fallbackSource, /pointerRaf = requestAnimationFrame/,
+  'fallback must run after modal-player-controls RAF so the poster renderer cannot hide it afterwards');
+assert.match(fallbackSource, /previewVideo\.addEventListener\('seeked'/);
+assert.match(fallbackSource, /seekedFallbackFrames/,
+  'paused auxiliary video needs a seeked+RAF fallback when requestVideoFrameCallback does not arrive');
+assert.doesNotMatch(fallbackSource, /meta\.isLatest === false/);
+assert.doesNotMatch(fallbackSource, /requestSegment\s*\(/);
+assert.doesNotMatch(fallbackSource, /\/api\/storyboard\/segment/);
 
 const runtimeSource = fs.readFileSync('runtime_app.py', 'utf8');
-assert.match(runtimeSource, /v43-timeline-fallback\.js/);
+assert.match(runtimeSource, /v43-timeline-fallback\.js\?v=3/);
 assert.match(runtimeSource, /dynamic_timeline_fallback["']:\s*True/);
 
-console.log('PASS V4.3 MODAL IDENTITY + COMPOSITOR TIMELINE FALLBACK');
+console.log('PASS V4.3 MODAL IDENTITY + RAF-ORDERED TIMELINE FALLBACK');
