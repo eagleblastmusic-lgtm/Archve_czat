@@ -496,6 +496,7 @@
       active.timer = null;
       if (!active.started) metrics.intentCancelled += 1;
     }
+    active.parentSignal?.removeEventListener?.('abort', active.parentAbort);
     active.unlink?.();
     if (!active.controller.signal.aborted) active.controller.abort();
   }
@@ -536,6 +537,8 @@
       targetTime: Number(targetTime) || 0,
       controller,
       unlink,
+      parentSignal: signal || null,
+      parentAbort: null,
       onReady: typeof onReady === 'function' ? onReady : null,
       promise: null,
       timer: null,
@@ -544,6 +547,16 @@
     };
     activeTargetRequests.set(videoId, active);
     metrics.intentScheduled += 1;
+
+    const parentAbort = () => {
+      if (activeTargetRequests.get(videoId) === active) cancelActiveTarget(videoId);
+    };
+    active.parentAbort = parentAbort;
+    signal?.addEventListener?.('abort', parentAbort, { once: true });
+    if (signal?.aborted) {
+      parentAbort();
+      return null;
+    }
 
     const tryStart = () => {
       active.timer = null;
@@ -566,6 +579,7 @@
         })
         .catch(() => null)
         .finally(() => {
+          active.parentSignal?.removeEventListener?.('abort', active.parentAbort);
           if (activeTargetRequests.get(videoId) === active) activeTargetRequests.delete(videoId);
           unlink();
         });
