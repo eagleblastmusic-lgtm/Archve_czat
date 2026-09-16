@@ -170,28 +170,44 @@
 
   function setupIdleTimer(wrapper, controls, video, delayMs = 2500) {
     let timer = null;
+    let controlsHovered = false;
     const clear = () => {
       if (timer !== null) clearTimeout(timer);
       timer = null;
     };
-    const reset = () => {
-      controls?.classList?.remove?.('idle');
+    const arm = () => {
       clear();
-      if (!video?.paused && !video?.ended) {
+      if (!video?.paused && !video?.ended && !controlsHovered) {
         timer = setTimeout(() => controls?.classList?.add?.('idle'), delayMs);
       }
+    };
+    const reset = () => {
+      controls?.classList?.remove?.('idle');
+      arm();
+    };
+    const onControlsEnter = () => {
+      controlsHovered = true;
+      clear();
+      controls?.classList?.remove?.('idle');
+    };
+    const onControlsLeave = () => {
+      controlsHovered = false;
+      reset();
     };
     const onPause = () => {
       clear();
       controls?.classList?.remove?.('idle');
     };
     const onPointerLeave = () => {
+      controlsHovered = false;
       if (!video?.paused && !video?.ended) controls?.classList?.add?.('idle');
     };
 
     wrapper?.addEventListener?.('pointermove', reset, { passive: true });
     wrapper?.addEventListener?.('pointerenter', reset, { passive: true });
     wrapper?.addEventListener?.('pointerleave', onPointerLeave, { passive: true });
+    controls?.addEventListener?.('pointerenter', onControlsEnter, { passive: true });
+    controls?.addEventListener?.('pointerleave', onControlsLeave, { passive: true });
     video?.addEventListener?.('play', reset);
     video?.addEventListener?.('pause', onPause);
     reset();
