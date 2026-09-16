@@ -1,6 +1,8 @@
 (() => {
   'use strict';
 
+  // Runtime-only safety net: preserve lazy loading, but make scroll recovery
+  // independent from the lifetime of the shared IntersectionObserver instance.
   // Safety net for the card thumbnail IntersectionObserver. A same-page refresh
   // can temporarily disconnect the shared observer while keeping existing cards
   // in the DOM. Those cards still carry data-src, so re-promote only thumbnails
