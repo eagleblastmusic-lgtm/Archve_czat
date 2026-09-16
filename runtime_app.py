@@ -85,7 +85,7 @@ _main._versioned_html = _v43_versioned_html
 # script, which made Chromium log an error even though performance.js later repairs
 # the stylesheet. Permit only that exact handler hash; arbitrary inline script
 # remains blocked.
-_FA_EVENT_HASH = "'sha256-MhtPZXr7+LpJUY5qtMutB+WfQtMaPccfe7QXtCcEYc='"
+_FA_EVENT_HASH = "'sha256-MhtPZXr7+LpJUY5qtMutB+qWfQtMaPccfe7QXtCcEYc='"
 
 
 @app.get("/api/runtime/v43")
