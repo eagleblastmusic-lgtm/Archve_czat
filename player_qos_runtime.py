@@ -83,7 +83,7 @@ def snapshot() -> dict:
     with _lock:
         data = dict(_state)
     updated = float(data.pop("updated_monotonic", 0.0) or 0.0)
-    age = max(0.0, now - updated) if updated else float("inf")
+    age = max(0.0, now - updated) if updated else 0.0
     if not updated or age > STALE_AFTER_SECONDS:
         return {
             "video_id": str(data.get("video_id") or ""),
