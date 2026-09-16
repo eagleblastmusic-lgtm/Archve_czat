@@ -10,6 +10,7 @@ story = (ROOT / "storyboard_service.py").read_text(encoding="utf-8")
 quick = (ROOT / "fast_storyboard_quick.py").read_text(encoding="utf-8")
 watch = (ROOT / "static" / "watch.html").read_text(encoding="utf-8")
 client = (ROOT / "static" / "v452-player-qos.js").read_text(encoding="utf-8")
+player_core = (ROOT / "static" / "player-core.js").read_text(encoding="utf-8")
 timeline = (ROOT / "static" / "youtube-storyboard.js").read_text(encoding="utf-8")
 fallback = (ROOT / "static" / "v43-timeline-fallback-v7.js").read_text(encoding="utf-8")
 live = (ROOT / "static" / "v43-live-report.js").read_text(encoding="utf-8")
@@ -60,6 +61,13 @@ assert 'droppedVideoFrames' in client
 assert 'corruptedVideoFrames' in client
 assert 'stall_duration_ms' in client
 assert 'video_width' in client and 'display_width' in client
+
+# Stationary interaction with the controls/timeline must keep the controls visible.
+# Cold EXACT can legitimately take longer than the default 2.5 s idle timeout.
+assert 'let controlsHovered = false' in player_core
+assert "controls?.addEventListener?.('pointerenter', onControlsEnter" in player_core
+assert "controls?.addEventListener?.('pointerleave', onControlsLeave" in player_core
+assert '!video?.paused && !video?.ended && !controlsHovered' in player_core
 
 # Final V4.5.2 exact-timeline client: cached frames are free, uncached work is
 # held behind an idle gate plus a second playback-health check before demand/POST.
