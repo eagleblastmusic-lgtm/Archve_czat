@@ -26,6 +26,13 @@
         }
       }
     } catch (_) {}
+
+    let media = {};
+    try {
+      media = globalThis.ArchivebatePlayerQoS?.snapshot?.(video) ||
+        globalThis.ArchivebatePlayerQoS?.getPlaybackMediaStats?.(video) || {};
+    } catch (_) {}
+
     return {
       id: String(video.id || ''),
       dataset_video_id: String(video.dataset?.videoId || ''),
@@ -36,13 +43,25 @@
       current_time_s: Number((Number(video.currentTime) || 0).toFixed(3)),
       duration_s: Number.isFinite(Number(video.duration)) ? Number(Number(video.duration).toFixed(3)) : null,
       buffered_ahead_s: Number(bufferedAhead.toFixed(3)),
+      video_width: Number(media.video_width || video.videoWidth || 0),
+      video_height: Number(media.video_height || video.videoHeight || 0),
+      display_width: Number(media.display_width || video.clientWidth || 0),
+      display_height: Number(media.display_height || video.clientHeight || 0),
+      total_video_frames: Number(media.total_video_frames || 0),
+      dropped_video_frames: Number(media.dropped_video_frames || 0),
+      corrupted_video_frames: Number(media.corrupted_video_frames || 0),
+      dropped_frame_ratio: Number(media.dropped_frame_ratio || 0),
+      stall_count: Number(media.stall_count || 0),
+      stall_duration_ms: Number(media.stall_duration_ms || 0),
+      stall_active: !!media.stall_active,
+      qos_reason: String(media.reason || media.last_reason || ''),
     };
   }
 
   function activeContextSnapshot() {
     const state = globalThis.ArchivebateAppContext?.state || globalThis.state || null;
     const details = state?.currentVideoDetails || null;
-    const id = String(state?.currentVideoId || details?.id || '').trim();
+    const id = String(details?.id || state?.currentVideoId || '').trim();
     const source = String(details?.source || '').trim() || (id.startsWith('cw_') ? 'camwhores' : 'archivebate');
     return {
       current_video_id: id,
@@ -56,6 +75,7 @@
       hover_controller_active: !!state?.timelineHoverController && !state.timelineHoverController.signal?.aborted,
       storyboard_api_loaded: !!globalThis.ArchivebateYouTubeStoryboard,
       storyboard_request_segment: typeof globalThis.ArchivebateYouTubeStoryboard?.requestSegment === 'function',
+      player_qos_loaded: !!globalThis.ArchivebatePlayerQoS,
     };
   }
 
@@ -91,14 +111,17 @@
     const fallback = globalThis.ArchivebateV43TimelineFallback || null;
     const clientStoryboard = typeof storyboard?.stats === 'function' ? storyboard.stats() : null;
     const fallbackStats = typeof fallback?.stats === 'function' ? fallback.stats() : null;
-    const [serverStoryboard, coarseServer] = await Promise.all([
+    const [serverStoryboard, coarseServer, qosServer, runtime] = await Promise.all([
       serverStoryboardStats(),
       fetchJSON('/api/runtime/v43/storyboard/stats'),
+      fetchJSON('/api/runtime/v452/qos'),
+      fetchJSON('/api/runtime/v43'),
     ]);
 
     return {
-      schema: 'archivebate-v43-live-report/3',
+      schema: 'archivebate-v452-live-report/1',
       generated_at: new Date().toISOString(),
+      runtime,
       playback: {
         click_to_first_frame: percentiles(perf, 'total_click_to_first_frame_ms'),
         click_to_resolve: percentiles(perf, 'click_to_resolve_ms'),
@@ -114,6 +137,10 @@
         exact_server: serverStoryboard,
         coarse_server: coarseServer,
       },
+      qos: {
+        client: globalThis.ArchivebatePlayerQoS ? { installed: true } : { installed: false },
+        server: qosServer,
+      },
       player: activePlayerSnapshot(perf),
       context: activeContextSnapshot(),
     };
@@ -122,12 +149,13 @@
   async function print() {
     const report = await collect();
     try {
-      console.group('Archivebate V4.3 live gate');
+      console.group('Archivebate V4.5.2 live gate');
       console.log('click -> first frame', report.playback.click_to_first_frame);
       console.log('timeline exact client', report.timeline.exact_client);
       console.log('timeline fallback', report.timeline.fallback);
       console.log('timeline exact server', report.timeline.exact_server);
       console.log('timeline coarse server', report.timeline.coarse_server);
+      console.log('player QoS', report.qos);
       console.log('player', report.player);
       console.log('context', report.context);
       console.log(JSON.stringify(report, null, 2));
@@ -136,5 +164,7 @@
     return report;
   }
 
-  globalThis.ArchivebateV43Diagnostics = { collect, print };
+  const api = { collect, print };
+  globalThis.ArchivebateV43Diagnostics = api;
+  globalThis.ArchivebateV452Diagnostics = api;
 })();

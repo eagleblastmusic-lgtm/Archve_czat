@@ -35,6 +35,10 @@ jobs:
         run: python audit/regression_v42_full.py
       - name: V4.3 storyboard scheduler regression
         run: python audit/regression_v43_storyboard_scheduler.py
+      - name: V4.5.2 player QoS contracts
+        run: python audit/regression_v452_player_qos.py
+      - name: V4.5.2 frontend player QoS gate
+        run: node audit/regression_v452_frontend_qos.cjs
       - name: V4.3 grouped feed fast-path regression
         run: python audit/regression_v43_grouped_fast.py
       - name: Consolidated audit-fix regressions
@@ -143,6 +147,10 @@ jobs:
         run: python audit/regression_v42_full.py
       - name: V4.3 storyboard scheduler regression
         run: python audit/regression_v43_storyboard_scheduler.py
+      - name: V4.5.2 player QoS contracts
+        run: python audit/regression_v452_player_qos.py
+      - name: V4.5.2 frontend player QoS gate
+        run: node audit/regression_v452_frontend_qos.cjs
       - name: V4.3 grouped feed fast-path regression
         run: python audit/regression_v43_grouped_fast.py
       - name: Next-generation contract regression
@@ -194,6 +202,10 @@ jobs:
         run: python audit/regression_v42_full.py
       - name: V4.3 storyboard scheduler regression
         run: python audit/regression_v43_storyboard_scheduler.py
+      - name: V4.5.2 player QoS contracts
+        run: python audit/regression_v452_player_qos.py
+      - name: V4.5.2 frontend player QoS gate
+        run: node audit/regression_v452_frontend_qos.cjs
       - name: V4.3 grouped feed fast-path regression
         run: python audit/regression_v43_grouped_fast.py
       - name: V4.1 catalog concurrency regression
