@@ -68,6 +68,7 @@ assert 'let controlsHovered = false' in player_core
 assert "controls?.addEventListener?.('pointerenter', onControlsEnter" in player_core
 assert "controls?.addEventListener?.('pointerleave', onControlsLeave" in player_core
 assert '!video?.paused && !video?.ended && !controlsHovered' in player_core
+assert "controls?.classList?.remove?.('idle')" in player_core
 
 # Final V4.5.2 exact-timeline client: cached frames are free, uncached work is
 # held behind an idle gate plus a second playback-health check before demand/POST.
