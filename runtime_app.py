@@ -4,6 +4,7 @@ Keeps V4.3-only performance wiring outside main.py while both browser and deskto
 launch the same FastAPI app.
 """
 
+import re
 from urllib.parse import quote
 
 from fast_grouped_feed_v2 import install as install_grouped_feed_fast_path
@@ -12,38 +13,61 @@ import fast_storyboard_quick as _quick_storyboard
 install_grouped_feed_fast_path()
 
 # Cold-hover overview is only the first bridge until exact 1-fps segments take
-# over. Two anchors can be fetched in one two-process batch, which removes the
-# previous second batch from first-preview latency and keeps playback contention
-# bounded. Exact segment frames provide the fine-grained follow-up.
-_quick_storyboard.QUICK_FRAME_COUNT = 2
+# over. Four coarse anchors are prepared with bounded two-process parallelism.
+# Exact segment frames remain authoritative and provide the fine-grained follow-up.
+# V4.4 keeps this shared coarse fallback alive while exact hover work coexists.
+_quick_storyboard.QUICK_FRAME_COUNT = 4
 _quick_storyboard.QUICK_PARALLELISM = 2
-_quick_storyboard.QUICK_MIN_SUCCESS = 2
+_quick_storyboard.QUICK_MIN_SUCCESS = 3
 _quick_storyboard.install()
 
-import main as _main  # noqa: E402  (patches must be installed before main binds entry points)
+import main as _main  # noqa: E402  (runtime accelerators must be installed before main binds entry points)
+import player_qos_runtime as _player_qos  # noqa: E402
 
 app = _main.app
+_player_qos.install(app, _main)
 RUNTIME_ID = "v4.3-fast2"
 
 # V4.3 timeline layer is deliberately injected only by this runtime instead of
 # changing the V4.2/master HTML. V7 coordinates the first cold hover so the
 # persistent coarse sprite gets a bounded head start before exact 1-fps work.
 # It never seeks a second full-resolution browser <video>.
-_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback-v7.js?v=7"></script>'
+_V452_QOS_SCRIPT = '<script src="/static/v452-player-qos.js?v=452"></script>'
+_V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback-v7.js?v=452"></script>'
 _original_versioned_html = _main._versioned_html
+
+
+_WATCH_AUX_STREAM_RE = re.compile(
+    r"\n            if \(previewVideo && streamUrl\) \{.*?"
+    r"\n            \}\n          \}\n        \} else \{",
+    re.DOTALL,
+)
+
+
+def _remove_watch_aux_stream(body: str) -> str:
+    """Remove the historical second full-resolution timeline <video> path."""
+    if "const warmWatch = () =>" not in body:
+        return body
+    return _WATCH_AUX_STREAM_RE.sub("\n          }\n        } else {", body, count=1)
 
 
 def _v43_versioned_html(path):
     response = _original_versioned_html(path)
     try:
         body = response.body.decode("utf-8")
-        if _V43_TIMELINE_SCRIPT not in body and "</body>" in body:
-            body = body.replace("</body>", f"  {_V43_TIMELINE_SCRIPT}\n</body>", 1)
-            response.body = body.encode("utf-8")
-            response.headers["content-length"] = str(len(response.body))
+        if str(path).replace("\\", "/").endswith("/watch.html"):
+            body = _remove_watch_aux_stream(body)
+        scripts = []
+        if _V452_QOS_SCRIPT not in body:
+            scripts.append(_V452_QOS_SCRIPT)
+        if _V43_TIMELINE_SCRIPT not in body:
+            scripts.append(_V43_TIMELINE_SCRIPT)
+        if scripts and "</body>" in body:
+            body = body.replace("</body>", "  " + "\n  ".join(scripts) + "\n</body>", 1)
+        response.body = body.encode("utf-8")
+        response.headers["content-length"] = str(len(response.body))
     except Exception:
-        # HTML injection is a V4.3 enhancement; never make the app unbootable
-        # if a future response type does not expose a mutable byte body.
+        # Runtime HTML enhancements must never make the application unbootable.
         pass
     return response
 
@@ -72,8 +96,16 @@ def v43_runtime_marker():
         "parallel_quick_storyboard": bool(getattr(storyboard_service, "_v43_parallel_quick_installed", False)),
         "playback_safe_quick_storyboard": bool(getattr(storyboard_service, "_v43_playback_safe_quick_installed", False)),
         "quick_reservation_scheduler": bool(getattr(storyboard_service, "_v43_quick_reservation_installed", False)),
-        "timeline_coordinator_version": 7,
-        "quick_scheduler_revision": 8,
+        "timeline_coordinator_version": 452,
+        "timeline_mode": "local-first-player-qos-v452",
+        "timeline_scheduler": "single-idle-exact-v452",
+        "quick_scheduler_revision": 11,
+        "quick_durable_build": True,
+        "storyboard_priority_mode": "player-qos-arbiter-v452",
+        "player_qos_stabilization": True,
+        "storyboard_stream_owner_tagging": True,
+        "watch_aux_media_seek_removed": True,
+        **_player_qos.runtime_marker(),
         "quick_frame_count": int(_quick_storyboard.QUICK_FRAME_COUNT),
         "quick_parallelism": int(_quick_storyboard.QUICK_PARALLELISM),
         "quick_min_success": int(_quick_storyboard.QUICK_MIN_SUCCESS),
