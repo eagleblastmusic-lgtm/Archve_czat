@@ -13,6 +13,7 @@ client = (ROOT / "static" / "v452-player-qos.js").read_text(encoding="utf-8")
 timeline = (ROOT / "static" / "youtube-storyboard.js").read_text(encoding="utf-8")
 fallback = (ROOT / "static" / "v43-timeline-fallback-v7.js").read_text(encoding="utf-8")
 live = (ROOT / "static" / "v43-live-report.js").read_text(encoding="utf-8")
+launcher = (ROOT / "run.py").read_text(encoding="utf-8")
 
 # Backend arbitration and cancellation.
 assert 'FFMPEG_MAX_CONCURRENT = 2' in qos
@@ -37,6 +38,10 @@ assert '/api/runtime/v452/playback/status' in qos
 assert '/api/runtime/v452/storyboard/protect' in qos
 assert '/api/runtime/v452/storyboard/cancel' in qos
 assert '/api/runtime/v452/qos' in qos
+
+# The default end-user launcher must never bypass the release runtime wiring.
+assert 'uvicorn.run("runtime_app:app"' in launcher
+assert 'uvicorn.run("main:app"' not in launcher
 
 # /watch must not retain the second full-resolution preview media path at runtime.
 assert 'previewVideo.src = streamUrl' in watch
