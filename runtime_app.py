@@ -34,6 +34,7 @@ RUNTIME_ID = "v4.3-fast2"
 # It never seeks a second full-resolution browser <video>.
 _V452_QOS_SCRIPT = '<script src="/static/v452-player-qos.js?v=452"></script>'
 _V452_NEXT_PREFETCH_SCRIPT = '<script src="/static/v452-next-video-prefetch.js?v=452"></script>'
+_LAZY_THUMB_RESILIENCE_SCRIPT = '<script src="/static/lazy-thumbnail-resilience.js?v=1"></script>'
 _V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback-v7.js?v=452"></script>'
 _original_versioned_html = _main._versioned_html
 
@@ -63,6 +64,8 @@ def _v43_versioned_html(path):
             scripts.append(_V452_QOS_SCRIPT)
         if _V452_NEXT_PREFETCH_SCRIPT not in body:
             scripts.append(_V452_NEXT_PREFETCH_SCRIPT)
+        if _LAZY_THUMB_RESILIENCE_SCRIPT not in body:
+            scripts.append(_LAZY_THUMB_RESILIENCE_SCRIPT)
         if _V43_TIMELINE_SCRIPT not in body:
             scripts.append(_V43_TIMELINE_SCRIPT)
         if scripts and "</body>" in body:
@@ -82,7 +85,7 @@ _main._versioned_html = _v43_versioned_html
 # script, which made Chromium log an error even though performance.js later repairs
 # the stylesheet. Permit only that exact handler hash; arbitrary inline script
 # remains blocked.
-_FA_EVENT_HASH = "'sha256-MhtPZXr7+LpJUY5qtMutB+qWfQtMaPccfe7QXtCcEYc='"
+_FA_EVENT_HASH = "'sha256-MhtPZXr7+LpJUY5qtMutB+WfQtMaPccfe7QXtCcEYc='"
 
 
 @app.get("/api/runtime/v43")
@@ -109,6 +112,7 @@ def v43_runtime_marker():
         "storyboard_stream_owner_tagging": True,
         "watch_aux_media_seek_removed": True,
         "next_video_prefetch": True,
+        "lazy_thumbnail_scroll_resilience": True,
         **_player_qos.runtime_marker(),
         "quick_frame_count": int(_quick_storyboard.QUICK_FRAME_COUNT),
         "quick_parallelism": int(_quick_storyboard.QUICK_PARALLELISM),
