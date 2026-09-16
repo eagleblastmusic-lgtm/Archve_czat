@@ -67,6 +67,13 @@ assert 'prefetch.prefetchVideoDetails(candidateId)' in next_prefetch
 assert 'signal:' not in next_prefetch
 assert 'let activeWarm = null' in next_prefetch
 assert 'active_candidate_id' in next_prefetch
+# Real Chromium sessions may miss the document-level non-bubbling `playing`
+# capture path, so a tiny watchdog must deterministically observe actual playback.
+assert 'function maybeWarmFromPlayer' in next_prefetch
+assert "setInterval?.(() =>" in next_prefetch
+assert '}, 250);' in next_prefetch
+assert 'lastObservedPlayingId' in next_prefetch
+assert 'watchdog_active' in next_prefetch
 
 # Client player telemetry.
 assert 'droppedVideoFrames' in client
