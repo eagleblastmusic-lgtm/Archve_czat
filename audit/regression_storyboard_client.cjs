@@ -45,6 +45,8 @@ const vm = require('node:vm');
   const api = context.window.ArchivebateYouTubeStoryboard;
   assert.ok(api, 'ArchivebateYouTubeStoryboard should be exported');
   assert.ok(api.HOVER_INTENT_MS >= 100, 'hover intent gate should suppress fly-over segments');
+  assert.equal(api.EXACT_BUFFER_SECONDS, 3, 'V4.5.2 exact hover gate must stay at 3 seconds');
+  assert.equal(api.BACKGROUND_BUFFER_SECONDS, 8, 'V4.5.2 background exact prewarm gate must stay at 8 seconds');
 
   let segmentStarts = 0;
   let demandPosts = 0;
@@ -143,10 +145,9 @@ const vm = require('node:vm');
   assert.equal(segmentStarts, 1, 'attach pointer-enter must not start exact segment work');
   attachAbort.abort();
 
-  // The buffered-playing hook must resolve /watch/<id> from pathname. Without
-  // this contract the standalone watch page would never receive the safe
-  // post-buffer prewarm after removing attach's eager warm.
-  context.ArchivebatePerf = { getBufferedAhead: () => 3.5 };
+  // Standalone /watch exact prewarm is intentionally stricter in V4.5.2:
+  // background FFmpeg may start only after at least 8 seconds are buffered.
+  context.ArchivebatePerf = { getBufferedAhead: () => 9.5 };
   const playingHandler = documentEvents.get('playing');
   assert.equal(typeof playingHandler, 'function', 'global playing prewarm hook must be installed');
   const watchVideo = {
@@ -159,10 +160,10 @@ const vm = require('node:vm');
     readyState: 4,
   };
   playingHandler({ target: watchVideo });
-  for (let i = 0; i < 80 && segmentStarts < 2; i += 1) {
+  for (let i = 0; i < 120 && segmentStarts < 2; i += 1) {
     await new Promise(resolve => setTimeout(resolve, 10));
   }
-  assert.equal(segmentStarts, 2, 'buffered watch playback must prewarm exact segment using pathname video id');
+  assert.equal(segmentStarts, 2, 'well-buffered watch playback must prewarm exact segment using pathname video id');
   for (let i = 0; i < 20 && images.length < 2; i += 1) {
     await new Promise(resolve => setTimeout(resolve, 2));
   }
@@ -170,14 +171,14 @@ const vm = require('node:vm');
   images[1].onload();
   await new Promise(resolve => setTimeout(resolve, 5));
 
-  // If playback remains weak after all retry checks, V4.3 must give up instead
-  // of starting FFmpeg anyway. Accelerate only the 350/450 ms readiness timers;
-  // keep the 15 s warm cancellation timer real so a buggy warm would be visible.
+  // If playback remains weak after all retry checks, V4.5.2 must give up
+  // instead of starting FFmpeg anyway. Accelerate only the 400/650 ms readiness
+  // timers; keep the 15 s warm cancellation timer real so a buggy warm is visible.
   const realSetTimeout = context.setTimeout;
   const realClearTimeout = context.clearTimeout;
   const fastTimerTokens = new Set();
   context.setTimeout = (callback, delay, ...args) => {
-    if (delay === 350 || delay === 450) {
+    if (delay === 400 || delay === 650) {
       const token = {};
       fastTimerTokens.add(token);
       Promise.resolve().then(() => {
