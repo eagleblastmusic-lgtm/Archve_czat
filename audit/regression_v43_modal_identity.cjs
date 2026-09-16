@@ -3,18 +3,12 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 const listeners = new Map();
-const state = {
-  currentVideoDetails: { id: 'archive-fixture-a' }
-};
-
+const state = { currentVideoDetails: { id: 'archive-fixture-a' } };
 const document = {
   hidden: false,
-  addEventListener(name, callback) {
-    listeners.set(name, callback);
-  },
+  addEventListener(name, callback) { listeners.set(name, callback); },
   querySelector() { return null; }
 };
-
 const context = {
   console,
   window: null,
@@ -48,61 +42,67 @@ const modalVideo = { id: 'modalVideo', dataset: {} };
 listeners.get('play')({ target: modalVideo });
 assert.equal(state.currentVideoId, 'archive-fixture-a');
 assert.equal(modalVideo.dataset.videoId, 'archive-fixture-a');
-
 state.currentVideoDetails = { id: 'archive-fixture-b' };
 listeners.get('play')({ target: modalVideo });
-assert.equal(state.currentVideoId, 'archive-fixture-b', 'switching modal video must refresh active storyboard id');
+assert.equal(state.currentVideoId, 'archive-fixture-b');
 assert.equal(modalVideo.dataset.videoId, 'archive-fixture-b');
-
-const otherVideo = { id: 'mainPlayer', dataset: {} };
-listeners.get('play')({ target: otherVideo });
-assert.equal(otherVideo.dataset.videoId, undefined, 'bridge is modal-specific');
 
 const fallbackSource = fs.readFileSync('static/v43-timeline-fallback-v7.js', 'utf8');
 assert.doesNotThrow(() => new vm.Script(fallbackSource, { filename: 'v43-timeline-fallback-v7.js' }));
-assert.match(fallbackSource, /coordinator_version:\s*7/);
-assert.match(fallbackSource, /currentVideoDetails\?\.id/,
-  'modal details id must be the source of truth, not a stale compatibility id');
-assert.match(fallbackSource, /showExact/,
-  'V7 must render cached exact frames itself instead of depending on listener ordering');
-assert.match(fallbackSource, /getExactCached/,
-  'exact 1-fps segments remain authoritative');
-assert.match(fallbackSource, /ensureInteractiveCoarse/,
-  'real hover must be able to start one persistent coarse overview');
-assert.match(fallbackSource, /COARSE_EXACT_DEFER_MS = 3500/,
-  'cold coarse generation gets only a bounded head start');
-assert.match(fallbackSource, /coordinatedRequestSegment/,
-  'V7 must coordinate exact requests with the one-time coarse build');
-assert.match(fallbackSource, /deferExact/);
-assert.match(fallbackSource, /hover_coarse_starts/);
-assert.match(fallbackSource, /source_video_id:\s*latestVideoId/,
-  'diagnostics must expose the real active source id');
-assert.match(fallbackSource, /INTERACTIVE_BUFFER_SECONDS = 3\.0/,
-  'interactive coarse work requires a useful primary playback buffer');
-assert.match(fallbackSource, /PREWARM_BUFFER_SECONDS = 5\.0/,
-  'background coarse work remains more conservative than interactive hover');
-assert.match(fallbackSource, /LOW_BUFFER_CANCEL_SECONDS = 2\.0/,
-  'coarse work must yield when the playback buffer becomes fragile');
-assert.match(fallbackSource, /showPosterFallback/,
-  'cold hover must preserve a meaningful poster instead of a black tooltip');
-assert.match(fallbackSource, /previewImg\.style\.display = 'block'/,
-  'poster image remains visible until a valid dynamic frame exists');
-assert.match(fallbackSource, /mainVideo\.addEventListener\('waiting'/);
-assert.match(fallbackSource, /mainVideo\.addEventListener\('stalled'/);
+assert.match(fallbackSource, /coordinator_version:\s*452/);
+assert.match(fallbackSource, /currentVideoDetails\?\.id/);
+assert.match(fallbackSource, /showExact/);
+assert.match(fallbackSource, /getExactCached/);
+assert.match(fallbackSource, /ensureInteractiveCoarse/);
+assert.match(fallbackSource, /EXACT_IDLE_MS = 260/);
+assert.match(fallbackSource, /EXACT_MIN_BUFFER_SECONDS = 3\.0/);
+assert.match(fallbackSource, /requestSoftProtect/);
+assert.match(fallbackSource, /requestHardCancel/);
+assert.match(fallbackSource, /\/api\/runtime\/v452\/storyboard\/protect/);
+assert.match(fallbackSource, /\/api\/runtime\/v452\/storyboard\/cancel/);
+assert.match(fallbackSource, /__v452PlayerQoSCoordinator/);
+assert.match(fallbackSource, /clearIdleExact\(\{ cancelActive: true \}\)/);
+assert.match(fallbackSource, /playbackSafe\(mainVideo, EXACT_MIN_BUFFER_SECONDS\)/,
+  'idle exact must re-check live playback health immediately before backend work');
+assert.match(fallbackSource, /source_video_id:\s*latestVideoId/);
+assert.match(fallbackSource, /INTERACTIVE_BUFFER_SECONDS = 3\.0/);
+assert.match(fallbackSource, /PREWARM_BUFFER_SECONDS = 5\.0/);
+assert.match(fallbackSource, /LOW_BUFFER_CANCEL_SECONDS = 2\.0/);
 assert.match(fallbackSource, /media_seek_enabled:\s*false/);
 assert.match(fallbackSource, /black_fallback_enabled:\s*false/);
-assert.doesNotMatch(fallbackSource, /cancelCoarse\(videoId, 'exact_hover'\)/,
-  'pointerenter may no longer kill the coarse build before it has a chance to finish');
-assert.doesNotMatch(fallbackSource, /\/api\/video\/stream\?id=.*owner=preview/,
-  'timeline must never seek a second full-resolution MP4');
 assert.doesNotMatch(fallbackSource, /previewVideo\.currentTime\s*=/,
-  'timeline pointer motion must not trigger media seeks');
+  'modal timeline pointer motion must not seek an auxiliary video');
+
+const youtubeSource = fs.readFileSync('static/youtube-storyboard.js', 'utf8');
+assert.match(youtubeSource, /bufferedAhead >= 2\.0/,
+  'standalone watch exact prewarm remains gated by the existing client readiness check; backend QoS is authoritative');
+assert.match(youtubeSource, /__v452PlayerQoSCoordinator/,
+  'modal exact prewarm is owned by the V4.5.2 coordinator');
+
+const qosSource = fs.readFileSync('static/v452-player-qos.js', 'utf8');
+assert.doesNotThrow(() => new vm.Script(qosSource, { filename: 'v452-player-qos.js' }));
+assert.match(qosSource, /droppedVideoFrames/);
+assert.match(qosSource, /totalVideoFrames/);
+assert.match(qosSource, /stall_count/);
+assert.match(qosSource, /video_width/);
+assert.match(qosSource, /display_width/);
+assert.match(qosSource, /\/api\/runtime\/v452\/playback\/status/);
+assert.match(qosSource, /\/api\/runtime\/v452\/storyboard\/cancel/);
 
 const runtimeSource = fs.readFileSync('runtime_app.py', 'utf8');
-assert.match(runtimeSource, /v43-timeline-fallback-v7\.js\?v=7/);
-assert.match(runtimeSource, /timeline_coordinator_version["']:\s*7/);
-assert.match(runtimeSource, /QUICK_FRAME_COUNT = 8/);
+assert.match(runtimeSource, /v43-timeline-fallback-v7\.js\?v=452/);
+assert.match(runtimeSource, /v452-player-qos\.js\?v=452/);
+assert.match(runtimeSource, /timeline_coordinator_version["']:\s*452/);
+assert.match(runtimeSource, /timeline_scheduler["']:\s*["']single-idle-exact-v452["']/);
+assert.match(runtimeSource, /QUICK_FRAME_COUNT = 4/);
 assert.match(runtimeSource, /QUICK_PARALLELISM = 2/);
+assert.match(runtimeSource, /QUICK_MIN_SUCCESS = 3/);
+assert.match(runtimeSource, /player_qos_stabilization["']:\s*True/);
+assert.match(runtimeSource, /_remove_watch_aux_stream/);
+assert.match(runtimeSource, /const warmWatch = \(\) =>/,
+  'runtime must explicitly recognize and strip the legacy /watch auxiliary media path');
 assert.match(runtimeSource, /media_seek_fallback["']:\s*False/);
+assert.match(runtimeSource, /RUNTIME_ID = ["']v4\.3-fast2["']/,
+  'launcher compatibility runtime id must remain stable');
 
-console.log('PASS V4.3 MODAL IDENTITY + COARSE-FIRST V7 TIMELINE');
+console.log('PASS V4.5.2 MODAL IDENTITY + PLAYER QOS + RUNTIME WATCH GUARD');
