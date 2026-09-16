@@ -11,14 +11,16 @@ quick = (ROOT / "fast_storyboard_quick.py").read_text(encoding="utf-8")
 watch = (ROOT / "static" / "watch.html").read_text(encoding="utf-8")
 client = (ROOT / "static" / "v452-player-qos.js").read_text(encoding="utf-8")
 
-assert 'FFMPEG_MAX_CONCURRENT = 2' in story
-assert '_playback_ffmpeg_slot = threading.BoundedSemaphore(1)' in story
-assert 'configure_playback_qos' in story
-assert 'def protect_playback' in story
-assert 'def hard_cancel' in story
-assert '_qos_blocks_new_process' in story
-assert '_hard_cancel_requested(video_id)' in quick
-assert 'exact_preempts_quick": False' in quick
+assert 'FFMPEG_MAX_CONCURRENT = 2' in qos
+assert '_playback_ffmpeg_slot = threading.BoundedSemaphore(1)' in qos
+assert 'def configure_playback_qos' in qos
+assert 'def protect_playback' in qos
+assert 'def hard_cancel' in qos
+assert 'def _qos_blocks_new_process' in qos
+assert '_storyboard._run_cancellable_process = run_cancellable_process' in qos
+assert 'quick_module._cancel_requested = quick_cancel_requested' in qos
+assert 'quick_module._reserve_quick_slot = quick_reserve' in qos
+assert 'data["exact_preempts_quick"] = False' in qos
 
 assert 'owner=storyboard' in qos or 'params["owner"] = "storyboard"' in qos
 assert 'priority=low' in qos or 'params["priority"] = "low"' in qos
