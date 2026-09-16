@@ -14,6 +14,7 @@ player_core = (ROOT / "static" / "player-core.js").read_text(encoding="utf-8")
 timeline = (ROOT / "static" / "youtube-storyboard.js").read_text(encoding="utf-8")
 fallback = (ROOT / "static" / "v43-timeline-fallback-v7.js").read_text(encoding="utf-8")
 live = (ROOT / "static" / "v43-live-report.js").read_text(encoding="utf-8")
+next_prefetch = (ROOT / "static" / "v452-next-video-prefetch.js").read_text(encoding="utf-8")
 launcher = (ROOT / "run.py").read_text(encoding="utf-8")
 
 # Backend arbitration and cancellation.
@@ -55,6 +56,17 @@ assert '_remove_watch_aux_stream' in runtime
 assert 'const warmWatch = () =>' in runtime
 assert 'watch_aux_media_seek_removed' in runtime
 assert 'v452-player-qos.js?v=452' in runtime
+
+# Next-video startup warm-up must be injected by the release runtime. It resolves
+# exactly one likely candidate after playback starts and must not inherit the
+# current player generation AbortSignal, otherwise A -> B cancels B's warm-up.
+assert 'v452-next-video-prefetch.js?v=452' in runtime
+assert '"next_video_prefetch": True' in runtime
+assert "event?.target?.id !== 'modalVideo'" in next_prefetch
+assert 'prefetch.prefetchVideoDetails(candidateId)' in next_prefetch
+assert 'signal:' not in next_prefetch
+assert 'let activeWarm = null' in next_prefetch
+assert 'active_candidate_id' in next_prefetch
 
 # Client player telemetry.
 assert 'droppedVideoFrames' in client
