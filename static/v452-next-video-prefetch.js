@@ -11,6 +11,8 @@
     cacheReady: 0,
     failed: 0,
     skipped: 0,
+    watchdogTriggers: 0,
+    eventTriggers: 0,
     lastCurrentId: '',
     lastCandidateId: '',
     lastDurationMs: 0,
@@ -18,6 +20,7 @@
 
   let activeWarm = null;
   let rerunRequested = false;
+  let lastObservedPlayingId = '';
 
   function state() {
     return globalThis.ArchivebateAppContext?.state || globalThis.state || {};
@@ -113,21 +116,59 @@
     return holder.promise;
   }
 
-  // Capture phase runs before the modal's target-level `onplaying` callback.
-  // This lets our signal-independent singleflight become the canonical prefetch
-  // before the older generation-bound background prefetch can be scheduled.
+  function modalIsActive() {
+    return Boolean(globalThis.document?.getElementById?.('videoModal')?.classList?.contains?.('active'));
+  }
+
+  function maybeWarmFromPlayer(source = 'watchdog') {
+    const video = globalThis.document?.getElementById?.('modalVideo');
+    const currentId = currentVideoId();
+    if (!modalIsActive() || !video || !currentId || video.paused || video.ended || Number(video.readyState || 0) < 2) {
+      return false;
+    }
+
+    // If playlist/list state is still being populated, leave the ID unclaimed so
+    // the watchdog can retry on the next tick instead of permanently skipping it.
+    const candidate = resolveCandidate();
+    const candidateId = String(candidate?.id || '').trim();
+    if (!candidateId || candidateId === currentId) return false;
+
+    if (lastObservedPlayingId === currentId) return false;
+    lastObservedPlayingId = currentId;
+    if (source === 'event') stats.eventTriggers += 1;
+    else stats.watchdogTriggers += 1;
+    warmNextCandidate().catch(() => {});
+    return true;
+  }
+
+  // Keep the event path because it is the cheapest fast path when Chromium
+  // delivers the non-bubbling media event through capture as expected.
   globalThis.document?.addEventListener?.('playing', event => {
     if (event?.target?.id !== 'modalVideo') return;
-    warmNextCandidate().catch(() => {});
+    maybeWarmFromPlayer('event');
   }, true);
+
+  // Some real browser sessions did not deliver that document-level media event.
+  // A tiny state watchdog makes prefetch deterministic without touching player
+  // lifecycle code. It fires at most once per actually-playing current video ID.
+  const watchdog = globalThis.setInterval?.(() => {
+    maybeWarmFromPlayer('watchdog');
+  }, 250);
+
+  // Also cover the case where this runtime script is injected after playback has
+  // already begun (for example after a hard reload during an open modal).
+  globalThis.setTimeout?.(() => maybeWarmFromPlayer('watchdog'), 0);
 
   globalThis.ArchivebateNextVideoPrefetch = {
     warmNextCandidate,
+    maybeWarmFromPlayer,
     stats: () => ({
       ...stats,
       active_candidate_id: activeWarm?.id || '',
       active: Boolean(activeWarm),
       rerun_requested: rerunRequested,
+      last_observed_playing_id: lastObservedPlayingId,
+      watchdog_active: Boolean(watchdog),
     }),
   };
 })();
