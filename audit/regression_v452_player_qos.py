@@ -85,6 +85,15 @@ assert 'qos_prewarm_skips' in timeline
 assert 'player_qos_guard: true' in timeline
 assert 'BACKGROUND_BUFFER_SECONDS' in timeline
 
+# Hard lifecycle cancellation must release the session-level hover lease too.
+# Otherwise the backend keeps a live demand lease until its 45 s TTL even after
+# modal close/video switch, while all FFmpeg processes have already stopped.
+assert 'function releaseTargetLease(videoId' in timeline
+assert 'releaseTargetLease(videoId);' in timeline
+assert "holder.signal?.removeEventListener?.('abort', holder.release)" in timeline
+assert 'if (holder.url) releaseLease(holder.url);' in timeline
+assert 'if (targetLeases.get(videoId) === holder) targetLeases.delete(videoId);' in timeline
+
 # The legacy coarse coordinator may delegate to requestSegment; the final
 # storyboard client now owns the authoritative second QoS gate, so that delegate
 # cannot start uncached FFmpeg during critical playback.
