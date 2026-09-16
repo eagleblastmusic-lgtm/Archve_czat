@@ -31,6 +31,11 @@ assert 'quick_module._cancel_requested = quick_cancel_requested' in qos
 assert 'quick_module._reserve_quick_slot = quick_reserve' in qos
 assert 'data["exact_preempts_quick"] = False' in qos
 
+# Stale/startup QoS snapshots must remain JSON serializable. Returning inf here
+# makes FastAPI/Starlette fail the protect/status endpoint with HTTP 500.
+assert 'age = max(0.0, now - updated) if updated else 0.0' in qos
+assert 'float("inf")' not in qos
+
 # Storyboard traffic ownership and browser -> runtime QoS endpoints.
 assert 'owner=storyboard' in qos or 'params["owner"] = "storyboard"' in qos
 assert 'priority=low' in qos or 'params["priority"] = "low"' in qos
