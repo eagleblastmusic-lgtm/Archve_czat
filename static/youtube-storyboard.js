@@ -294,7 +294,17 @@
     }
   }
 
+  function releaseTargetLease(videoId, holder = targetLeases.get(videoId)) {
+    if (!holder || holder.released) return;
+    holder.released = true;
+    metrics.hoverSessionCancels += 1;
+    holder.signal?.removeEventListener?.('abort', holder.release);
+    if (holder.url) releaseLease(holder.url);
+    if (targetLeases.get(videoId) === holder) targetLeases.delete(videoId);
+  }
+
   function cancelVideoClientWork(videoId) {
+    releaseTargetLease(videoId);
     cancelActiveTarget(videoId);
     cancelWarmForVideo(videoId);
     abortSegmentEntriesForVideo(videoId);
@@ -314,12 +324,8 @@
     };
     const release = () => {
       if (holder.released) return;
-      holder.released = true;
-      metrics.hoverSessionCancels += 1;
-      signal.removeEventListener?.('abort', release);
+      releaseTargetLease(videoId, holder);
       cancelVideoClientWork(videoId);
-      if (holder.url) releaseLease(holder.url);
-      if (targetLeases.get(videoId) === holder) targetLeases.delete(videoId);
     };
     holder.release = release;
     targetLeases.set(videoId, holder);
