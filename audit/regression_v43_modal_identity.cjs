@@ -68,16 +68,23 @@ assert.match(fallbackSource, /source_video_id:\s*latestVideoId/);
 assert.match(fallbackSource, /INTERACTIVE_BUFFER_SECONDS = 3\.0/);
 assert.match(fallbackSource, /PREWARM_BUFFER_SECONDS = 5\.0/);
 assert.match(fallbackSource, /LOW_BUFFER_CANCEL_SECONDS = 2\.0/);
+assert.match(fallbackSource, /exact_idle_scheduled/);
+assert.match(fallbackSource, /player_qos_coordinator:\s*true/);
 assert.match(fallbackSource, /media_seek_enabled:\s*false/);
 assert.match(fallbackSource, /black_fallback_enabled:\s*false/);
 assert.doesNotMatch(fallbackSource, /previewVideo\.currentTime\s*=/,
   'modal timeline pointer motion must not seek an auxiliary video');
 
 const youtubeSource = fs.readFileSync('static/youtube-storyboard.js', 'utf8');
-assert.match(youtubeSource, /bufferedAhead >= 2\.0/,
-  'standalone watch exact prewarm remains gated by the existing client readiness check; backend QoS is authoritative');
-assert.match(youtubeSource, /__v452PlayerQoSCoordinator/,
-  'modal exact prewarm is owned by the V4.5.2 coordinator');
+assert.doesNotThrow(() => new vm.Script(youtubeSource, { filename: 'youtube-storyboard.js' }));
+assert.match(youtubeSource, /EXACT_BUFFER_SECONDS = 3\.0/);
+assert.match(youtubeSource, /BACKGROUND_BUFFER_SECONDS = 8\.0/);
+assert.match(youtubeSource, /QOS_RECHECK_MS = 180/);
+assert.match(youtubeSource, /playbackAllowsStoryboard/);
+assert.match(youtubeSource, /waitForPlaybackBudget/);
+assert.match(youtubeSource, /player_qos_guard:\s*true/);
+assert.match(youtubeSource, /currentVideoDetails\?\.id/,
+  'exact client must prefer the modal details identity over stale compatibility state');
 
 const qosSource = fs.readFileSync('static/v452-player-qos.js', 'utf8');
 assert.doesNotThrow(() => new vm.Script(qosSource, { filename: 'v452-player-qos.js' }));

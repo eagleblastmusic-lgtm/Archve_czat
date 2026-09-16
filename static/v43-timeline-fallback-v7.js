@@ -1,26 +1,18 @@
 (() => {
   'use strict';
 
-  // V4.3 timeline coordinator v7.
-  //
-  // The previous playback-safe patch could starve the cold preview completely:
-  // pointer movement was observed, but was forbidden from starting QUICK work,
-  // while background prewarm often never reached its 8 s buffer threshold.
-  // The visible result was a healthy poster that never changed.
-  //
-  // V7 fixes that starvation without bringing back full-resolution preview seeks:
-  // - the active modal video id is synchronized from currentVideoDetails,
-  // - cached exact 1-fps frames are rendered here deterministically,
-  // - the first real hover may start ONE persistent low-resolution QUICK build,
-  // - exact work is deferred only while that cold coarse build gets a short head start,
-  // - playback waiting/stalling/low-buffer still cancels speculative coarse work,
-  // - there is still no auxiliary <video> seek path.
+  // V4.5.2 modal timeline coordinator.
+  // Pointer motion renders only local cache/coarse/poster. One exact target is
+  // retained and may enter the exact client only after 260 ms of real pointer
+  // idle and a fresh playback-health check.
   const PREWARM_DELAY_MS = 1800;
   const PREWARM_BUFFER_SECONDS = 5.0;
   const INTERACTIVE_BUFFER_SECONDS = 3.0;
+  const EXACT_MIN_BUFFER_SECONDS = 3.0;
   const LOW_BUFFER_CANCEL_SECONDS = 2.0;
+  const EXACT_IDLE_MS = 260;
+  const EXACT_RECHECK_MS = 180;
   const RETRY_AFTER_HOVER_MS = 2200;
-  const COARSE_EXACT_DEFER_MS = 3500;
   const STATUS_WAIT_MS = 1200;
   const STATUS_TOTAL_TIMEOUT_MS = 16000;
   const QUICK_MEMORY_LIMIT = 24;
@@ -33,12 +25,13 @@
   let pointerRaf = 0;
   let pendingClientX = 0;
   let prewarmTimer = null;
+  let exactIdleTimer = null;
+  let idleExact = null;
   let lowBufferVideoId = '';
   let lastFrameIdentity = '';
   let renderLatestBoard = null;
   let originalRequestSegment = null;
-  let deferredExact = null;
-  let deferredExactTimer = null;
+  let modalObserver = null;
 
   const coarseBoards = new Map();
   const coarseBuilds = new Map();
@@ -64,10 +57,14 @@
     playbackProtectSkips: 0,
     lowBufferCancels: 0,
     buildErrors: 0,
-    exactDeferred: 0,
-    exactDeferredFlushes: 0,
-    exactDeferTimeouts: 0,
-    exactImmediateUnsafe: 0,
+    exactIdleScheduled: 0,
+    exactIdleResets: 0,
+    exactIdleStarts: 0,
+    exactIdleBlocked: 0,
+    exactIdleCancelled: 0,
+    softProtectRequests: 0,
+    hardCancelRequests: 0,
+    videoSwitchCancels: 0,
     identityRepairs: 0,
   };
 
@@ -92,13 +89,11 @@
   }
 
   function currentIdentity(mainVideo, state) {
-    // currentVideoDetails is the modal source of truth. currentVideoId is a
-    // compatibility field and may briefly contain the previous modal item.
     const detailsId = String(state?.currentVideoDetails?.id || '').trim();
     const compatibilityId = String(state?.currentVideoId || '').trim();
     const datasetId = String(mainVideo?.dataset?.videoId || '').trim();
     const videoId = detailsId || compatibilityId || datasetId;
-    const duration = Number.isFinite(Number(mainVideo?.duration)) && Number(mainVideo?.duration) > 0
+    const duration = Number.isFinite(Number(mainVideo?.duration)) && Number(mainVideo.duration) > 0
       ? Number(mainVideo.duration)
       : parseDuration(state?.currentVideoDetails?.duration);
     return { videoId, duration };
@@ -177,6 +172,24 @@
     const token = document.querySelector?.('meta[name="archivebate-mutation-token"]')?.content || '';
     if (token) headers['X-Archivebate-Mutation-Token'] = token;
     return fetch(url, { ...options, headers });
+  }
+
+  function postRuntime(url) {
+    return mutationRequest(url, { method: 'POST', keepalive: true }).catch(() => null);
+  }
+
+  function requestSoftProtect(reason = 'timeline') {
+    metrics.softProtectRequests += 1;
+    return postRuntime(`/api/runtime/v452/storyboard/protect?reason=${encodeURIComponent(reason)}`);
+  }
+
+  function requestHardCancel(videoId, reason = 'lifecycle') {
+    if (!videoId) return Promise.resolve(null);
+    metrics.hardCancelRequests += 1;
+    return postRuntime(
+      `/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}` +
+      `&reason=${encodeURIComponent(reason)}`,
+    );
   }
 
   function sleep(ms, signal) {
@@ -353,44 +366,54 @@
     return holder.promise;
   }
 
-  function clearDeferredExact() {
-    if (deferredExactTimer) clearTimeout(deferredExactTimer);
-    deferredExactTimer = null;
-    deferredExact = null;
+  function clearIdleExact({ cancelActive = false } = {}) {
+    if (exactIdleTimer) clearTimeout(exactIdleTimer);
+    exactIdleTimer = null;
+    const entry = idleExact;
+    idleExact = null;
+    if (entry) metrics.exactIdleCancelled += 1;
+    if (cancelActive && entry?.videoId) {
+      globalThis.ArchivebateYouTubeStoryboard?.cancelActiveTarget?.(entry.videoId);
+    }
   }
 
-  function flushDeferredExact(reason = 'coarse_ready') {
-    if (deferredExactTimer) clearTimeout(deferredExactTimer);
-    deferredExactTimer = null;
-    const entry = deferredExact;
-    deferredExact = null;
-    if (!entry || !originalRequestSegment) return null;
-    if (entry.args?.signal?.aborted) return null;
-    metrics.exactDeferredFlushes += 1;
-    return originalRequestSegment(entry.args);
-  }
+  function scheduleIdleExact(args, mainVideo) {
+    const videoId = String(args?.videoId || '').trim();
+    if (!videoId || !originalRequestSegment) return null;
+    if (exactIdleTimer) {
+      clearTimeout(exactIdleTimer);
+      metrics.exactIdleResets += 1;
+    }
+    const previous = idleExact;
+    if (previous?.videoId && previous.videoId !== videoId) {
+      globalThis.ArchivebateYouTubeStoryboard?.cancelVideoClientWork?.(previous.videoId);
+    }
+    idleExact = { ...args, videoId, scheduledAt: now() };
+    metrics.exactIdleScheduled += 1;
 
-  function deferExact(args, buildPromise) {
-    deferredExact = { args, at: now() };
-    metrics.exactDeferred += 1;
-    if (deferredExactTimer) clearTimeout(deferredExactTimer);
-    deferredExactTimer = setTimeout(() => {
-      metrics.exactDeferTimeouts += 1;
-      flushDeferredExact('timeout');
-    }, COARSE_EXACT_DEFER_MS);
-
-    Promise.resolve(buildPromise).then(() => {
-      if (!hoverActive || !deferredExact) return;
-      if (deferredExact.args?.signal?.aborted) {
-        clearDeferredExact();
+    const attempt = () => {
+      exactIdleTimer = null;
+      const entry = idleExact;
+      if (!entry || !hoverActive || entry.signal?.aborted) {
+        clearIdleExact();
         return;
       }
-      flushDeferredExact('coarse_ready');
-    }).catch(() => {
-      if (hoverActive && deferredExact && !deferredExact.args?.signal?.aborted) {
-        flushDeferredExact('coarse_failed');
+      const current = synchronizeIdentity(mainVideo, appState());
+      if (!current.videoId || current.videoId !== entry.videoId) {
+        clearIdleExact({ cancelActive: true });
+        return;
       }
-    });
+      if (!playbackSafe(mainVideo, EXACT_MIN_BUFFER_SECONDS)) {
+        metrics.exactIdleBlocked += 1;
+        exactIdleTimer = setTimeout(attempt, EXACT_RECHECK_MS);
+        return;
+      }
+      idleExact = null;
+      metrics.exactIdleStarts += 1;
+      originalRequestSegment(entry);
+    };
+
+    exactIdleTimer = setTimeout(attempt, EXACT_IDLE_MS);
     return null;
   }
 
@@ -442,12 +465,7 @@
 
     function applyBoard(board, targetTime, duration, kind) {
       if (!board || !hoverActive) return false;
-      const result = storyboard.applyFrame(
-        sprite,
-        board,
-        targetTime,
-        { targetTime, duration },
-      );
+      const result = storyboard.applyFrame(sprite, board, targetTime, { targetTime, duration });
       if (!result?.ok) return false;
       if (previewVideo) previewVideo.style.display = 'none';
       if (previewImg) previewImg.style.display = 'none';
@@ -488,7 +506,7 @@
       return prewarmCoarse(videoId, duration, { reason: 'interactive_hover' });
     }
 
-    if (typeof storyboard.requestSegment === 'function' && !storyboard.__v43CoarseFirstCoordinator) {
+    if (typeof storyboard.requestSegment === 'function' && !storyboard.__v452PlayerQoSCoordinator) {
       originalRequestSegment = storyboard.requestSegment.bind(storyboard);
       storyboard.requestSegment = function coordinatedRequestSegment(args = {}) {
         const state = appState();
@@ -500,23 +518,32 @@
           return originalRequestSegment(args);
         }
 
-        // Cached exact data is always authoritative and zero-cost.
-        if (getExactCached(videoId, duration, targetTime)) {
-          return originalRequestSegment({ ...args, videoId, duration, targetTime });
+        const normalized = { ...args, videoId, duration, targetTime };
+        const exact = getExactCached(videoId, duration, targetTime);
+        if (exact) {
+          metrics.exactCacheHits += 1;
+          return originalRequestSegment(normalized);
         }
 
-        const build = ensureInteractiveCoarse(videoId, duration);
-        if (build) {
-          // Give the one-time coarse overview a bounded head start. Continuous
-          // pointer movement updates only this latest deferred exact request;
-          // it no longer cancels the coarse build every 140 ms.
-          return deferExact({ ...args, videoId, duration, targetTime }, build);
-        }
-
-        metrics.exactImmediateUnsafe += 1;
-        return originalRequestSegment({ ...args, videoId, duration, targetTime });
+        // Cached/local presentation stays immediate. Uncached EXACT is only the
+        // latest idle target; pointer churn never directly starts backend work.
+        ensureInteractiveCoarse(videoId, duration);
+        return scheduleIdleExact(normalized, mainVideo);
       };
-      storyboard.__v43CoarseFirstCoordinator = true;
+      storyboard.__v452PlayerQoSCoordinator = true;
+    }
+
+    function handleVideoSwitch(nextVideoId) {
+      const next = String(nextVideoId || '').trim();
+      if (latestVideoId && next && latestVideoId !== next) {
+        const previous = latestVideoId;
+        metrics.videoSwitchCancels += 1;
+        clearIdleExact({ cancelActive: true });
+        cancelCoarse(previous, 'video_switched');
+        storyboard.cancelVideoClientWork?.(previous);
+        requestHardCancel(previous, 'video_switched');
+      }
+      if (next) latestVideoId = next;
     }
 
     function requestFromClientX(clientX) {
@@ -525,18 +552,17 @@
       if (!state || state.currentTimelinePrefix) return;
       const { videoId, duration } = synchronizeIdentity(mainVideo, state);
       if (!videoId || !Number.isFinite(duration) || duration <= 0) return;
+      handleVideoSwitch(videoId);
 
       const rect = timeline.getBoundingClientRect?.();
       if (!rect?.width) return;
       const pos = Math.max(0, Math.min(1, (Number(clientX) - rect.left) / rect.width));
       const targetTime = pos * duration;
-      latestVideoId = videoId;
       latestDuration = duration;
       latestTargetTime = targetTime;
       hoverActive = true;
       metrics.pointerUpdates += 1;
 
-      // Render exact cache ourselves instead of assuming listener ordering.
       const exact = getExactCached(videoId, duration, targetTime);
       if (exact) {
         metrics.exactCacheHits += 1;
@@ -556,9 +582,6 @@
         if (showCoarse(board, targetTime, duration)) return;
       }
 
-      // If modal-player-controls has not yet called requestSegment (for example
-      // during the very first pointerenter frame), still let real hover intent
-      // start the single persistent coarse build when playback is safe.
       ensureInteractiveCoarse(videoId, duration);
       showPosterFallback(state);
     }
@@ -580,6 +603,7 @@
         if (!modal?.classList?.contains?.('active') || hoverActive) return;
         const state = appState();
         const { videoId, duration } = synchronizeIdentity(mainVideo, state);
+        handleVideoSwitch(videoId);
         if (!videoId || !duration) return;
         if (!playbackSafe(mainVideo, PREWARM_BUFFER_SECONDS)) {
           metrics.playbackProtectSkips += 1;
@@ -593,41 +617,52 @@
     function protectPlayback(reason) {
       const state = appState();
       const { videoId } = synchronizeIdentity(mainVideo, state);
+      clearIdleExact({ cancelActive: true });
       if (videoId && cancelCoarse(videoId, reason)) metrics.playbackProtectSkips += 1;
+      requestSoftProtect(reason);
     }
 
     timeline.addEventListener('pointerenter', event => {
       hoverActive = true;
       const state = appState();
-      synchronizeIdentity(mainVideo, state);
+      const { videoId } = synchronizeIdentity(mainVideo, state);
+      handleVideoSwitch(videoId);
       schedulePointer(event);
     }, { passive: true });
 
-    timeline.addEventListener('pointermove', schedulePointer, { passive: true });
+    timeline.addEventListener('pointermove', event => {
+      // Any real movement resets the single EXACT idle timer and cancels an
+      // already-running target-specific exact client request.
+      clearIdleExact({ cancelActive: true });
+      schedulePointer(event);
+    }, { passive: true });
 
     timeline.addEventListener('pointerleave', () => {
       hoverActive = false;
       lastFrameIdentity = '';
       if (pointerRaf) cancelAnimationFrame(pointerRaf);
       pointerRaf = 0;
-      if (deferredExact?.args?.signal?.aborted) clearDeferredExact();
+      clearIdleExact({ cancelActive: true });
       schedulePrewarm(RETRY_AFTER_HOVER_MS);
     }, { passive: true });
 
     mainVideo.addEventListener('loadedmetadata', () => {
-      synchronizeIdentity(mainVideo, appState());
+      const { videoId } = synchronizeIdentity(mainVideo, appState());
+      handleVideoSwitch(videoId);
     });
     mainVideo.addEventListener('playing', () => {
-      synchronizeIdentity(mainVideo, appState());
+      const { videoId } = synchronizeIdentity(mainVideo, appState());
+      handleVideoSwitch(videoId);
       schedulePrewarm(PREWARM_DELAY_MS);
     });
     mainVideo.addEventListener('pause', () => {
-      synchronizeIdentity(mainVideo, appState());
+      const { videoId } = synchronizeIdentity(mainVideo, appState());
+      handleVideoSwitch(videoId);
       if (Number(mainVideo.currentTime || 0) > 0.25) schedulePrewarm(350);
     });
     mainVideo.addEventListener('waiting', () => protectPlayback('waiting'));
     mainVideo.addEventListener('stalled', () => protectPlayback('stalled'));
-    mainVideo.addEventListener('seeking', () => protectPlayback('player_seek'));
+    mainVideo.addEventListener('seeking', () => protectPlayback('seeking'));
     mainVideo.addEventListener('seeked', () => {
       if (!hoverActive) schedulePrewarm(PREWARM_DELAY_MS);
     });
@@ -635,31 +670,57 @@
       if (mainVideo.paused) return;
       const state = appState();
       const { videoId } = synchronizeIdentity(mainVideo, state);
+      handleVideoSwitch(videoId);
       if (!videoId) return;
       const ahead = bufferedAhead(mainVideo);
-      if (coarseBuilds.size && ahead < LOW_BUFFER_CANCEL_SECONDS) {
-        if (lowBufferVideoId !== videoId && cancelCoarse(videoId, 'low_buffer')) {
-          metrics.lowBufferCancels += 1;
+      if (ahead < LOW_BUFFER_CANCEL_SECONDS) {
+        if (lowBufferVideoId !== videoId) {
+          clearIdleExact({ cancelActive: true });
+          if (cancelCoarse(videoId, 'low_buffer')) metrics.lowBufferCancels += 1;
+          requestSoftProtect('low_buffer');
           lowBufferVideoId = videoId;
         }
-      } else if (ahead >= LOW_BUFFER_CANCEL_SECONDS) {
+      } else {
         lowBufferVideoId = '';
       }
     });
 
     mainVideo.addEventListener('emptied', () => {
-      const previous = latestVideoId;
-      if (previous) cancelCoarse(previous, 'video_emptied');
+      const previous = latestVideoId || String(mainVideo.dataset?.videoId || '').trim();
+      clearIdleExact({ cancelActive: true });
+      if (previous) {
+        cancelCoarse(previous, 'video_emptied');
+        storyboard.cancelVideoClientWork?.(previous);
+        requestHardCancel(previous, 'video_emptied');
+      }
       hoverActive = false;
       latestVideoId = '';
       latestDuration = 0;
       latestTargetTime = 0;
       lowBufferVideoId = '';
       lastFrameIdentity = '';
-      clearDeferredExact();
       if (prewarmTimer) clearTimeout(prewarmTimer);
       prewarmTimer = null;
     });
+
+    if (modal && globalThis.MutationObserver) {
+      let wasActive = !!modal.classList?.contains?.('active');
+      modalObserver = new MutationObserver(() => {
+        const active = !!modal.classList?.contains?.('active');
+        if (wasActive && !active) {
+          const previous = latestVideoId || currentIdentity(mainVideo, appState()).videoId;
+          clearIdleExact({ cancelActive: true });
+          if (previous) {
+            cancelCoarse(previous, 'modal_closed');
+            storyboard.cancelVideoClientWork?.(previous);
+            requestHardCancel(previous, 'modal_closed');
+          }
+          hoverActive = false;
+        }
+        wasActive = active;
+      });
+      modalObserver.observe(modal, { attributes: true, attributeFilter: ['class'] });
+    }
   }
 
   function scheduleInstall() {
@@ -676,7 +737,7 @@
     stats() {
       return {
         installed,
-        coordinator_version: 7,
+        coordinator_version: 452,
         hover_active: hoverActive,
         source_video_id: latestVideoId,
         source_duration_s: Number(latestDuration.toFixed?.(3) ?? latestDuration),
@@ -701,20 +762,26 @@
         playback_protect_skips: metrics.playbackProtectSkips,
         low_buffer_cancels: metrics.lowBufferCancels,
         build_errors: metrics.buildErrors,
-        exact_deferred: metrics.exactDeferred,
-        exact_deferred_flushes: metrics.exactDeferredFlushes,
-        exact_defer_timeouts: metrics.exactDeferTimeouts,
-        exact_immediate_unsafe: metrics.exactImmediateUnsafe,
+        exact_idle_scheduled: metrics.exactIdleScheduled,
+        exact_idle_resets: metrics.exactIdleResets,
+        exact_idle_starts: metrics.exactIdleStarts,
+        exact_idle_blocked: metrics.exactIdleBlocked,
+        exact_idle_cancelled: metrics.exactIdleCancelled,
+        soft_protect_requests: metrics.softProtectRequests,
+        hard_cancel_requests: metrics.hardCancelRequests,
+        video_switch_cancels: metrics.videoSwitchCancels,
         identity_repairs: metrics.identityRepairs,
-        deferred_exact_active: !!deferredExact,
+        exact_idle_active: !!idleExact,
         coarse_cache_entries: coarseBoards.size,
         coarse_inflight: coarseBuilds.size,
         last_target_time: Number(latestTargetTime.toFixed?.(3) ?? latestTargetTime),
+        exact_idle_ms: EXACT_IDLE_MS,
+        exact_min_buffer_seconds: EXACT_MIN_BUFFER_SECONDS,
         prewarm_delay_ms: PREWARM_DELAY_MS,
         prewarm_buffer_seconds: PREWARM_BUFFER_SECONDS,
         interactive_buffer_seconds: INTERACTIVE_BUFFER_SECONDS,
-        exact_defer_ms: COARSE_EXACT_DEFER_MS,
         status_wait_ms: STATUS_WAIT_MS,
+        player_qos_coordinator: true,
         media_seek_enabled: false,
         black_fallback_enabled: false,
       };
@@ -727,12 +794,14 @@
       prewarmTimer = null;
       if (pointerRaf) cancelAnimationFrame(pointerRaf);
       pointerRaf = 0;
+      clearIdleExact({ cancelActive: true });
       hoverActive = false;
       latestVideoId = '';
       latestDuration = 0;
       latestTargetTime = 0;
       lastFrameIdentity = '';
-      clearDeferredExact();
+      modalObserver?.disconnect?.();
+      modalObserver = null;
     },
   };
 })();
