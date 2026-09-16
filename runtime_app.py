@@ -33,6 +33,7 @@ RUNTIME_ID = "v4.3-fast2"
 # persistent coarse sprite gets a bounded head start before exact 1-fps work.
 # It never seeks a second full-resolution browser <video>.
 _V452_QOS_SCRIPT = '<script src="/static/v452-player-qos.js?v=452"></script>'
+_V452_NEXT_PREFETCH_SCRIPT = '<script src="/static/v452-next-video-prefetch.js?v=452"></script>'
 _V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback-v7.js?v=452"></script>'
 _original_versioned_html = _main._versioned_html
 
@@ -60,6 +61,8 @@ def _v43_versioned_html(path):
         scripts = []
         if _V452_QOS_SCRIPT not in body:
             scripts.append(_V452_QOS_SCRIPT)
+        if _V452_NEXT_PREFETCH_SCRIPT not in body:
+            scripts.append(_V452_NEXT_PREFETCH_SCRIPT)
         if _V43_TIMELINE_SCRIPT not in body:
             scripts.append(_V43_TIMELINE_SCRIPT)
         if scripts and "</body>" in body:
@@ -105,6 +108,7 @@ def v43_runtime_marker():
         "player_qos_stabilization": True,
         "storyboard_stream_owner_tagging": True,
         "watch_aux_media_seek_removed": True,
+        "next_video_prefetch": True,
         **_player_qos.runtime_marker(),
         "quick_frame_count": int(_quick_storyboard.QUICK_FRAME_COUNT),
         "quick_parallelism": int(_quick_storyboard.QUICK_PARALLELISM),
