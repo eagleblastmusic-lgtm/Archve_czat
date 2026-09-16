@@ -41,10 +41,16 @@ with patch.object(requests.Session,'request',side_effect=AssertionError('Externa
         def selective(ffmpeg,url,target,path,timeout):
             if path.name in ('frame_000.jpg','frame_003.jpg'):return False
             return extract(ffmpeg,url,target,path,timeout)
-        with patch.object(story,'_extract_one',side_effect=selective):
-            manifest=story._build_variant('fixture',10,str(video),'quick')
-        assert manifest['selected_indices'][0]!=0 and manifest['selected_indices'][3]!=3
-        for i,chosen in enumerate(manifest['selected_indices']):assert manifest['times'][i]==manifest['requested_times'][chosen]
+        story.demand('fixture','integration-direct-build',active=True)
+        try:
+            with patch.object(story,'_extract_one',side_effect=selective):
+                manifest=story._build_variant('fixture',10,str(video),'quick')
+        finally:
+            story.demand('fixture','integration-direct-build',active=False)
+        assert manifest['frame_count']==8 and len(manifest['times'])==8
+        requested=[min(max(0.05,10*((i+0.5)/8)),max(0.05,10-0.12)) for i in range(8)]
+        assert manifest['times'][0]!=round(requested[0],3) and manifest['times'][3]!=round(requested[3],3)
+        assert len(set(manifest['times']))<8
         assert story.get_status('fixture',10)['status']=='ready'
     calls=[]
     def build(ident,duration,url,quality):

@@ -176,11 +176,12 @@ assert.ok(p95 <= 50, `p95 wynosi ${p95}ms, co przekracza próg 50ms`);
     onReady: (seg) => { segmentReadyReceived = seg; }
   });
 
-  // Oczekiwanie na pobranie i znormalizowanie obrazu
-  await new Promise(r => setTimeout(r, 20));
-  assert.ok(segmentReadyReceived, 'onReady powinno zostać wywołane po załadowaniu segmentu');
+  // V4.3 intentionally waits for hover intent before cold FFmpeg work. The
+  // contract is still that a settled hover receives the exact segment.
+  await new Promise(r => setTimeout(r, Storyboard.HOVER_INTENT_MS + 80));
+  assert.ok(segmentReadyReceived, 'onReady powinno zostać wywołane po ustabilizowaniu hover intent i załadowaniu segmentu');
   assert.equal(segmentReadyReceived.segment_index, 1);
-  console.log('PASS 5: Zimny segment pobiera manifest i obraz, a następnie wywołuje onReady');
+  console.log('PASS 5: Zimny segment po intent gate pobiera manifest i obraz, a następnie wywołuje onReady');
 
   // Po pobraniu segment jest natychmiast ciepły w pamięci (warm)
   const warmCheck = Storyboard.getSegmentFromCache('test_vid', 120, 42.0);
@@ -205,7 +206,7 @@ assert.ok(p95 <= 50, `p95 wynosi ${p95}ms, co przekracza próg 50ms`);
     onReady: () => { cancelledSegmentLoaded = true; }
   });
   cancelAc.abort();
-  await new Promise(r => setTimeout(r, 20));
+  await new Promise(r => setTimeout(r, Storyboard.HOVER_INTENT_MS + 20));
   assert.equal(cancelledSegmentLoaded, false, 'Przerwane zapytanie nie powinno wywołać onReady');
   console.log('PASS 8: Anulowanie zapytania przy zmianie filmu zapobiega niepotrzebnym aktualizacjom UI');
 

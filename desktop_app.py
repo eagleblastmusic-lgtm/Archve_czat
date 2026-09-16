@@ -26,7 +26,7 @@ def ensure_port_available(host="127.0.0.1", port=8000):
 
 
 def start_server():
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False, log_level="warning")
+    uvicorn.run("runtime_app:app", host="127.0.0.1", port=8000, reload=False, log_level="warning")
 
 
 def wait_for_server(url="http://127.0.0.1:8000", timeout=10):

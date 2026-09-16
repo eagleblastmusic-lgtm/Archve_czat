@@ -59,6 +59,116 @@
   function setPlaybackBusy(value) { playbackBusy=!!value; drain(); }
   globalThis.document?.addEventListener('visibilitychange',drain);
 
+  // Browser mode: Font Awesome is declared as media="print" and was supposed
+  // to switch to screen via an inline onload handler. V4.2 CSP blocks inline
+  // handlers, so a normal browser can leave every FA icon blank. Repair the
+  // media value from this allowed self-hosted script. If the CDN/webfont still
+  // cannot load, use a small local glyph fallback rather than empty controls.
+  const LOCAL_ICON_GLYPHS = {
+    'fa-house': '⌂', 'fa-heart': '♥', 'fa-clock-rotate-left': '↶', 'fa-user-group': '●●',
+    'fa-circle-user': '●', 'fa-location-dot': '●', 'fa-magnifying-glass': '⌕', 'fa-xmark': '×',
+    'fa-rotate-right': '↻', 'fa-rotate-left': '↺', 'fa-rotate': '↻', 'fa-arrows-rotate': '↻',
+    'fa-tags': '#', 'fa-tag': '#', 'fa-user-tag': '#', 'fa-user-shield': '◆', 'fa-trash': '×',
+    'fa-file-export': '⇥', 'fa-file-import': '⇤', 'fa-stethoscope': '+', 'fa-film': '▣',
+    'fa-database': '▤', 'fa-users': '●●', 'fa-layer-group': '≡', 'fa-bookmark': '◆',
+    'fa-ban': '⊘', 'fa-bolt': '⚡', 'fa-stop': '■', 'fa-chevron-left': '‹', 'fa-chevron-right': '›',
+    'fa-chevron-down': '⌄', 'fa-chevron-up': '⌃', 'fa-angles-right': '»', 'fa-angles-down': '⌄',
+    'fa-arrow-left': '←', 'fa-play': '▶', 'fa-pause': 'Ⅱ', 'fa-backward-step': '◀', 'fa-forward-step': '▶',
+    'fa-user-minus': '−', 'fa-user-plus': '+', 'fa-volume-high': '◖', 'fa-volume-xmark': '×',
+    'fa-clone': '▣', 'fa-expand': '⛶', 'fa-compress': '⊡', 'fa-video': '▶', 'fa-download': '↓',
+    'fa-arrow-up-right-from-square': '↗', 'fa-arrow-right': '→', 'fa-lock': '■', 'fa-eye': '◉',
+    'fa-calendar-days': '□', 'fa-star': '★', 'fa-tv': '▣', 'fa-folder': '▰', 'fa-folder-open': '▱',
+    'fa-boxes-stacked': '▦', 'fa-circle-exclamation': '!', 'fa-triangle-exclamation': '!',
+    'fa-check': '✓', 'fa-plus': '+', 'fa-minus': '−', 'fa-spinner': '↻'
+  };
+
+  function activateLocalIconFallback() {
+    const doc = globalThis.document;
+    const root = doc?.documentElement;
+    if (!doc || !root || root.classList?.contains?.('archivebate-local-icons')) return;
+    const style = doc.createElement?.('style');
+    if (!style) return;
+    style.id = 'archivebate-local-icon-style';
+    const rules = [
+      "html.archivebate-local-icons i.fa-solid::before,html.archivebate-local-icons i.fa-regular::before{font-family:'Segoe UI Symbol','Arial Unicode MS',sans-serif!important;font-style:normal!important;font-weight:700!important;display:inline-block!important;min-width:1em;text-align:center;line-height:1;content:'•'!important}",
+      "html.archivebate-local-icons i.fa-spin{animation:archivebateLocalIconSpin 1s linear infinite}",
+      '@keyframes archivebateLocalIconSpin{to{transform:rotate(360deg)}}'
+    ];
+    for (const [name, glyph] of Object.entries(LOCAL_ICON_GLYPHS)) {
+      const safe = String(glyph).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+      rules.push(`html.archivebate-local-icons i.${name}::before{content:'${safe}'!important}`);
+    }
+    style.textContent = rules.join('');
+    doc.head?.appendChild?.(style);
+    root.classList?.add?.('archivebate-local-icons');
+  }
+
+  async function fontAwesomeUsable() {
+    const doc = globalThis.document;
+    if (!doc?.body || typeof globalThis.getComputedStyle !== 'function') return false;
+    const probe = doc.createElement?.('i');
+    if (!probe) return false;
+    probe.className = 'fa-solid fa-house';
+    probe.style.cssText = 'position:absolute;left:-10000px;top:-10000px;visibility:hidden';
+    doc.body.appendChild?.(probe);
+    try {
+      const pseudo = globalThis.getComputedStyle(probe, '::before');
+      const content = String(pseudo?.content || '');
+      const family = String(pseudo?.fontFamily || '');
+      if (!content || content === 'none' || content === 'normal' || content === '""' || !/Font Awesome/i.test(family)) return false;
+      if (!doc.fonts?.load) return true;
+      const loaded = await Promise.race([
+        doc.fonts.load('900 16px "Font Awesome 6 Free"', '\uf015'),
+        new Promise(resolve => setTimeout(() => resolve([]), 500))
+      ]);
+      return Boolean(loaded?.length);
+    } catch (_) {
+      return false;
+    } finally {
+      probe.remove?.();
+    }
+  }
+
+  function repairBrowserIcons() {
+    const doc = globalThis.document;
+    if (!doc?.querySelectorAll) return;
+    const link = Array.from(doc.querySelectorAll('link[rel="stylesheet"]'))
+      .find(node => String(node.href || '').includes('font-awesome'));
+    if (link && String(link.media || '').toLowerCase() === 'print') link.media = 'all';
+    const check = () => setTimeout(async () => {
+      if (!(await fontAwesomeUsable())) activateLocalIconFallback();
+    }, 900);
+    if (doc.readyState === 'loading') doc.addEventListener?.('DOMContentLoaded', check, { once: true });
+    else check();
+  }
+  repairBrowserIcons();
+
+  // V4.3 compatibility bridge: the modal keeps the active item in
+  // currentVideoDetails, while storyboard prewarm/hover historically reads
+  // currentVideoId. Home/feed/grid behavior remains unchanged.
+  function bridgeModalVideoIdentity(video) {
+    if (!video || video.id !== 'modalVideo') return '';
+    const appState = globalThis.ArchivebateAppContext?.state || null;
+    const legacyState = globalThis.state || null;
+    const videoId = String(
+      appState?.currentVideoDetails?.id ||
+      appState?.currentVideoId ||
+      legacyState?.currentVideoDetails?.id ||
+      legacyState?.currentVideoId ||
+      video.dataset?.videoId ||
+      ''
+    ).trim();
+    if (!videoId) return '';
+    if (appState) appState.currentVideoId = videoId;
+    if (legacyState && legacyState !== appState) legacyState.currentVideoId = videoId;
+    if (video.dataset) video.dataset.videoId = videoId;
+    return videoId;
+  }
+
+  globalThis.document?.addEventListener?.('play', event => {
+    bridgeModalVideoIdentity(event?.target);
+  }, true);
+
   async function prefetchUrls(urls, {concurrency=4,signal}={}) {
     const queue=[...new Set((urls||[]).filter(Boolean))];
     let cursor=0;
@@ -270,6 +380,7 @@
     updatePlaybackBuffer,
     calculatePercentiles,
     sessionHistory,
+    bridgeModalVideoIdentity,
     getActiveSession: () => activeSession
   };
 })();

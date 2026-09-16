@@ -64,7 +64,7 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp_dir:
         assert rejected == [], "Partial frame left by FFmpeg rc!=0 must be rejected"
         print("PASS 1B: Partial/non-zero FFmpeg output is rejected")
 
-    # 3. Budowa segmentu i weryfikacja manifestu. V4.2 generuje tylko dla aktywnego konsumenta.
+    # 3. Budowa segmentu i weryfikacja manifestu. V4.2+ generuje tylko dla aktywnego konsumenta.
     with patch.object(story, "STORYBOARD_CACHE_DIR", root):
         story.demand("vid_pkg_d", "pkg-d", active=True)
         try:
@@ -102,7 +102,7 @@ with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp_dir:
 
     # 5. Sprawdzenie priorytetyzacji i usuwania zapotrzebowania (demand lease)
     segment_calls = []
-    def fake_build_seg(video_id, duration, seg_idx, url):
+    def fake_build_seg(video_id, duration, seg_idx, url, priority=0):
         segment_calls.append((video_id, seg_idx))
         return {"segment_index": seg_idx}
 

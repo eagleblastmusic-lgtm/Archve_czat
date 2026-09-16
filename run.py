@@ -27,7 +27,7 @@ def open_browser():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("   ARCHIVEBATE VIDEO BROWSER (GUI)")
+    print("   ARCHIVEBATE VIDEO BROWSER (V4.5.2 RUNTIME)")
     print("   Logowanie: konfiguracja z .env.local / zmiennych środowiskowych")
     print("=" * 60)
     try:
@@ -36,4 +36,8 @@ if __name__ == "__main__":
         print(f"[START] {exc}")
         raise SystemExit(2)
     threading.Thread(target=open_browser, daemon=True).start()
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False, log_level="info")
+    # The default launcher must use runtime_app so V4.3 fast paths and V4.5.2
+    # player/storyboard QoS wiring are always active. Launching main:app here
+    # silently bypassed the release runtime and made real-world behavior differ
+    # from CI/live-gate assumptions.
+    uvicorn.run("runtime_app:app", host="127.0.0.1", port=8000, reload=False, log_level="info")
