@@ -361,6 +361,7 @@
 
   // RENDEROWANIE KAFELKÓW: ZGODNOŚĆ Z WYWOŁANIAMI
   function renderVideoGrid(videos, options = {}) {
+    if (options.scope) videos = (videos || []).map(video => ({ ...video, _mediaScope: options.scope }));
     if (options && options.reconcile) {
       return reconcilePage(videos, options);
     }

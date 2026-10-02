@@ -1319,6 +1319,9 @@ class CatalogService:
         source: str = "all",
         revision: Optional[int] = None,
         blocked_models: Optional[List[str]] = None,
+        author_filter: str = "all",
+        favorite_authors: Optional[List[str]] = None,
+        favorite_ids: Optional[List[Any]] = None,
         enrich_fn: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
     ) -> Dict[str, Any]:
         """Search the local catalog without silently falling back to remote media."""
@@ -1327,6 +1330,7 @@ class CatalogService:
         requested_revision = revision
         if not needle:
             return {"scope": "local_catalog", "catalog_revision": 0, "items": [], "count": 0, "total": 0, "page": page, "page_count": 1}
+        indexed = len(needle) >= 3 and self._ensure_local_search_index()
         with self._read_snapshot() as conn:
             rev = requested_revision if requested_revision is not None else self._select_revision_from_conn(conn)
             if rev is None:
@@ -1346,12 +1350,41 @@ class CatalogService:
                 placeholders = ",".join("?" for _ in clean_blocked)
                 clauses.append(f"author_clean NOT IN ({placeholders})")
                 params.extend(clean_blocked)
+            if author_filter in {"only_fav", "exclude_fav"}:
+                clean_fav = sorted({re.sub(r"[^a-z0-9]", "", str(a).lower()) for a in (favorite_authors or []) if a})
+                fav_keys = _normalize_favorite_keys(favorite_ids)
+                conditions = []
+                if clean_fav:
+                    conditions.append(f"author_clean IN ({','.join('?' for _ in clean_fav)})")
+                    params.extend(clean_fav)
+                by_source = {}
+                for key in fav_keys:
+                    by_source.setdefault(key.source, []).append(key.provider_id)
+                for fav_source, ids in by_source.items():
+                    conditions.append(f"(source = ? AND video_id IN ({','.join('?' for _ in ids)}))")
+                    params.extend([fav_source, *ids])
+                favorite_clause = f"({' OR '.join(conditions)})" if conditions else "0"
+                clauses.append(f"NOT {favorite_clause}" if author_filter == "exclude_fav" else favorite_clause)
             where = " AND ".join(clauses)
+            if indexed:
+                # LIKE on the trigram table deliberately has no ESCAPE clause:
+                # wildcard characters may broaden these candidates, while the
+                # original escaped predicate above remains the final authority.
+                # Bound very common matches and use the ordinary scan for them.
+                capacity = min(10000, max(1, conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER) - len(params) - 2))
+                candidates = conn.execute(
+                    "SELECT c.rowid FROM catalog_search_fts f JOIN catalog_items c ON c.rowid=f.rowid "
+                    "WHERE c.revision=? AND f.raw_json LIKE ? LIMIT ?", (rev, f"%{needle}%", capacity + 1)
+                ).fetchall()
+                if len(candidates) <= capacity:
+                    ids = [row[0] for row in candidates]
+                    where += f" AND rowid IN ({','.join('?' for _ in ids)})" if ids else " AND 0"
+                    params.extend(ids)
             total = int(conn.execute(f"SELECT COUNT(*) AS cnt FROM catalog_items WHERE {where}", params).fetchone()["cnt"] or 0)
             rows = conn.execute(
                 f"SELECT raw_json FROM catalog_items WHERE {where} ORDER BY published_at DESC, canonical_key ASC LIMIT ? OFFSET ?",
                 params + [ps, max(0, (page - 1) * ps)],
-            ).fetchall()
+            ).fetchall() if total else []
             items = [json.loads(row["raw_json"]) for row in rows]
             if enrich_fn:
                 items = enrich_fn(items)
@@ -1374,6 +1407,40 @@ class CatalogService:
             "network_media_may_be_required": False,
             "projection": {"scope": "local_catalog", "revision": rev, "identity": "source:provider_id"},
         }
+
+    def _ensure_local_search_index(self) -> bool:
+        """Lazily build a transactional, derived index; startup and feed never wait for it."""
+        with self._lock:
+            if hasattr(self, "_local_search_index_ready"):
+                return self._local_search_index_ready
+            conn = self._get_conn()
+            if self.is_shutting_down():
+                raise RuntimeError("catalog is shutting down")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_search_fts'").fetchone()
+                conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS catalog_search_fts USING fts5(raw_json, content='catalog_items', content_rowid='rowid', tokenize='trigram', detail='none')")
+                conn.execute("""CREATE TRIGGER IF NOT EXISTS catalog_search_ai AFTER INSERT ON catalog_items BEGIN
+                    INSERT INTO catalog_search_fts(rowid,raw_json) VALUES(new.rowid,new.raw_json); END""")
+                conn.execute("""CREATE TRIGGER IF NOT EXISTS catalog_search_ad AFTER DELETE ON catalog_items BEGIN
+                    INSERT INTO catalog_search_fts(catalog_search_fts,rowid,raw_json) VALUES('delete',old.rowid,old.raw_json); END""")
+                conn.execute("""CREATE TRIGGER IF NOT EXISTS catalog_search_au AFTER UPDATE OF raw_json ON catalog_items BEGIN
+                    INSERT INTO catalog_search_fts(catalog_search_fts,rowid,raw_json) VALUES('delete',old.rowid,old.raw_json);
+                    INSERT INTO catalog_search_fts(rowid,raw_json) VALUES(new.rowid,new.raw_json); END""")
+                if not exists:
+                    conn.execute("INSERT INTO catalog_search_fts(catalog_search_fts) VALUES('rebuild')")
+                conn.execute("COMMIT")
+                self._local_search_index_ready = True
+            except sqlite3.OperationalError as exc:
+                conn.execute("ROLLBACK")
+                if 'no such module: fts5' not in str(exc) and 'no such tokenizer: trigram' not in str(exc):
+                    raise
+                # Older SQLite distributions retain exact substring search.
+                self._local_search_index_ready = False
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            return self._local_search_index_ready
 
     def import_cached_raw_pages(self, raw_cache_dir: Optional[Path] = None) -> int:
         """Imports existing raw_v1_*.json files into a partial initial revision if no complete revision exists."""

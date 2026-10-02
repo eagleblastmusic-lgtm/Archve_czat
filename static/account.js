@@ -45,12 +45,13 @@
     dom.jobsDeepStopBtn?.addEventListener('click', stopDeepJob);
 
     dom.reloginBtn.addEventListener('click', async () => {
-      showToast('Synchronizacja konta...', 'info');
+      showToast('Logowanie do konta...', 'info');
       try {
-        const data = await global.ArchivebateAPI.postJSON('/api/relogin', {});
+        const data = await global.ArchivebateAPI.postJSON('/api/relogin', {}, { timeoutMs: 120000 });
         if (data.success) {
-          showToast('Zsynchronizowano pomyślnie!', 'success');
+          showToast('Zalogowano. Rozpoczynam synchronizację danych.', 'info');
           updateUserStatus(data.status);
+          await sync();
         } else {
           showToast(data?.status?.login_error || 'Błąd logowania!', 'error');
         }
@@ -107,6 +108,8 @@
 
   function updateUserStatus(status) {
     const nextPreferencesVersion = Number(status?.preferences_version);
+    if (Number.isFinite(nextPreferencesVersion) && state.preferencesVersion != null &&
+        nextPreferencesVersion < Number(state.preferencesVersion)) return;
     if (Number.isFinite(nextPreferencesVersion)) {
       if (state.preferencesVersion !== null && state.preferencesVersion !== undefined &&
           Number(state.preferencesVersion) !== nextPreferencesVersion) {
@@ -158,6 +161,8 @@
       icon.className = 'fa-solid fa-clock';
       icon.setAttribute('aria-hidden', 'true');
       dom.panelLastSync.append(icon, document.createTextNode(` Ostatnia synchronizacja: ${status.last_synced}`));
+    } else if (dom.panelLastSync) {
+      dom.panelLastSync.textContent = 'Dane konta nie były jeszcze synchronizowane.';
     }
     if (dom.accountStatusBadge) {
       const configured = Boolean(status.account_configured);
@@ -170,6 +175,7 @@
   }
 
   function showPanel() {
+    global.ArchivebateVideoViews?.beginViewRequest?.();
     state.mode = 'account';
     dom.accountPanelView.style.display = 'block';
     dom.tagsSection.style.display = 'none';
@@ -208,7 +214,10 @@
     const overall = String(report?.status || 'unknown');
 
     if (dom.jobsOverallStatus) dom.jobsOverallStatus.textContent = `Stan: ${jobLabel(overall)}`;
-    if (dom.jobSyncStatus) dom.jobSyncStatus.textContent = jobLabel(sync.status);
+    if (dom.jobSyncStatus) dom.jobSyncStatus.textContent = sync.status === 'running'
+      ? `W toku: ${sync.phase || 'pobieranie'}`
+      : (sync.result?.status === 'partial' ? 'Niepełne pobranie danych' : jobLabel(sync.status));
+    if (dom.jobSyncStatus) dom.jobSyncStatus.title = sync.result?.error || (sync.result?.complete ? 'Pobrano wszystkie strony sekcji konta.' : '');
     if (dom.jobQuickStatus) dom.jobQuickStatus.textContent = jobLabel(quickStatus);
     if (dom.jobDeepStatus) dom.jobDeepStatus.textContent = jobLabel(deepRunning ? 'running' : (deep.status || (deep.last_error ? 'failed' : 'idle')));
     if (dom.jobDeepProgress) {
@@ -279,10 +288,10 @@
   }
 
   async function sync() {
-    showToast('Pobieranie wszystkich stron z konta Archivebate...', 'info');
+    showToast('Pobieranie danych konta Archivebate… Stan zadania jest dostępny w panelu konta.', 'info');
     dom.panelSyncBtn.disabled = true;
     try {
-      const data = await global.ArchivebateAPI.postJSON('/api/account/sync', {});
+      const data = await global.ArchivebateAPI.postJSON('/api/account/sync', {}, { timeoutMs: 120000 });
       if (data.success) {
         showToast(`Pobrano: ${data.favorites_count} ulubionych, ${data.history_count} historii, ${data.following_count} obserwowanych!`, 'success');
         updateUserStatus(data);
@@ -293,13 +302,15 @@
         if (state.mode === 'history') loadHistory(1);
         if (state.mode === 'following') loadFollowing(1);
       } else {
+        updateUserStatus(data);
         const reason = data.error || (data.status === 'not_configured' ? 'Konto nie jest skonfigurowane.' : `Synchronizacja nieukończona (${data.status || 'unknown'}).`);
         showToast(reason, 'error');
       }
     } catch (e) {
-      showToast('Błąd synchronizacji', 'error');
+      showToast('Nie uzyskano wyniku synchronizacji. Sprawdź stan zadania w panelu konta.', 'warning');
     } finally {
       dom.panelSyncBtn.disabled = false;
+      void refreshJobs();
     }
   }
 
@@ -350,11 +361,13 @@
       if (!preview?.success) throw new Error('Plik nie przeszedł walidacji.');
       const confirmed = confirm(
         `Przywrócić ${preview.favorites} ulubionych, ${preview.history} wpisów historii i ${preview.following} obserwowanych?\n\n` +
+        `Blokady: ${preview.blocked_models || 0}. Usunięte wpisy ulubionych: ${preview.differences?.favorites?.removed || 0}.\n` +
         'Istniejący lokalny magazyn zostanie zastąpiony kopią z pliku. Operacja nie usuwa pliku źródłowego.'
       );
       if (!confirmed) return;
       const result = await global.ArchivebateAPI.postJSON('/api/account/restore', snapshot, { timeoutMs: 12000 });
       if (!result?.success) throw new Error('Przywracanie nie zostało potwierdzone przez serwer.');
+      global.ArchivebateVideoViews?.preferencesChanged?.(result.preferences_version);
       showToast('Dane zostały przywrócone. Widoki zostaną odświeżone.', 'success');
       await initUserStatus();
       if (state.mode === 'favorites') loadFavorites(1);

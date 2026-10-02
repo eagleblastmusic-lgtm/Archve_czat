@@ -223,6 +223,7 @@
   }
 
   function createVideoCard(v, idx) {
+    const isLocalScope = () => v._mediaScope === 'local_catalog';
     let isCamwhores = v.source === 'camwhores' || String(v.id).startsWith('cw_') || (v.platform && v.platform.toLowerCase().includes('camwhores'));
     const isFav = !!v.is_favorite;
     const isFavAuthor = isFavoriteAuthor(v.username) || v.has_favorite_video;
@@ -241,7 +242,7 @@
     card._videoData = v;
     card._cardIndex = idx;
 
-    const directPoster = v.poster_direct || (v.poster ? v.poster.replace(/\.mp4$/, '.jpg') : '');
+    const directPoster = isLocalScope() ? '' : (v.poster_direct || (v.poster ? v.poster.replace(/\.mp4$/, '.jpg') : ''));
     const rawPoster = directPoster || (v.poster ? v.poster.replace(/\.mp4$/, '.jpg') : '');
     const canonicalPoster = thumbnailUrlForVideo(v) || directPoster;
     const displayPoster = canonicalPoster;
@@ -399,10 +400,10 @@
     const showThumbnailError = () => {
       if (thumbnailError || !cardThumbImg) return;
       cardThumbImg.style.visibility = 'hidden';
-      thumbnailError = document.createElement('button');
+      thumbnailError = document.createElement(isLocalScope() ? 'span' : 'button');
       thumbnailError.type = 'button';
       thumbnailError.className = 'thumbnail-retry';
-      thumbnailError.textContent = 'Miniatura niedostępna · Ponów';
+      thumbnailError.textContent = isLocalScope() ? 'Brak lokalnej miniatury · Odtwórz, aby pobrać media' : 'Miniatura niedostępna · Ponów';
       thumbnailError.addEventListener('click', event => {
         event.preventDefault();
         event.stopPropagation();
@@ -420,6 +421,7 @@
       thumbWrapper.appendChild(thumbnailError);
     };
     const recoverThumbnail = () => {
+      if (isLocalScope()) { showThumbnailError(); return; }
       const current = card._videoData || v;
       const preview = String(current.preview_video || '');
       // Only the provider's tiny thumbnail clip is eligible. Never open the
@@ -485,6 +487,7 @@
     if (cardThumbImg) {
       cardThumbImg.addEventListener('load', clearThumbnailError);
       cardThumbImg.addEventListener('error', () => {
+        if (isLocalScope()) { showThumbnailError(); return; }
         const backup = cardThumbImg.dataset.fallback;
         if (!cardThumbImg.dataset.retried && backup && cardThumbImg.getAttribute('src') !== backup) {
           cardThumbImg.dataset.retried = '1';
@@ -685,6 +688,7 @@
     }
 
     thumbWrapper.addEventListener('mouseenter', (e) => {
+      if (isLocalScope()) return;
       isHovered = true;
       if (timelinePrefix) preloadFrames();
       else {
@@ -700,6 +704,7 @@
     });
 
     thumbWrapper.addEventListener('mousemove', (e) => {
+      if (isLocalScope()) return;
       isHovered = true;
       const rect = thumbWrapper.getBoundingClientRect();
       const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -1041,6 +1046,7 @@
 
     let cardPrefetchTimer = null;
     card.addEventListener('pointerenter', () => {
+      if (isLocalScope()) return;
       clearTimeout(cardPrefetchTimer);
       cardPrefetchTimer = setTimeout(() => {
         const activeVideo = card._videoData || v;
@@ -1051,6 +1057,7 @@
       clearTimeout(cardPrefetchTimer);
     }, { passive: true });
     card.addEventListener('focusin', () => {
+      if (isLocalScope()) return;
       const activeVideo = card._videoData || v;
       prefetchVideoDetails(activeVideo, { source: activeVideo.source || (String(activeVideo.id).startsWith('cw_') ? 'camwhores' : 'archivebate') });
     }, { passive: true, once: true });
@@ -1200,7 +1207,7 @@
       }
 
       // Miniatura: stabilność img.src
-      const dirPoster = newV.poster_direct || (newV.poster ? newV.poster.replace(/\.mp4$/, '.jpg') : '');
+      const dirPoster = isLocalScope() ? '' : (newV.poster_direct || (newV.poster ? newV.poster.replace(/\.mp4$/, '.jpg') : ''));
       const canPoster = (typeof thumbnailUrlForVideo === 'function' ? thumbnailUrlForVideo(newV) : '') || dirPoster;
       const targetPoster = canPoster || dirPoster;
       const tImg = card.querySelector('.thumbnail-img');

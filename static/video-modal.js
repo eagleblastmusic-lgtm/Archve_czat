@@ -142,11 +142,16 @@
   let loadingMarkup;
   let modalPreviousFocus = null;
   let modalKeyHandler = null;
+  let releaseModalFocus = null;
 
   function installModalFocusManagement() {
-    if (!dom.videoModal || modalKeyHandler) return;
+    if (!dom.videoModal || modalKeyHandler || releaseModalFocus) return;
     modalPreviousFocus = document.activeElement;
     dom.videoModal.setAttribute('aria-hidden', 'false');
+    if (global.ArchivebateDOM?.manageDialogFocus) {
+      releaseModalFocus = global.ArchivebateDOM.manageDialogFocus(dom.videoModal, dom.modalCloseBtn, closeModal);
+      return;
+    }
     modalKeyHandler = (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();
@@ -354,6 +359,7 @@
     // Inicjalizacja sesji pomiarowej otwarcia wideo (Pakiet C, punkt 1)
     let detailsResolved = false;
     let streamFailed = false;
+    let failureCheckStarted = false;
     const currentSession = state.activePlaybackSession = (g.ArchivebatePerf?.startPlaybackSession ? g.ArchivebatePerf.startPlaybackSession({
       id: video?.id,
       owner: 'player',
@@ -488,6 +494,16 @@
           }
         }
         showToast('Błąd strumienia. Kliknij „Ponów próbę”.', 'error');
+        if (!failureCheckStarted && g.ArchivebateVideoPrefetch?.checkPlaybackFailure) {
+          failureCheckStarted = true;
+          void g.ArchivebateVideoPrefetch.checkPlaybackFailure(video, sessionController.signal).then(() => {
+            if (sessionController.signal.aborted || generation !== state.playerGeneration) return;
+            if (g.ArchivebateVideoPrefetch.isKnownUnavailableVideo(video) && dom.videoLoader) {
+              dom.videoLoader.textContent = 'Nagranie jest niedostępne. Usunięto je z kafelków.';
+              if (dom.modalCenterPlay) dom.modalCenterPlay.style.display = 'none';
+            }
+          });
+        }
       };
     }
 
@@ -585,11 +601,12 @@
         ...video,
         source: video.source || (String(video.id || '').startsWith('cw_') ? 'camwhores' : '')
       };
-      api().postJSON('/api/account/history/record', historyVideo).then(d => {
+      g.ArchivebatePlayerCore.recordHistory(historyVideo, d => {
+        if (generation !== state.playerGeneration) return;
         state.historyCount = d.total_history;
         if (dom.navHistCount) dom.navHistCount.innerText = state.historyCount;
         if (dom.statHistCount) dom.statHistCount.innerText = state.historyCount;
-      }).catch(() => {});
+      });
     };
     if (dom.modalVideo) {
       dom.modalVideo.addEventListener('playing', recordStartedVideo, { once: true, signal: sessionController.signal });
@@ -700,7 +717,12 @@
           dom.videoLoader.style.display = 'flex';
           dom.videoLoader.textContent = 'Nagranie zostało usunięte ze źródła. Potwierdzam usunięcie przed ukryciem karty.';
         }
-        void prefetchMod.confirmUnavailableVideo(video, details, sessionController.signal);
+        await prefetchMod.confirmUnavailableVideo(video, details, sessionController.signal);
+        if (!sessionController.signal.aborted && generation === state.playerGeneration && dom.videoLoader) {
+          dom.videoLoader.textContent = prefetchMod.isKnownUnavailableVideo(video, videoSource)
+            ? 'Nagranie jest niedostępne. Usunięto je z kafelków.'
+            : 'Nagranie jest niedostępne. Nie udało się jeszcze potwierdzić usunięcia.';
+        }
         return;
       }
 
@@ -966,6 +988,8 @@
     }
     if (dom.modalIframe) dom.modalIframe.src = '';
     if (typeof document !== 'undefined' && document.body) document.body.style.overflow = '';
+    releaseModalFocus?.();
+    releaseModalFocus = null;
     modalPreviousFocus?.focus?.();
     modalPreviousFocus = null;
   }

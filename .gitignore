@@ -34,3 +34,11 @@ data/catalog.db-shm
 
 # Runtime model-tag enrichment (seed is tracked separately)
 data/model_tags.local.json
+
+# Isolated audit checkouts and scratch results
+audit/isolated_implementation*
+audit/repair_results*
+audit/checkpoint_diff*
+audit/2026-09-24/
+audit/implementation_2026-09-24/
+audit/video_review_2026-09-29/

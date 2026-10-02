@@ -101,9 +101,9 @@ assert "postJSON('/api/account/sync'" in account_js_contract
 print("PASS audit-fix 6: account sync is explicit and GET summary is read-only")
 
 # 7. Remote favorite failure is not reported as fully successful.
-with patch.object(main.storage, "toggle_favorite", return_value=True), \
-     patch.object(main.scraper, "toggle_remote_save", return_value=False), \
-     patch.object(main.storage, "set_remote_intent", return_value={"status": "pending"}), \
+with patch.object(main.storage, "commit_favorite_toggle", return_value={"is_favorite": True, "operation_id": "audit-operation"}), \
+     patch.object(main.storage, "get_remote_intent", return_value={"operation_id": "audit-operation"}), \
+     patch.object(main.scraper, "set_remote_save", return_value={"status": "failed"}), \
      patch.object(main.storage, "set_remote_status", return_value={"status": "failed"}), \
      patch.object(main, "invalidate_feed_cache", return_value=None):
     main.session.email = "configured@example.invalid"; main.session.password = "configured"

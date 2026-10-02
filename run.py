@@ -1,9 +1,10 @@
 import socket
+import os
 import sys
-import time
 import webbrowser
 import threading
 import uvicorn
+from runtime_readiness import wait_for_runtime
 
 
 def ensure_port_available(host="127.0.0.1", port=8000):
@@ -19,8 +20,10 @@ def ensure_port_available(host="127.0.0.1", port=8000):
 
 
 def open_browser():
-    time.sleep(1.2)
     url = "http://127.0.0.1:8000"
+    if not wait_for_runtime(url, expected_pid=os.getpid()):
+        print("[START] Serwer nie potwierdził gotowości. Sprawdź komunikaty w oknie serwera.")
+        return
     print(f"\n[Archivebate Browser] Otwieranie aplikacji w przeglądarce: {url}")
     webbrowser.open(url)
 

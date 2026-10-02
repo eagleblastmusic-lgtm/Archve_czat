@@ -6,3 +6,10 @@ httpx>=0.28.0
 Pillow>=10.0.0
 imageio-ffmpeg>=0.5.1
 pywebview>=5.0.0
+
+# Keep the Windows Desktop dependency closure conditional in the generated lock.
+# pip-compile can otherwise flatten transitive platform markers.
+pythonnet==3.1.0; sys_platform == "win32"
+clr-loader>=0.3.1; sys_platform == "win32"
+cffi>=2.1.1; sys_platform == "win32"
+pycparser>=3.0; sys_platform == "win32"

@@ -4,6 +4,8 @@ import json
 import time
 import math
 import logging
+from html import unescape
+from html.parser import HTMLParser
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -13,6 +15,17 @@ from client import ArchivebateSession
 from storage import storage
 
 logger = logging.getLogger("archivebate_scraper")
+
+
+class _AccountMarkup(HTMLParser):
+    """Read account/component attributes without executing provider markup."""
+    def __init__(self, text: str):
+        super().__init__(convert_charrefs=True)
+        self.elements = []
+        self.feed(text)
+
+    def handle_starttag(self, tag, attrs):
+        self.elements.append((tag, dict(attrs)))
 
 _REMOVED_PAGE_MARKERS = (
     "this video has been removed",
@@ -1517,7 +1530,7 @@ class ArchivebateScraper:
             result["checked_at"] = checked_at
             return result
 
-    def get_account_section_videos(self, endpoint: str, max_pages: int = 12, strict: bool = False) -> List[Dict[str, Any]]:
+    def get_account_section_videos(self, endpoint: str, max_pages: Optional[int] = 12, strict: bool = False, return_meta: bool = False):
         """Pobiera listę sekcji konta; w trybie strict nie zamienia awarii na pustą listę."""
         if not self.session.is_logged_in:
             logged = self.session.login()
@@ -1540,48 +1553,119 @@ class ArchivebateScraper:
                         r.raise_for_status()
                     if "login" in str(getattr(r, "url", "")):
                         raise RuntimeError("account_auth_redirect")
-                sections = re.findall(r'<section class="video_item">.*?</section>', r.text, re.DOTALL)
+                elements = _AccountMarkup(r.text).elements
+                if any(marker in r.text.lower() for marker in _CHALLENGE_PAGE_MARKERS):
+                    raise RuntimeError("account_provider_challenge")
+                sections = re.findall(r'<section\b(?=[^>]*\bclass=["\'][^"\']*\bvideo_item\b)[^>]*>.*?</section>', r.text, re.DOTALL | re.I)
                 result = []
                 for section in sections:
-                    parsed = self.parse_video_card(section)
+                    parsed = self.parse_video_card(str(section))
                     if parsed:
                         result.append(parsed)
-                return result
+                next_link = any(tag == "a" and attrs.get("href") and ("next" in str(attrs.get("rel", "")).split() or
+                                re.search(rf'[?&]page={p + 1}(?:&|$)', attrs["href"])) for tag, attrs in elements)
+                account_markup = any("wire:initial-data" in attrs or "logout" in str(attrs.get("href", attrs.get("action", ""))) for _, attrs in elements)
+                if not sections and not (account_markup or
+                                         re.search(r'no (?:videos|recordings|results)|nothing (?:here|found)|empty', unescape(re.sub(r'<[^>]+>', ' ', r.text)).lower())):
+                    raise RuntimeError("account_unrecognized_page")
+                if sections and not result:
+                    raise RuntimeError("account_parse_failed")
+                return result, bool(next_link)
             except Exception as e:
                 logger.error(f"Błąd pobierania {endpoint} strona {p}: {e}")
                 if strict:
                     raise RuntimeError(f"account_fetch_failed:{endpoint}:{p}") from e
-                return []
+                return [], None
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            page_results = list(executor.map(fetch_page, range(1, max_pages + 1)))
-
-        all_videos = []
-        seen_ids = set()
-        for batch in page_results:
+        all_videos, seen_ids = [], set()
+        page, complete, error = 1, False, None
+        while True:
+            batch, has_next = fetch_page(page)
+            new_ids = {v["id"] for v in batch if v.get("id")} - seen_ids
+            if batch and not new_ids:
+                error = "account_repeated_page"
+                break
             for v in batch:
                 if v and v.get("id") and v["id"] not in seen_ids:
                     seen_ids.add(v["id"])
                     all_videos.append(v)
+            if has_next is None:
+                error = "account_fetch_failed"
+                break
+            if not has_next:
+                complete = True
+                break
+            if max_pages is not None and page >= max_pages:
+                error = "account_page_limit"
+                break
+            page += 1
+        if strict and not complete and not return_meta:
+            raise RuntimeError(error or "account_incomplete")
+        items = sort_videos_newest_first(all_videos)
+        return {"items": items, "complete": complete, "pages": page, "error": error} if return_meta else items
 
-        return sort_videos_newest_first(all_videos)
+    @staticmethod
+    def _save_component(html: str):
+        for _, attrs in _AccountMarkup(html).elements:
+            if "wire:initial-data" not in attrs:
+                continue
+            data = json.loads(attrs["wire:initial-data"])
+            if "save-video" in str(data.get("fingerprint", {}).get("name", "")):
+                return data
+        return None
+
+    def _remote_saved_state(self, video_id: str, component: dict) -> Optional[bool]:
+        memo = component.get("serverMemo", {}).get("data", {})
+        for field in ("saved", "isSaved", "is_saved", "videoSaved", "isVideoSaved"):
+            if isinstance(memo.get(field), bool):
+                return memo[field]
+        # Some provider versions omit the flag from the component. A complete
+        # account collection can still prove presence or absence.
+        result = self.get_account_section_videos("watchlater", max_pages=None, strict=True, return_meta=True)
+        if any(str(v.get("id")) == str(video_id) for v in result["items"]):
+            return True
+        return False if result["complete"] else None
+
+    def set_remote_save(self, video_id: str, desired: bool) -> dict:
+        """Reach a saved state; never retry an unobserved toggle blindly."""
+        attempted = False
+        try:
+            watch_url = f"https://archivebate.com/watch/{video_id}"
+            def read():
+                response = self.session.request("GET", watch_url, timeout=10)
+                if response.status_code != 200 or "login" in str(getattr(response, "url", "")):
+                    raise RuntimeError(f"Archivebate HTTP {response.status_code} / auth")
+                component = self._save_component(response.text)
+                if not component:
+                    raise RuntimeError("save-video component not found")
+                return component, self._remote_saved_state(video_id, component)
+            component, saved = read()
+            if saved is None:
+                return {"status": "unknown", "error": "Nie można odczytać zdalnego stanu ulubionego"}
+            if saved == desired:
+                return {"status": "confirmed", "desired": desired}
+            attempted = True
+            self.session.call_livewire(component["fingerprint"]["name"], component["fingerprint"], component["serverMemo"], "toggleSave")
+            _, saved = read()
+            if saved == desired:
+                return {"status": "confirmed", "desired": desired}
+            return {"status": "unknown", "error": "Zdalny stan docelowy nie został potwierdzony"}
+        except Exception as exc:
+            return {"status": "unknown" if attempted else "failed", "error": str(exc)}
 
     def toggle_remote_save(self, video_id: str) -> dict:
-        """Send toggleSave and report confirmed/failed/unknown instead of a false success."""
+        """Legacy caller: observe the starting state before requesting its inverse."""
         try:
             watch_url = f"https://archivebate.com/watch/{video_id}"
             r = self.session.request("GET", watch_url, timeout=10)
             if r.status_code >= 400:
                 return {"status": "failed", "error": f"Archivebate HTTP {r.status_code}"}
-            for m in re.finditer(r'wire:id="([^"]+)" wire:initial-data="([^"]+)"', r.text):
-                raw_data = m.group(2).replace('&quot;', '"')
-                data = json.loads(raw_data)
-                name = data['fingerprint']['name']
-                if 'save-video' in name:
-                    response = self.session.call_livewire(name, data['fingerprint'], data['serverMemo'], "toggleSave")
-                    if response:
-                        return {"status": "confirmed", "provider": "archivebate"}
-                    return {"status": "unknown", "error": "provider did not return a mutation response"}
+            component = self._save_component(r.text)
+            if component:
+                saved = self._remote_saved_state(video_id, component)
+                if saved is not None:
+                    return self.set_remote_save(video_id, not saved)
+                return {"status": "unknown", "error": "Nie można odczytać zdalnego stanu ulubionego"}
             return {"status": "failed", "error": "save-video component not found"}
         except Exception as e:
             logger.error(f"Błąd toggle_remote_save: {e}")

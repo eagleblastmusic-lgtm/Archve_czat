@@ -1,0 +1,39 @@
+{
+  "runs": [
+    {
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+      "width": 944,
+      "height": 601,
+      "pageLabel": "Numer strony",
+      "scriptsReady": true,
+      "accountBadge": "Anonimowe",
+      "native_media_played": true,
+      "keyboard_focus_in_native_DOM": true,
+      "active_ffmpeg_at_close": true,
+      "port_released": true,
+      "writer_lock_released": true,
+      "WAL_readers_closed": true,
+      "producers_stopped": true,
+      "ffmpeg_exited": true,
+      "lifecycle_seconds": 5.482
+    },
+    {
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+      "width": 944,
+      "height": 601,
+      "pageLabel": "Numer strony",
+      "scriptsReady": true,
+      "accountBadge": "Anonimowe",
+      "native_media_played": true,
+      "keyboard_focus_in_native_DOM": true,
+      "active_ffmpeg_at_close": true,
+      "port_released": true,
+      "writer_lock_released": true,
+      "WAL_readers_closed": true,
+      "producers_stopped": true,
+      "ffmpeg_exited": true,
+      "lifecycle_seconds": 3.779
+    }
+  ],
+  "restart_same_port": true
+}

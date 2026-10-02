@@ -1,0 +1,2 @@
+# Test-only dependency, separate from the application runtime lock.
+playwright==1.58.0

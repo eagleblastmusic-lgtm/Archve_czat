@@ -20,6 +20,31 @@
   --transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@media (forced-colors: active) {
+  :root {
+    --bg-main: Canvas;
+    --bg-card: Canvas;
+    --bg-card-hover: Canvas;
+    --bg-surface: Canvas;
+    --text-main: CanvasText;
+    --text-muted: CanvasText;
+    --text-dim: CanvasText;
+    --border-color: CanvasText;
+    --border-focus: Highlight;
+    --primary: LinkText;
+  }
+  button, input, select, .video-card, .toast { border: 1px solid ButtonText !important; }
+  :focus-visible { outline: 2px solid Highlight !important; outline-offset: 2px; }
+}
+
 * {
   margin: 0;
   padding: 0;
