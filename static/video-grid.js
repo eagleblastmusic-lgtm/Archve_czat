@@ -128,6 +128,7 @@
   function isGroupedVideo(video) {
     return Boolean(
       video?.is_grouped || video?._isGrouped ||
+      video?.group_members_lazy || video?.group_key || video?.author_clean && video?.group_count === 1 ||
       (video?.group_count && Number(video.group_count) > 1) ||
       (video?._groupCount && Number(video._groupCount) > 1) ||
       (Array.isArray(video?.grouped_videos) && video.grouped_videos.length > 1) ||
@@ -145,8 +146,11 @@
       if (!video || typeof video !== 'object') return false;
       // Nie usuwaj całej grupy tylko dlatego, że jej reprezentant wygasł;
       // członkowie grupy mogą nadal być dostępni. Zwykłe kafelki filtrujemy od razu.
-      if (isGroupedVideo(video)) return true;
-      return !checker(video.id);
+      if (isGroupedVideo(video)) {
+        const reconcileGroup = global.ArchivebateVideoPrefetch?.reconcileKnownUnavailableGroup;
+        return typeof reconcileGroup !== 'function' || reconcileGroup(video);
+      }
+      return !checker(video);
     });
   }
 
@@ -317,6 +321,11 @@
         } else if (existingCard && typeof existingCard === 'object') {
           existingCard._videoData = Object.assign(existingCard._videoData || {}, v);
         }
+        // A same-page refresh disconnects the observer but retains these DOM
+        // nodes. Restore their subscriptions even when no new cards are added.
+        const pendingThumb = existingCard?.querySelector?.('.thumbnail-img[data-src]');
+        if (pendingThumb) global.ArchivebateVideoPrefetch?.armLazyThumbnail(pendingThumb);
+        global.ArchivebateVideoPrefetch?.observeAvailability?.(existingCard);
       } else {
         const card = createVideoCardFn(v, idx);
         if (!card) return;

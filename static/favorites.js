@@ -192,6 +192,10 @@
       const intendedState = !previousState;
       applyFavoriteState(video, key, buttonEl, isFav, Number(snapshot?.total));
 
+      if (isFav !== previousState) {
+        global.ArchivebateVideoViews?.preferencesChanged?.(snapshot?.preferences_version);
+      }
+
       if (isFav === intendedState) {
         showToast?.(
           isFav
@@ -288,6 +292,7 @@
         throw new Error('invalid mutation response');
       }
       const isFav = data.is_favorite;
+      if (isFav !== previousIsFav) global.ArchivebateVideoViews?.preferencesChanged?.(data.preferences_version);
 
       applyFavoriteState(video, key, buttonEl, isFav, Number(data.total_favorites));
 

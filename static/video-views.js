@@ -182,10 +182,22 @@
   const HOME_FEED_HANDSHAKE_TIMEOUT_MS = 30_000;
   const HOME_INITIAL_ITEM_LIMIT = 16;
   const homePageCache = new Map();
+  const modelPageCache = new Map();
   const homePagePrefetchInflight = new Map();
+  const homePagePrefetchControllers = new Map();
+  let homePageCacheEpoch = 0;
+  let catalogRefreshPromise = null;
+
+  function currentHomeSpecKey() {
+    const src = encodeURIComponent(state.sourceFilter || 'all');
+    const authorFilter = encodeURIComponent(state.authorFilter || 'all');
+    const grouped = (state.profileDirectory || state.groupByAuthor) ? '1' : '0';
+    const preferencesVersion = Number(state.preferencesVersion) || 0;
+    return `${src}|${authorFilter}|${grouped}|prefs:${preferencesVersion}`;
+  }
 
   function homePageCacheKey(page, specKey) {
-    return `${specKey}|page:${Number(page) || 1}`;
+    return `${specKey}|epoch:${homePageCacheEpoch}|page:${Number(page) || 1}`;
   }
 
   function rememberHomePage(page, specKey, data) {
@@ -194,6 +206,8 @@
     const entry = {
       data: { ...data, videos: data.videos || data.items || [], items: data.items || data.videos || [] },
       revision: Number(data.catalog_revision !== undefined ? data.catalog_revision : data.revision),
+      preferencesVersion: Number(data.preferences_version),
+      cacheEpoch: homePageCacheEpoch,
       storedAt: Date.now()
     };
     homePageCache.delete(key);
@@ -211,6 +225,11 @@
       homePageCache.delete(key);
       return null;
     }
+    if (entry.cacheEpoch !== homePageCacheEpoch ||
+        (Number.isFinite(entry.preferencesVersion) && entry.preferencesVersion !== (Number(state.preferencesVersion) || 0))) {
+      homePageCache.delete(key);
+      return null;
+    }
     const activeRevision = Number(state.catalogRevision);
     if (Number.isFinite(activeRevision) && activeRevision > 0 && Number.isFinite(entry.revision) && entry.revision !== activeRevision) {
       homePageCache.delete(key);
@@ -219,6 +238,28 @@
     homePageCache.delete(key);
     homePageCache.set(key, entry);
     return entry.data;
+  }
+
+  function invalidateHomePageCache(version, cancelActiveView = true) {
+    const next = Number(version);
+    if (Number.isFinite(next)) state.preferencesVersion = next;
+    homePageCacheEpoch += 1;
+    homePageCache.clear();
+    modelPageCache.clear();
+    for (const controller of homePagePrefetchControllers.values()) controller.abort();
+    homePagePrefetchControllers.clear();
+    homePagePrefetchInflight.clear();
+    if (!cancelActiveView) return;
+    state.viewController?.abort?.();
+    state.activeSearchSource?.close?.();
+    state.activeSearchSource = null;
+    state.viewGeneration = (state.viewGeneration || 0) + 1;
+    state.isLoading = false;
+    setFeedRefreshingIndicator(false);
+  }
+
+  function preferencesChanged(version) {
+    invalidateHomePageCache(version, true);
   }
 
   function warmPageThumbnails(data, count = 24) {
@@ -240,17 +281,25 @@
 
     const src = encodeURIComponent(state.sourceFilter || 'all');
     const af = encodeURIComponent(state.authorFilter || 'all');
-    const grp = state.groupByAuthor ? '1' : '0';
-    const revParam = Number(revision) > 0 ? `&revision=${encodeURIComponent(revision)}` : '';
+    const grp = (state.profileDirectory || state.groupByAuthor) ? '1' : '0';
+    const revisionToFollow = Number(revision || state.requestedCatalogRevision || 0);
+    const revParam = revisionToFollow > 0 ? `&revision=${encodeURIComponent(revisionToFollow)}` : '';
+    const preferencesVersion = Number(state.preferencesVersion) || 0;
+    const preferencesParam = `&preferences_version=${encodeURIComponent(preferencesVersion)}`;
+    const cacheEpoch = homePageCacheEpoch;
+    const controller = new AbortController();
+    homePagePrefetchControllers.set(key, controller);
     const request = api().getJSON(
-      `/api/feed?page=${target}&source=${src}&author_filter=${af}&group_authors=${grp}${revParam}`,
-      { timeoutMs: 12000 }
+      `/api/feed?page=${target}&source=${src}&author_filter=${af}&group_authors=${grp}${revParam}${preferencesParam}`,
+      { timeoutMs: 12000, signal: controller.signal }
     ).then(data => {
+      if (controller.signal.aborted || cacheEpoch !== homePageCacheEpoch) return null;
       rememberHomePage(target, specKey, data);
       warmPageThumbnails(data, 24);
       return data;
     }).catch(() => null).finally(() => {
-      homePagePrefetchInflight.delete(key);
+      if (homePagePrefetchInflight.get(key) === request) homePagePrefetchInflight.delete(key);
+      if (homePagePrefetchControllers.get(key) === controller) homePagePrefetchControllers.delete(key);
     });
     homePagePrefetchInflight.set(key, request);
     return request;
@@ -259,14 +308,12 @@
   function prefetchNextPage() {
     if (state.mode !== 'home') return;
     const current = Math.max(1, Number(state.currentPage) || 1);
-    const src = encodeURIComponent(state.sourceFilter || 'all');
-    const af = encodeURIComponent(state.authorFilter || 'all');
-    const grp = state.groupByAuthor ? '1' : '0';
-    const specKey = `${src}|${af}|${grp}`;
+    const specKey = currentHomeSpecKey();
     prefetchHomePage(current + 1, specKey, state.catalogRevision);
   }
 
   function beginViewRequest() {
+    global.ArchivebateVideoPrefetch?.cancelAvailabilityChecks?.();
     state.gridController?.abort();
     if (typeof global.lazyThumbObserver !== 'undefined') global.lazyThumbObserver?.disconnect?.();
     if (global.activeHoverVideo) {
@@ -278,7 +325,7 @@
       global.activeHoverVideo = null;
     }
     state.viewController?.abort();
-    if (global.thumbnailWarmupController) global.thumbnailWarmupController?.abort?.();
+    global.ArchivebateVideoPrefetch?.cancelThumbnailWarmup?.();
     state.activeSearchSource?.close?.();
     state.activeSearchSource = null;
     state.viewController = new AbortController();
@@ -288,13 +335,27 @@
     return state.viewGeneration;
   }
 
-  async function loadHomeVideos(page = 1, force = false) {
+  function refreshCatalogAt(page = Math.max(1, Number(state.currentPage) || 1)) {
+    if (catalogRefreshPromise) return catalogRefreshPromise;
+    if (dom.refreshCatalogBtn) dom.refreshCatalogBtn.disabled = true;
+    catalogRefreshPromise = loadHomeVideos(page, { refreshCatalog: true }).finally(() => {
+      catalogRefreshPromise = null;
+      if (dom.refreshCatalogBtn) dom.refreshCatalogBtn.disabled = false;
+    });
+    return catalogRefreshPromise;
+  }
+
+  async function loadHomeVideos(page = 1, options = {}) {
+    const settings = typeof options === 'boolean' ? { refreshCatalog: options } : (options || {});
+    const refreshCatalog = Boolean(settings.refreshCatalog);
+    const retryLoad = Boolean(settings.retryLoad || settings.recoveredFrom409);
     const started = performance.now();
     const previousPage = state.currentPage;
     const generation = beginViewRequest();
     const controller = state.viewController;
     state.isLoading = true;
     state.mode = 'home';
+    setActiveNavTab(state.profileDirectory ? dom.navProfilesBtn : dom.navHomeBtn);
 
     state.currentPage = page;
     if (global.tabManager && typeof global.tabManager.updateActiveTabInfo === 'function') {
@@ -303,8 +364,10 @@
 
     const src = encodeURIComponent(state.sourceFilter || 'all');
     const af = encodeURIComponent(state.authorFilter || 'all');
-    const grp = state.groupByAuthor ? '1' : '0';
-    const specKey = `${src}|${af}|${grp}`;
+    const grp = (state.profileDirectory || state.groupByAuthor) ? '1' : '0';
+    const preferencesVersion = Number(state.preferencesVersion) || 0;
+    const preferencesParam = `&preferences_version=${encodeURIComponent(preferencesVersion)}`;
+    const specKey = currentHomeSpecKey();
     const checkpoint = state.checkpointContext;
     if (checkpoint && checkpoint.sourceFilter === (state.sourceFilter || 'all') && checkpoint.authorFilter === (state.authorFilter || 'all') && checkpoint.groupByAuthor === Boolean(state.groupByAuthor)) {
       state.catalogRevision = checkpoint.catalogRevision || null;
@@ -312,7 +375,7 @@
       state.feedSpecKey = specKey;
       state.checkpointContext = null;
     }
-    const cachedPage = !force ? getCachedHomePage(page, specKey) : null;
+    const cachedPage = !refreshCatalog && !retryLoad ? getCachedHomePage(page, specKey) : null;
     let renderedFromPageCache = false;
 
     const hasExistingCards = Boolean(
@@ -323,7 +386,7 @@
       state.gridCardMap &&
       state.gridCardMap.size > 0
     );
-    const isSamePageRefresh = hasExistingCards && !force && previousPage === page && state.feedSpecKey === specKey;
+    const isSamePageRefresh = hasExistingCards && previousPage === page && state.feedSpecKey === specKey;
 
     if (!isSamePageRefresh) {
       if (cachedPage) {
@@ -360,7 +423,7 @@
     if (dom.homeStatsBar) dom.homeStatsBar.style.display = 'grid';
     if (dom.contentHeader) dom.contentHeader.style.display = 'flex';
 
-    let filterTitle = 'Najnowsze wideo';
+    let filterTitle = state.profileDirectory ? 'Profile • jeden kafelek na autora' : 'Najnowsze wideo';
     if (state.sourceFilter === 'only-camwhores') filterTitle += ' • Tylko Camwhores';
     else if (state.sourceFilter === 'only-archivebate') filterTitle += ' • Tylko Archivebate';
     if (state.authorFilter === 'only_fav') filterTitle += ' • Tylko polubieni';
@@ -383,8 +446,8 @@
         if (dom.videoGrid && !dom.videoGrid.querySelector('.feed-retry')) {
           const retry = document.createElement('button');
           retry.className = 'btn-card feed-retry feed-refresh-retry';
-          retry.textContent = 'Ponów odświeżanie katalogu';
-          retry.onclick = () => loadHomeVideos(page, true);
+          retry.textContent = 'Ponów ładowanie';
+          retry.onclick = () => loadHomeVideos(page, { retryLoad: true });
           dom.videoGrid.appendChild(retry);
         }
         setFeedRefreshingIndicator(false);
@@ -396,31 +459,59 @@
         const retry = document.createElement('button');
         retry.className = 'btn-card feed-retry';
         retry.textContent = 'Ponów ładowanie filmów';
-        retry.onclick = () => loadHomeVideos(page, true);
+        retry.onclick = () => loadHomeVideos(page, { retryLoad: true });
         dom.videoGrid.appendChild(retry);
       }
       setFeedRefreshingIndicator(false);
     };
 
+    const slowLoadTimer = setTimeout(() => {
+      if (generation === state.viewGeneration && !state.videos?.length && dom.videoCount) {
+        dom.videoCount.innerText = 'Ładowanie katalogu trwa dłużej. Czekam na pierwszą porcję filmów…';
+      }
+    }, 5000);
+    const clearSlowLoadTimer = () => clearTimeout(slowLoadTimer);
+    controller.signal.addEventListener('abort', clearSlowLoadTimer, { once: true });
+
     try {
-      const snapshot = !force && state.feedSpecKey === specKey ? state.feedSnapshotId : null;
-      const revParam = !force && state.catalogRevision ? `&revision=${encodeURIComponent(state.catalogRevision)}` : '';
-      const initialItemsParam = !cachedPage && !isSamePageRefresh
+      const snapshot = !refreshCatalog && !retryLoad && state.feedSpecKey === specKey ? state.feedSnapshotId : null;
+      let refreshResult = null;
+      if (refreshCatalog) {
+        refreshResult = await api().postJSON('/api/catalog/refresh', {}, { timeoutMs: HOME_FEED_HANDSHAKE_TIMEOUT_MS, signal: controller.signal });
+        if (generation !== state.viewGeneration) return;
+        const refreshRevision = Number(refreshResult?.refresh_revision);
+        if (!Number.isFinite(refreshRevision) || refreshRevision <= 0) {
+          throw new Error('Serwer nie zwrócił rewizji odświeżenia katalogu.');
+        }
+        state.requestedCatalogRevision = refreshRevision;
+        setFeedRefreshingIndicator(true);
+      }
+      const requestedRevision = Number(state.requestedCatalogRevision) || 0;
+      const revisionToFollow = requestedRevision || (state.catalogRevision && !retryLoad ? Number(state.catalogRevision) : 0);
+      const revParam = revisionToFollow > 0 ? `&revision=${encodeURIComponent(revisionToFollow)}` : '';
+      const initialItemsParam = !cachedPage && (!isSamePageRefresh || refreshCatalog || retryLoad)
         ? `&initial_items=${HOME_INITIAL_ITEM_LIMIT}`
         : '';
-      if (force) {
-        await api().postJSON('/api/catalog/refresh', {}, { timeoutMs: HOME_FEED_HANDSHAKE_TIMEOUT_MS, signal: controller.signal });
-        if (generation !== state.viewGeneration) return;
-      }
-      const params = `page=${page}&source=${src}&author_filter=${af}&group_authors=${grp}${revParam}${initialItemsParam}`;
+      const params = `page=${page}&source=${src}&author_filter=${af}&group_authors=${grp}${revParam}${preferencesParam}${initialItemsParam}`;
       const data = await api().getJSON(`/api/feed?${params}${snapshot ? `&snapshot_id=${encodeURIComponent(snapshot)}` : ''}`, { timeoutMs: HOME_FEED_HANDSHAKE_TIMEOUT_MS, signal: controller.signal });
+      clearSlowLoadTimer();
       if (generation !== state.viewGeneration) return;
+      const responseRevision = Number(data.catalog_revision !== undefined ? data.catalog_revision : data.revision);
+      if (requestedRevision && responseRevision !== requestedRevision) {
+        throw new Error(`Oczekiwano rewizji ${requestedRevision}, serwer zwrócił ${responseRevision}.`);
+      }
+      const responsePreferencesVersion = Number(data.preferences_version);
+      if (Number.isFinite(responsePreferencesVersion) && responsePreferencesVersion !== preferencesVersion) {
+        invalidateHomePageCache(responsePreferencesVersion, false);
+        const mismatch = new Error('Preferencje zmieniły się podczas ładowania widoku.');
+        mismatch.status = 409;
+        throw mismatch;
+      }
       state.feedSpecKey = specKey;
-      state.feedSnapshotId = data.snapshot_id;
-      state.catalogRevision = data.catalog_revision !== undefined ? data.catalog_revision : data.revision;
-      const streamRevision = data.refresh_revision || state.catalogRevision;
-      const streamSnapshotId = data.refresh_revision ? String(data.refresh_revision) : data.snapshot_id;
-      if (data.refresh_pending) setFeedRefreshingIndicator(true);
+      state.feedSnapshotId = data.snapshot_id || String(requestedRevision || '');
+      const streamRevision = requestedRevision || data.refresh_revision || data.catalog_revision || data.revision;
+      const streamSnapshotId = requestedRevision ? String(requestedRevision) : (data.refresh_revision ? String(data.refresh_revision) : data.snapshot_id);
+      if (refreshResult?.refresh_pending || data.refresh_pending || (requestedRevision && !data.catalog_complete)) setFeedRefreshingIndicator(true);
       let firstBatch = true;
       let pendingBatchData = null;
       let batchRafId = null;
@@ -464,6 +555,8 @@
       const commitBatch = (batchData, isInitial = false) => {
         if (generation !== state.viewGeneration) return;
         const incomingRevision = Number(batchData.catalog_revision !== undefined ? batchData.catalog_revision : batchData.revision);
+        const requestedTarget = Number(state.requestedCatalogRevision) || 0;
+        if (requestedTarget && incomingRevision !== requestedTarget) return;
         const currentRevision = Number(state.catalogRevision);
         const isNewerCatalogRevision = Number.isFinite(incomingRevision) && Number.isFinite(currentRevision) && incomingRevision > currentRevision;
         if (batchData.snapshot_id && state.feedSnapshotId && batchData.snapshot_id !== state.feedSnapshotId && batchData.catalog_revision !== state.catalogRevision && !isNewerCatalogRevision) return;
@@ -491,6 +584,13 @@
         }
 
         const incomingVideos = batchData.videos || batchData.items || [];
+        if (requestedTarget && hasExistingCards && incomingVideos.length === 0 && !batchData.catalog_complete) {
+          if (batchData.catalog_state === 'failed' || batchData.type === 'source_error' || batchData.retryable) {
+            setFeedRefreshingIndicator(false);
+            showFeedError({ preserveVisible: true });
+          }
+          return;
+        }
 
         state.lastAppliedFeedRevision = currentRev;
         state.lastAppliedFeedUpdatedAt = incomingUpdatedAt;
@@ -499,6 +599,7 @@
         state.catalogRevision = currentRev;
         state.lastAppliedVideosCount = incomingVideos.length;
         state.videos = incomingVideos;
+        if (Number.isFinite(Number(batchData.preferences_version))) state.preferencesVersion = Number(batchData.preferences_version);
         if (firstBatch && state.videos.length) {
           perf().measure('feed_first_batch', started);
           firstBatch = false;
@@ -507,6 +608,9 @@
         state.lastPage = batchData.page_count || batchData.last_page;
         state.totalCatalogVideos = batchData.video_count !== undefined ? batchData.video_count : batchData.known_count;
         state.catalogComplete = !!batchData.catalog_complete;
+        if (requestedTarget && incomingRevision === requestedTarget && state.catalogComplete) {
+          state.requestedCatalogRevision = null;
+        }
 
         const pageComplete = batchData.page_complete !== false && (batchData.complete || batchData.stopped || batchData.catalog_complete);
         if (isInitial && !isSamePageRefresh && !renderedFromPageCache) {
@@ -525,7 +629,9 @@
         if (batchData.complete || batchData.stopped || batchData.catalog_complete) {
           setFeedRefreshingIndicator(false);
         }
-        if (batchData.retryable || batchData.type === 'source_error') showFeedError({ preserveVisible: true });
+        if (batchData.retryable || batchData.type === 'source_error' || batchData.catalog_state === 'failed') {
+          showFeedError({ preserveVisible: true });
+        }
       };
 
       const apply = (batchData, isInitial = false) => {
@@ -549,11 +655,14 @@
         }
       };
 
-      apply(data, true);
+      const initialVideos = data.videos || data.items || [];
+      const keepPreviousUntilTargetHasItems = requestedRevision && hasExistingCards && initialVideos.length === 0 && !data.catalog_complete;
+      if (!keepPreviousUntilTargetHasItems) apply(data, true);
+      else if (dom.videoCount) dom.videoCount.innerText = 'Odświeżam katalog. Wyświetlam poprzednią rewizję do czasu pierwszych nowych danych.';
       const catalogRevisionStream = data.catalog_complete === false && /^\d+$/.test(String(streamSnapshotId || ''));
       const pageNeedsStream = data.page_complete === false;
       if (data.refresh_pending || catalogRevisionStream || !data.complete || pageNeedsStream) {
-        const streamRevisionParam = streamRevision ? `&revision=${encodeURIComponent(streamRevision)}` : '';
+        const streamRevisionParam = streamRevision && !revisionToFollow ? `&revision=${encodeURIComponent(streamRevision)}` : '';
         const stream = new EventSource(`/api/feed/stream?${params}${streamRevisionParam}&snapshot_id=${encodeURIComponent(streamSnapshotId)}`);
         state.activeSearchSource = stream;
         // EventSource nie ma własnego limitu czasu. Gdy dostawca milczy,
@@ -569,6 +678,15 @@
           let batch;
           try { batch = JSON.parse(event.data); }
           catch (_) { clearTimeout(streamWatchdog); stream.close(); showFeedError({ preserveVisible: true }); return; }
+          if (batch.type === 'preferences_changed' ||
+              (Number.isFinite(Number(batch.preferences_version)) && Number(batch.preferences_version) !== (Number(state.preferencesVersion) || 0))) {
+            clearTimeout(streamWatchdog);
+            stream.close();
+            if (state.activeSearchSource === stream) state.activeSearchSource = null;
+            setFeedRefreshingIndicator(false);
+            showFeedError({ preserveVisible: true });
+            return;
+          }
           if ((batch.videos || batch.items || []).length || batch.catalog_complete || batch.stopped) {
             clearTimeout(streamWatchdog);
           }
@@ -584,10 +702,19 @@
       }
     } catch (e) {
       if (generation !== state.viewGeneration || e?.code === 'cancelled') return;
-      if (e?.status === 409 && !force) {
+      if (e?.status === 409 && !settings.recoveredFrom409) {
         state.feedSnapshotId = null;
-        state.catalogRevision = null;
-        return loadHomeVideos(page, true);
+        state.feedSpecKey = null;
+        try {
+          const status = await api().getJSON('/api/status', { timeoutMs: 5000, signal: controller.signal });
+          if (generation !== state.viewGeneration) return;
+          const latestPreferencesVersion = Number(status?.preferences_version);
+          if (Number.isFinite(latestPreferencesVersion) && latestPreferencesVersion !== preferencesVersion) {
+            invalidateHomePageCache(latestPreferencesVersion, false);
+          }
+        } catch (_) {}
+        if (generation !== state.viewGeneration) return;
+        return loadHomeVideos(page, { retryLoad: true, recoveredFrom409: true });
       }
       const preserveVisible = Boolean(state.videos?.length || renderedFromPageCache);
       showFeedError({ preserveVisible });
@@ -596,9 +723,10 @@
         'error'
       );
     } finally {
+      clearSlowLoadTimer();
+      controller.signal.removeEventListener('abort', clearSlowLoadTimer);
       if (generation === state.viewGeneration) {
         state.isLoading = false;
-        setFeedRefreshingIndicator(false);
       }
     }
   }
@@ -892,10 +1020,35 @@
     if (dom.paginationSection) dom.paginationSection.style.display = 'flex';
     if (dom.pageJumpInput) dom.pageJumpInput.value = page;
 
+    const cacheKey = `${String(username).toLowerCase()}:${page}:${Number(state.preferencesVersion) || 0}`;
+    const cached = modelPageCache.get(cacheKey);
+    let hasLocalVideos = false;
+    const showLocal = videos => {
+      if (generation !== state.viewGeneration || !videos?.length) return;
+      hasLocalVideos = true;
+      state.videos = videos;
+      renderVideoGrid(videos);
+      if (dom.videoCount) dom.videoCount.innerText = `${videos.length} z pamięci • odświeżanie profilu…`;
+    };
+    if (cached && Date.now() - cached.storedAt < 90000) showLocal(cached.videos);
+
+    let remoteComplete = false;
+    if (!hasLocalVideos) {
+      // This read uses the existing indexed author query and does no provider IO.
+      void api().getJSON(`/api/model/${encodeURIComponent(username)}?page=${page}&cached_only=true`,
+        { timeoutMs: 3000, signal: controller.signal }).then(data => {
+          if (!remoteComplete) showLocal(data.videos);
+        }).catch(() => {});
+    }
+
     try {
       const data = await api().getJSON(`/api/model/${encodeURIComponent(username)}?page=${page}`, { timeoutMs: 15000, signal: controller.signal });
       if (generation !== state.viewGeneration) return;
+      remoteComplete = true;
       state.videos = data.videos || [];
+      modelPageCache.delete(cacheKey);
+      modelPageCache.set(cacheKey, { videos: state.videos, storedAt: Date.now() });
+      while (modelPageCache.size > 6) modelPageCache.delete(modelPageCache.keys().next().value);
 
       renderVideoGrid(state.videos);
       scheduleThumbnailWarmup(state.videos);
@@ -908,6 +1061,7 @@
       prefetchNextPage();
     } catch (e) {
       if (generation !== state.viewGeneration || e?.code === 'cancelled') return;
+      if (hasLocalVideos && dom.videoCount) dom.videoCount.innerText = 'Wyświetlam zapisane filmy. Odświeżenie profilu nie powiodło się.';
       triggerToast(e?.message || `Błąd ładowania filmów dla ${username}`, 'error');
     } finally {
       if (generation === state.viewGeneration) state.isLoading = false;
@@ -915,6 +1069,7 @@
   }
 
   function resetToHome() {
+    state.profileDirectory = false;
     state.navHistory = [];
     updateBackButtonUI();
     document.querySelectorAll('.tag-pill').forEach(p => p.classList.remove('active'));
@@ -924,10 +1079,12 @@
 
   const ArchivebateVideoViews = {
     beginViewRequest,
+    preferencesChanged,
     showSkeletons,
     setFeedRefreshingIndicator,
     prefetchNextPage,
     loadHomeVideos,
+    refreshCatalog: refreshCatalogAt,
     loadFavorites,
     loadHistory,
     loadFollowing,

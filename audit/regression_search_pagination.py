@@ -71,3 +71,25 @@ p2_cached = scraper.search_query('#trans', page=2, source='only-archivebate', gr
 assert {v['username'] for v in p2_cached['videos']} == a2
 
 print('PASS: grouped Archivebate search pagination is deterministic and non-repeating')
+
+# A cold online search must yield matching saved videos before any slow remote
+# lookup. Respect source/author/block filters on that early batch as well.
+early = ArchivebateScraper(DummySession())
+stored = [
+    {"id": "local-match", "username": "saved", "source": "archivebate"},
+    {"id": "hidden", "username": "blocked", "source": "archivebate"},
+    {"id": "cw_other", "username": "saved", "source": "camwhores"},
+    {"id": "not-favorite", "username": "other", "source": "archivebate"},
+]
+with patch('scraper.storage.get_favorite_authors', return_value=['saved']), \
+     patch('scraper.storage.get_blocked_models', return_value=['blocked']), \
+     patch('scraper.storage.data', {"favorites": []}), \
+     patch('scraper.storage.search_stored_videos', return_value=stored), \
+     patch.object(early, '_fetch_search_profiles', side_effect=AssertionError('remote lookup before first paint')) as remote:
+    stream = early.search_query_stream('saved', source='only-archivebate', author_filter='only_fav')
+    first = next(stream)
+    assert first['type'] == 'videos'
+    assert [v['id'] for v in first['videos']] == ['local-match']
+    remote.assert_not_called()
+    stream.close()
+print('PASS: saved search results precede remote lookup and preserve filters')

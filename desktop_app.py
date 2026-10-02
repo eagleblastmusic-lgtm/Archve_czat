@@ -41,6 +41,36 @@ def wait_for_server(url="http://127.0.0.1:8000", timeout=10):
     return False
 
 
+def install_timeline_diagnostics(app, window):
+    """Read the actual Desktop DOM; never include provider URLs or credentials."""
+    @app.get("/api/runtime/desktop/timeline")
+    def desktop_timeline_snapshot():
+        return window.evaluate_js("""(() => {
+            const v = document.getElementById('modalVideo');
+            const t = document.getElementById('modalTimelineTooltip');
+            const s = document.getElementById('modalTimelineSprite');
+            const label = document.getElementById('modalTimelinePreviewStatus');
+            const state = window.ArchivebateAppContext?.state;
+            const visible = e => !!e && getComputedStyle(e).display !== 'none';
+            const image = s?.querySelector('img');
+            return {
+                video_id: state?.currentVideoId || '',
+                metadata_duration: state?.currentVideoDetails?.duration,
+                duration: Number.isFinite(v?.duration) ? v.duration : null,
+                paused: v?.paused,
+                tooltip_visible: visible(t),
+                tooltip_time: document.getElementById('modalTimelineTimeText')?.innerText,
+                sprite_visible: visible(s),
+                frame_time: s?.dataset.frameTime,
+                image_loaded: image?.complete && image?.naturalWidth > 0,
+                status_visible: visible(label),
+                status: label?.textContent,
+                client: window.ArchivebateYouTubeStoryboard?.stats(),
+                coordinator: window.ArchivebateV43TimelineFallback?.stats()
+            };
+        })()""")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("   ARCHIVEBATE & CAMWHORES PRO (Aplikacja Pulpitowa)")
@@ -58,7 +88,7 @@ if __name__ == "__main__":
         print("[START] Serwer nie zgłosił gotowości w wymaganym czasie.")
         raise SystemExit(3)
 
-    webview.create_window(
+    window = webview.create_window(
         title="Archivebate & Camwhores Desktop",
         url="http://127.0.0.1:8000",
         width=1440,
@@ -66,4 +96,6 @@ if __name__ == "__main__":
         min_size=(960, 640),
         background_color="#0a0e17"
     )
+    from runtime_app import app
+    install_timeline_diagnostics(app, window)
     webview.start(private_mode=False)

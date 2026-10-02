@@ -234,28 +234,20 @@
           if (dom.modalTimelineTimeText.innerText !== text) dom.modalTimelineTimeText.innerText = text;
         }
 
-        // 1. Camwhores: 15 klatek ze storyboardu CDN (0ms)
-        if (state.currentTimelinePrefix) {
-          const count = state.currentTimelineCount || 15;
-          const frameIdx = Math.min(count, Math.max(1, Math.round(pos * (count - 1)) + 1));
-          if (dom.modalTimelinePreviewImg) {
-            const src = `${state.currentTimelinePrefix}${frameIdx}.jpg`;
-            if (dom.modalTimelinePreviewImg.src !== new URL(src, location.href).href) dom.modalTimelinePreviewImg.src = src;
-            dom.modalTimelinePreviewImg.style.display = 'block';
-          }
-          if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
-          if (dom.modalTimelinePreviewStatus) dom.modalTimelinePreviewStatus.style.display = 'none';
-          if (dom.modalTimelineSprite && g.ArchivebateYouTubeStoryboard) g.ArchivebateYouTubeStoryboard.clearFrame(dom.modalTimelineSprite);
-          return;
-        }
-
         // 2. Archivebate gęsty segment: dokładna sekunda (błąd <= 1s, 0ms, 0 zapytań strumienia)
         const segment = g.ArchivebateYouTubeStoryboard?.getSegmentFromCache?.(state.currentVideoId, totalDur, targetTime);
         if (segment && dom.modalTimelineSprite && g.ArchivebateYouTubeStoryboard) {
           if (dom.modalTimelinePreviewImg) dom.modalTimelinePreviewImg.style.display = 'none';
           if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
           if (dom.modalTimelinePreviewStatus) dom.modalTimelinePreviewStatus.style.display = 'none';
-          g.ArchivebateYouTubeStoryboard.applyFrame(dom.modalTimelineSprite, segment, targetTime, { targetTime, duration: totalDur });
+          const result = g.ArchivebateYouTubeStoryboard.applyFrame(dom.modalTimelineSprite, segment, targetTime, { targetTime, duration: totalDur });
+          if (result?.isExact === false) {
+            if (dom.modalTimelineTimeText) dom.modalTimelineTimeText.innerText = `${formatPlayerTime(targetTime)} • klatka ${formatPlayerTime(result.frameTime)}`;
+            if (dom.modalTimelinePreviewStatus) {
+              dom.modalTimelinePreviewStatus.textContent = 'Najbliższa dostępna klatka';
+              dom.modalTimelinePreviewStatus.style.display = 'block';
+            }
+          }
           return;
         }
 
@@ -266,6 +258,14 @@
             duration: totalDur,
             targetTime,
             signal: state.timelineHoverController?.signal,
+            onStatus: phase => {
+              if (dom.modalTimelineTooltip?.style.display === 'none' || !dom.modalTimelinePreviewStatus) return;
+              const status = dom.modalTimelinePreviewStatus;
+              status.textContent = phase === 'waiting-buffer'
+                ? 'Podgląd czeka na bufor filmu. Wstrzymaj film, aby go przygotować.'
+                : g.ArchivebateYouTubeStoryboard.previewStatusText(state.currentVideoId, totalDur, targetTime);
+              status.style.display = phase === 'ready' ? 'none' : 'block';
+            },
             onReady: () => {
               if (dom.modalTimelineTooltip?.style.display !== 'none') {
                 renderTimelinePreview(modalPreviewClientX);
@@ -274,12 +274,31 @@
           });
         }
 
+        // Native CDN thumbnails are coarse; they must not bypass exact seconds.
+        if (state.currentTimelinePrefix) {
+          const count = state.currentTimelineCount || 15;
+          const frameIdx = Math.min(count, Math.max(1, Math.round(pos * (count - 1)) + 1));
+          if (dom.modalTimelinePreviewImg) {
+            const src = `${state.currentTimelinePrefix}${frameIdx}.jpg`;
+            if (dom.modalTimelinePreviewImg.src !== new URL(src, location.href).href) dom.modalTimelinePreviewImg.src = src;
+            dom.modalTimelinePreviewImg.style.display = 'block';
+          }
+          if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
+          if (dom.modalTimelinePreviewStatus) {
+            dom.modalTimelinePreviewStatus.textContent = g.ArchivebateYouTubeStoryboard?.previewStatusText?.(state.currentVideoId, totalDur, targetTime) || 'Przygotowywanie podglądu…';
+            dom.modalTimelinePreviewStatus.style.display = 'block';
+          }
+          if (dom.modalTimelineTimeText) dom.modalTimelineTimeText.innerText = `${formatPlayerTime(targetTime)} • podgląd przybliżony`;
+          if (dom.modalTimelineSprite && g.ArchivebateYouTubeStoryboard) g.ArchivebateYouTubeStoryboard.clearFrame(dom.modalTimelineSprite);
+          return;
+        }
+
         // 3. Fallback: rzadki storyboard (QUICK / FULL) z informacją o przygotowywaniu dokładnego podglądu
         if (state.timelineSpriteBoard && dom.modalTimelineSprite && g.ArchivebateYouTubeStoryboard) {
           if (dom.modalTimelinePreviewImg) dom.modalTimelinePreviewImg.style.display = 'none';
           if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
           if (dom.modalTimelinePreviewStatus) {
-            dom.modalTimelinePreviewStatus.innerText = 'Przygotowywanie dokładnego podglądu...';
+            dom.modalTimelinePreviewStatus.innerText = g.ArchivebateYouTubeStoryboard?.previewStatusText?.(state.currentVideoId, totalDur, targetTime) || 'Przygotowywanie dokładnego podglądu…';
             dom.modalTimelinePreviewStatus.style.display = 'block';
           }
           const res = g.ArchivebateYouTubeStoryboard.applyFrame(dom.modalTimelineSprite, state.timelineSpriteBoard, targetTime, { targetTime, duration: totalDur });
@@ -293,7 +312,7 @@
         if (dom.modalTimelineSprite && g.ArchivebateYouTubeStoryboard) g.ArchivebateYouTubeStoryboard.clearFrame(dom.modalTimelineSprite);
         if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
         if (dom.modalTimelinePreviewStatus) {
-          dom.modalTimelinePreviewStatus.innerText = 'Przygotowywanie podglądu...';
+          dom.modalTimelinePreviewStatus.innerText = g.ArchivebateYouTubeStoryboard?.previewStatusText?.(state.currentVideoId, totalDur, targetTime) || 'Przygotowywanie podglądu…';
           dom.modalTimelinePreviewStatus.style.display = 'block';
         }
         const posterSrc = (state.currentVideoDetails?.thumbnail || state.currentVideoDetails?.poster || '').replace('.mp4', '.jpg');

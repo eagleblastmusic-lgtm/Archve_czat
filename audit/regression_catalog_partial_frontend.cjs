@@ -54,10 +54,10 @@ context.ArchivebateAPI = {
   postJSON: async (url) => {
     assert.equal(url, '/api/catalog/refresh', 'forced refresh must use the protected POST route');
     refreshCalls += 1;
-    return { refresh_revision: 1, refresh_pending: true };
+    return { refresh_revision: 2, refresh_pending: true };
   },
   getJSON: async () => ({
-    snapshot_id: '1', catalog_revision: 1, revision: 1, videos: cards,
+    snapshot_id: '2', catalog_revision: 2, revision: 2, videos: cards,
     items: cards, complete: true, catalog_complete: false,
     video_count: 280, group_count: 280, page_count: 1, has_more: true, updated_at: 1
   })
@@ -69,7 +69,7 @@ context.ArchivebateAPI = {
   assert(eventSource, 'partial catalog must open a progress stream');
   assert.equal(eventSource.closed, false);
   eventSource.onmessage({ data: JSON.stringify({
-    snapshot_id: '1', catalog_revision: 1, revision: 1, videos: cards,
+    snapshot_id: '2', catalog_revision: 2, revision: 2, videos: cards,
     items: cards, complete: true, catalog_complete: false,
     video_count: 560, group_count: 560, page_count: 2, has_more: true, updated_at: 2
   }) });

@@ -71,6 +71,7 @@ def _v43_versioned_html(path):
         if scripts and "</body>" in body:
             body = body.replace("</body>", "  " + "\n  ".join(scripts) + "\n</body>", 1)
         response.body = body.encode("utf-8")
+        response.headers["Content-Security-Policy"] = _main._trusted_html_csp(body)
         response.headers["content-length"] = str(len(response.body))
     except Exception:
         # Runtime HTML enhancements must never make the application unbootable.

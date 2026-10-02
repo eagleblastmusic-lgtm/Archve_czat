@@ -1,56 +1,108 @@
+"""Exercise the composed runtime through its real FastAPI routes.
+
+Run in an isolated checkout: importing ``runtime_app`` initializes the local
+catalog/store singletons under the checkout's data directory.
+"""
+from unittest.mock import patch
 from pathlib import Path
+import sys
+
+from fastapi.testclient import TestClient
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-browser = (ROOT / "browser_server.py").read_text(encoding="utf-8")
-desktop = (ROOT / "desktop_app.py").read_text(encoding="utf-8")
-runtime = (ROOT / "runtime_app.py").read_text(encoding="utf-8")
-launcher = (ROOT / "URUCHOM_W_PRZEGLADARCE.bat").read_text(encoding="utf-8")
-quick = (ROOT / "fast_storyboard_quick.py").read_text(encoding="utf-8")
-coordinator = (ROOT / "static" / "v43-timeline-fallback-v7.js").read_text(encoding="utf-8")
+import main
+import runtime_app
 
-assert 'uvicorn.run("runtime_app:app"' in browser
-assert 'uvicorn.run("runtime_app:app"' in desktop
-assert 'from fast_grouped_feed_v2 import install' in runtime
-assert 'import fast_storyboard_quick as _quick_storyboard' in runtime
-assert '_quick_storyboard.QUICK_FRAME_COUNT = 2' in runtime
-assert '_quick_storyboard.QUICK_PARALLELISM = 2' in runtime
-assert '_quick_storyboard.QUICK_MIN_SUCCESS = 2' in runtime
-assert '_quick_storyboard.install()' in runtime
-assert 'parallel_quick_storyboard' in runtime  # compatibility marker
-assert 'playback_safe_quick_storyboard' in runtime
-assert 'quick_reservation_scheduler' in runtime
-assert 'quick_scheduler_revision' in runtime
-assert 'timeline_coordinator_version' in runtime
-assert 'media_seek_fallback' in runtime
-assert 'RUNTIME_ID = "v4.3-fast2"' in runtime
-assert '/api/runtime/v43/storyboard/quick' in runtime
-assert '/api/runtime/v43/storyboard/stats' in runtime
-assert 'X-Archivebate-Runtime' in runtime
-assert 'v43-timeline-fallback-v7.js?v=7' in runtime
 
-assert '_build_variant_playback_safe' in quick
-assert 'wait_status' in quick
-assert '_reserve_quick_slot' in quick
-assert '_release_quick_slot' in quick
-assert 'quick_reservation' in quick
-assert 'missing_status_waits' in quick
-assert 'stale_exact_preemptions' in quick
-assert 'exact_preempts_quick' in quick
-assert '_v43_playback_safe_quick_installed' in quick
-assert '_v43_quick_reservation_installed' in quick
-assert 'kind="quick"' in quick
-assert '_preempt_active_for_target =' not in quick, (
-    'V4.3 must keep baseline exact-target preemption semantics; QUICK may only reserve stale prewarm work'
-)
+client = TestClient(runtime_app.app)
 
-assert 'coordinatedRequestSegment' in coordinator
-assert 'ensureInteractiveCoarse' in coordinator
-assert 'COARSE_EXACT_DEFER_MS = 3500' in coordinator
-assert 'source_video_id: latestVideoId' in coordinator
+marker = client.get("/api/runtime/v43")
+assert marker.status_code == 200, marker.text
+assert marker.headers.get("x-archivebate-runtime") == runtime_app.RUNTIME_ID
+payload = marker.json()
+assert payload["runtime"] == runtime_app.RUNTIME_ID
+assert payload["grouped_fast_path_v2"] is True
+assert payload["timeline_coordinator_version"] == 452
+assert payload["next_video_prefetch"] is True
 
-assert 'Get-NetTCPConnection -State Listen -LocalPort 8000' in launcher
-assert '/api/runtime/v43' in launcher
-assert 'v4.3-fast2' in launcher
+home = client.get("/")
+assert home.status_code == 200
+assert home.headers.get("x-archivebate-runtime") == runtime_app.RUNTIME_ID
+for script in (
+    runtime_app._V452_QOS_SCRIPT,
+    runtime_app._V452_NEXT_PREFETCH_SCRIPT,
+    runtime_app._LAZY_THUMB_RESILIENCE_SCRIPT,
+    runtime_app._V43_TIMELINE_SCRIPT,
+):
+    assert script in home.text, f"runtime HTML injection missing {script}"
 
-print('PASS V4.3 RUNTIME WIRING + V8 QUICK RESERVATION + V7 TIMELINE')
+watch = client.get("/watch/runtime-smoke")
+assert watch.status_code == 200
+assert watch.headers.get("x-archivebate-runtime") == runtime_app.RUNTIME_ID
+assert runtime_app._V43_TIMELINE_SCRIPT in watch.text
+assert "previewVideo && streamUrl" not in watch.text, "secondary full-resolution watch stream must stay removed"
+
+# The browser must be able to execute the final transformed watch script.
+# Hashing the original static file would still block the runtime player.
+import re
+import hashlib
+import base64
+for response in (home, watch, runtime_app._original_versioned_html(str(ROOT / "static" / "watch.html"))):
+    html = response.text if hasattr(response, "text") else response.body.decode("utf-8")
+    csp = response.headers["Content-Security-Policy"]
+    script_policy = next(part for part in csp.split(";") if part.strip().startswith("script-src"))
+    assert "'unsafe-inline'" not in script_policy and "'unsafe-eval'" not in script_policy
+    for script in re.findall(r"<script\s*>(.*?)</script\s*>", html, re.S | re.I):
+        if script.strip():
+            expected = "'sha256-" + base64.b64encode(hashlib.sha256(script.encode()).digest()).decode() + "'"
+            assert expected in script_policy, "served inline player script is blocked by CSP"
+assert re.search(r"<script\s*>(.*?)</script", watch.text, re.S), "watch fixture must cover its inline player"
+
+# Verify the API method and local mutation gate at the actual router boundary.
+# Only the authorized POST is stubbed beyond the boundary; no provider is called.
+forced_get = client.get("/api/video/details?id=runtime-smoke&force_refresh=true")
+assert forced_get.status_code == 405, forced_get.text
+blocked_post = client.post("/api/video/details/refresh?id=runtime-smoke", json={})
+assert blocked_post.status_code == 403, blocked_post.text
+with patch.object(main, "_fetch_details_singleflight", return_value={
+    "direct_url": "https://fixture.invalid/runtime-smoke.mp4",
+    "source": "archivebate",
+}):
+    refreshed = client.post(
+        "/api/video/details/refresh?id=runtime-smoke",
+        json={},
+        headers={"X-Archivebate-Mutation-Token": main.LOCAL_MUTATION_TOKEN},
+    )
+assert refreshed.status_code == 200, refreshed.text
+assert refreshed.json()["availability"] == "available"
+
+diagnostics = client.get("/api/diagnostics")
+assert diagnostics.status_code == 200
+assert diagnostics.json()["build"]["sqlite"]
+catalog_sqlite = diagnostics.json()["catalog"]["sqlite"]
+assert catalog_sqlite["sqlite_version"] == diagnostics.json()["build"]["sqlite"]
+assert "active_readers" in catalog_sqlite and "wal_bytes" in catalog_sqlite
+assert "last_passive_checkpoint" in catalog_sqlite
+
+# Desktop diagnostics read the window's DOM through the existing WebView API.
+# No native window is opened by this regression, including on Linux runners.
+from unittest.mock import MagicMock
+with patch.dict(sys.modules, {"webview": MagicMock()}):
+    import desktop_app
+window = MagicMock()
+window.evaluate_js.return_value = {"video_id": "fixture", "frame_time": "460", "sprite_visible": True}
+desktop_app.install_timeline_diagnostics(runtime_app.app, window)
+desktop_snapshot = client.get('/api/runtime/desktop/timeline')
+assert desktop_snapshot.status_code == 200 and desktop_snapshot.json()['frame_time'] == '460'
+script = window.evaluate_js.call_args.args[0]
+assert 'modalTimelineSprite' in script and 'ArchivebateYouTubeStoryboard?.stats()' in script
+assert '.src' not in script and 'cookie' not in script and 'localStorage' not in script
+calls_before = window.evaluate_js.call_count
+assert client.get('/api/runtime/desktop/timeline', headers={'Host':'foreign.invalid'}).status_code == 403
+assert window.evaluate_js.call_count == calls_before
+
+client.close()
+print("PASS: actual runtime marker, HTML injection, POST-only refresh gate, and SQLite diagnostics")

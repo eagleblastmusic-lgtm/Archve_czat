@@ -92,6 +92,7 @@
       const url = `/api/model/${encodeURIComponent(username)}/block?count=${visibleCount}`;
       const data = await global.ArchivebateAPI.postJSON(url, {});
       if (data && data.success) {
+        global.ArchivebateVideoViews?.preferencesChanged?.(data.preferences_version);
         clientBlockedAuthors().add(norm);
         if (state.currentVideoDetails && normalizeUsername(state.currentVideoDetails.username) === norm) closeModal();
         const hiddenVids = data.hidden_videos || visibleCount || 0;
@@ -129,6 +130,7 @@
     try {
       const data = await global.ArchivebateAPI.postJSON(`/api/model/${encodeURIComponent(username)}/unblock`, {});
       if (data.success) {
+        global.ArchivebateVideoViews?.preferencesChanged?.(data.preferences_version);
         clientBlockedAuthors().delete(normalizeUsername(username));
         showToast(`Odblokowano profil "${username}". Będzie teraz ponownie widoczny w programie.`, 'success');
         updateCount();

@@ -503,6 +503,7 @@
   <script src="/static/api-client.js?v=1"></script>
   <script src="/static/dom-utils.js?v=1"></script>
   <script src="/static/performance.js?v=1"></script>
+  <script src="/static/video-prefetch.js?v=20260924"></script>
   <script src="/static/player-core.js?v=2.2"></script>
   <script src="/static/youtube-storyboard.js?v=3.0"></script>
   <script>
@@ -549,7 +550,6 @@
 
     let currentDetails = null;
     let isDraggingTimeline = false;
-    let idleTimeout = null;
     let timelinePrefix = null;
     let timelineCount = 0;
     let spriteBoard = null;
@@ -588,7 +588,6 @@
       ctrlPlayBtn.setAttribute('aria-pressed', 'false');
       centerPlayOverlay.style.display = 'flex';
       controlsBar.classList.remove('idle');
-      clearTimeout(idleTimeout);
     });
 
     centerPlayOverlay.addEventListener('click', togglePlay);
@@ -662,17 +661,6 @@
       const timeText = formatTime(targetTime);
       if (timelineTimeText.innerText !== timeText) timelineTimeText.innerText = timeText;
 
-      if (timelinePrefix) {
-        const idx = Math.min(timelineCount, Math.max(1, Math.round(pos * (timelineCount - 1)) + 1));
-        const src = `${timelinePrefix}${idx}.jpg`;
-        if (timelinePreviewImg.src !== new URL(src, location.href).href) timelinePreviewImg.src = src;
-        timelinePreviewImg.style.display = 'block';
-        if (timelineSprite && window.ArchivebateYouTubeStoryboard) ArchivebateYouTubeStoryboard.clearFrame(timelineSprite);
-        timelinePreviewStatus.style.display = 'none';
-        previewVideo.style.display = 'none';
-        return;
-      }
-
       // 1. Archivebate gęsty segment: dokładna sekunda (błąd <= 1s, 0ms, 0 zapytań strumienia)
       const segment = window.ArchivebateYouTubeStoryboard?.getSegmentFromCache?.(videoId, duration, targetTime);
       if (segment && timelineSprite && window.ArchivebateYouTubeStoryboard) {
@@ -680,7 +668,12 @@
         previewVideo.style.display = 'none';
         timelinePreviewStatus.style.display = 'none';
         timelineTimeText.innerText = formatTime(targetTime);
-        window.ArchivebateYouTubeStoryboard.applyFrame(timelineSprite, segment, targetTime, { targetTime, duration });
+        const result = window.ArchivebateYouTubeStoryboard.applyFrame(timelineSprite, segment, targetTime, { targetTime, duration });
+        if (result?.isExact === false) {
+          timelineTimeText.innerText = `${formatTime(targetTime)} • klatka ${formatTime(result.frameTime)}`;
+          timelinePreviewStatus.textContent = 'Najbliższa dostępna klatka';
+          timelinePreviewStatus.style.display = 'block';
+        }
         return;
       }
 
@@ -691,12 +684,30 @@
           duration,
           targetTime,
           signal: timelineHoverController?.signal,
+          onStatus: phase => {
+            if (timelineTooltip.style.display === 'none') return;
+            timelinePreviewStatus.textContent = ArchivebateYouTubeStoryboard.previewStatusText(videoId, duration, targetTime);
+            timelinePreviewStatus.style.display = phase === 'ready' ? 'none' : 'block';
+          },
           onReady: () => {
             if (timelineTooltip.style.display !== 'none') {
               renderWatchTimelinePreview(previewClientX);
             }
           }
         });
+      }
+
+      if (timelinePrefix) {
+        const idx = Math.min(timelineCount, Math.max(1, Math.round(pos * (timelineCount - 1)) + 1));
+        const src = `${timelinePrefix}${idx}.jpg`;
+        if (timelinePreviewImg.src !== new URL(src, location.href).href) timelinePreviewImg.src = src;
+        timelinePreviewImg.style.display = 'block';
+        if (timelineSprite && window.ArchivebateYouTubeStoryboard) ArchivebateYouTubeStoryboard.clearFrame(timelineSprite);
+        timelinePreviewStatus.textContent = ArchivebateYouTubeStoryboard.previewStatusText(videoId, duration, targetTime);
+        timelinePreviewStatus.style.display = 'block';
+        timelineTimeText.innerText = `${formatTime(targetTime)} • podgląd przybliżony`;
+        previewVideo.style.display = 'none';
+        return;
       }
 
       // 2. Fallback: rzadki storyboard z informacją o przygotowywaniu dokładnego podglądu
@@ -706,13 +717,14 @@
         timelineTimeText.innerText = `${formatTime(targetTime)}${frameTimeStr}`;
         timelinePreviewImg.style.display = 'none';
         previewVideo.style.display = 'none';
-        timelinePreviewStatus.innerText = 'Przygotowywanie dokładnego podglądu...';
+        timelinePreviewStatus.innerText = ArchivebateYouTubeStoryboard.previewStatusText(videoId, duration, targetTime);
         timelinePreviewStatus.style.display = 'block';
         return;
       }
 
       if (timelineSprite && window.ArchivebateYouTubeStoryboard) ArchivebateYouTubeStoryboard.clearFrame(timelineSprite);
-      timelinePreviewStatus.style.display = 'none';
+      timelinePreviewStatus.textContent = ArchivebateYouTubeStoryboard.previewStatusText(videoId, duration, targetTime);
+      timelinePreviewStatus.style.display = 'block';
 
       if (previewVideo && previewVideo.src) {
         timelinePreviewImg.style.display = 'none';
@@ -728,7 +740,7 @@
         if (timelinePreviewImg.src !== new URL(fallback, location.href).href) timelinePreviewImg.src = fallback;
         timelinePreviewImg.style.display = 'block';
       }
-      timelinePreviewStatus.style.display = 'none';
+      timelinePreviewStatus.style.display = 'block';
     }
 
     function updateWatchTimelinePreview(e) {
@@ -880,20 +892,9 @@
       ctrlFullscreenBtn.setAttribute('aria-pressed', active ? 'true' : 'false');
     });
 
-    // Auto-hide controls on idle
-    function resetIdleTimer() {
-      controlsBar.classList.remove('idle');
-      clearTimeout(idleTimeout);
-      if (!player.paused) {
-        idleTimeout = setTimeout(() => {
-          controlsBar.classList.add('idle');
-        }, 2500);
-      }
-    }
-    playerBox.addEventListener('mousemove', resetIdleTimer);
-    playerBox.addEventListener('mouseleave', () => {
-      if (!player.paused) controlsBar.classList.add('idle');
-    });
+    // Keep controls visible while the pointer is over the timeline; hiding
+    // them would emit pointerleave and abort its pending preview request.
+    const resetIdleTimer = ArchivebatePlayerCore.setupIdleTimer(playerBox, controlsBar, player);
 
     // Pamięć podręczna filmów w profilu autora dla odtwarzacza watch.html
     const authorPlaylistsWatch = new Map();
@@ -1025,6 +1026,8 @@
     async function initWatch(options = {}) {
       const generation = ++watchGeneration;
       const forceRefresh = !!options?.forceRefresh;
+      let detailsResolved = false;
+      let streamFailed = false;
       loader.innerHTML = watchLoadingMarkup;
       loader.style.display = 'flex';
       ArchivebatePerf.setPlaybackBusy(true);
@@ -1097,6 +1100,8 @@
       };
       player.onerror = () => {
         if (generation !== watchGeneration) return;
+        streamFailed = true;
+        if (!detailsResolved) return;
         ArchivebatePerf.setPlaybackBusy(false);
         watchSession?.markError('watch_stream_error', 'Błąd strumienia wideo');
         loader.style.display = 'flex';
@@ -1134,8 +1139,12 @@
       }
 
       try {
-        const data = await ArchivebateAPI.getJSON(`/api/video/details?id=${encodeURIComponent(videoId)}${forceRefresh ? '&force_refresh=true' : ''}`, { timeoutMs: 12000, signal: controller.signal });
+        const detailsUrl = `/api/video/details?id=${encodeURIComponent(videoId)}`;
+        const data = forceRefresh
+          ? await ArchivebateAPI.refreshVideoDetails(videoId, { signal: controller.signal })
+          : await ArchivebateAPI.getJSON(detailsUrl, { timeoutMs: 12000, signal: controller.signal });
         if (generation !== watchGeneration) return;
+        detailsResolved = true;
         currentDetails = data;
         watchSession?.markUrlResolved(data.proxy_stream_url || data.direct_url, !forceRefresh);
 
@@ -1169,6 +1178,19 @@
 
         updateFavState(!!data.is_favorite);
 
+        if (window.ArchivebateVideoPrefetch?.detailsAreUnavailable(data)) {
+          player.onerror = null;
+          player.pause();
+          player.removeAttribute('src');
+          player.load();
+          ArchivebatePerf.setPlaybackBusy(false);
+          if (watchPoster) watchPoster.style.display = 'none';
+          loader.style.display = 'flex';
+          loader.textContent = 'Nagranie zostało usunięte ze źródła. Potwierdzam usunięcie przed ukryciem karty.';
+          void ArchivebateVideoPrefetch.confirmUnavailableVideo(videoId, data, controller.signal);
+          return;
+        }
+
         if (data.is_private) {
           ArchivebatePerf.setPlaybackBusy(false);
           player.pause();
@@ -1201,6 +1223,8 @@
           loader.replaceChildren(privateBox);
           return;
         }
+
+        if (streamFailed) player.onerror?.();
 
         // Zawsze używamy bezpiecznego lokalnego proxy strumienia MP4 bez reklam
         const streamUrl = (data.proxy_stream_url || data.direct_url)
@@ -1294,7 +1318,8 @@
 
       } catch (err) {
         if (generation !== watchGeneration || err?.code === 'cancelled') return;
-        if (forceRefresh) player.onerror();
+        detailsResolved = true;
+        if (streamFailed || forceRefresh) player.onerror();
       }
     }
 

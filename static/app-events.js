@@ -102,6 +102,7 @@
   // DELEGOWANA OBSŁUGA ZDARZEŃ SIATKI WIDEO (BŁYSKAWICZNY DOM)
   // ============================================================
   function handleGridClick(e) {
+    if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
     const card = e.target.closest('.video-card');
     if (!card) return;
 
@@ -171,6 +172,7 @@
   }
 
   function handleGridAuxClick(e) {
+    if (e.target.closest('a[href]')) return; // Native links support tabs and context menus.
     if (e.button !== 1) return; // tylko środkowy przycisk myszy
     const card = e.target.closest('.video-card');
     if (!card) return;
@@ -198,6 +200,10 @@
   }
 
   function setupEvents() {
+    if (dom.refreshCatalogBtn) {
+      dom.refreshCatalogBtn.addEventListener('click', () => g.ArchivebateVideoViews?.refreshCatalog?.());
+    }
+
     // Checkpoint navigators
     if (dom.headerCheckpointBtn) dom.headerCheckpointBtn.addEventListener('click', navigateToCheckpoint);
     if (dom.navCheckpointBtn) dom.navCheckpointBtn.addEventListener('click', navigateToCheckpoint);
@@ -220,13 +226,23 @@
     // Nawigacja zakładek
     if (dom.navHomeBtn) {
       dom.navHomeBtn.addEventListener('click', () => {
+        state.profileDirectory = false;
         setActiveNavTab(dom.navHomeBtn);
+        loadHomeVideos(1);
+      });
+    }
+
+    if (dom.navProfilesBtn) {
+      dom.navProfilesBtn.addEventListener('click', () => {
+        state.profileDirectory = true;
+        setActiveNavTab(dom.navProfilesBtn);
         loadHomeVideos(1);
       });
     }
 
     if (dom.navFavoritesBtn) {
       dom.navFavoritesBtn.addEventListener('click', () => {
+        state.profileDirectory = false;
         setActiveNavTab(dom.navFavoritesBtn);
         loadFavorites(1);
       });

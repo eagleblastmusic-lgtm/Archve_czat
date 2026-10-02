@@ -39,6 +39,7 @@
     const activeSrc = String(img.getAttribute?.('src') || '').trim();
     if (activeSrc) return false;
 
+    img.loading = 'eager';
     img.src = src;
     delete img.dataset.src;
     stats.promoted += 1;

@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+from urllib.parse import urlencode
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -157,6 +158,7 @@ class CatalogService:
         self._reader_guard = threading.Condition(threading.RLock())
         self._reader_connections: Dict[int, sqlite3.Connection] = {}
         self._active_readers = 0
+        self._last_checkpoint_result = None
         self._closing = False
         self._conn: Optional[sqlite3.Connection] = None
         self._indexing_thread: Optional[threading.Thread] = None
@@ -314,6 +316,14 @@ class CatalogService:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_rev_src_order ON catalog_items(revision, source, published_at DESC, canonical_key ASC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_rev_author ON catalog_items(revision, author_clean, published_at DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cat_rev_id ON catalog_items(revision, video_id)")
+            # Cover the grouped filtered-count/member path.  The existing
+            # author-order index still serves leader ordering; this narrower
+            # identity projection avoids table lookups for author/source/id
+            # filters and keeps source-scoped favorite exclusion exact.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cat_rev_author_source_id "
+                "ON catalog_items(revision, author_clean, source, video_id)"
+            )
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS catalog_meta (
                     key TEXT PRIMARY KEY,
@@ -518,6 +528,27 @@ class CatalogService:
     def is_shutting_down(self) -> bool:
         with self._reader_guard:
             return bool(self._closing)
+
+    def operational_diagnostics(self) -> Dict[str, Any]:
+        """Return read-only SQLite/WAL observations without triggering a checkpoint."""
+        with self._reader_guard:
+            active_readers = int(self._active_readers)
+        wal_bytes = None
+        if str(self.db_path) != ":memory:":
+            try:
+                wal_bytes = Path(str(self.db_path) + "-wal").stat().st_size
+            except FileNotFoundError:
+                wal_bytes = 0
+            except OSError:
+                wal_bytes = None
+        checkpoint = dict(self._last_checkpoint_result) if self._last_checkpoint_result else None
+        return {
+            "sqlite_version": sqlite3.sqlite_version,
+            "file_backed": str(self.db_path) != ":memory:",
+            "wal_bytes": wal_bytes,
+            "active_readers": active_readers,
+            "last_passive_checkpoint": checkpoint,
+        }
 
     @staticmethod
     def _select_revision_from_conn(conn: sqlite3.Connection) -> Optional[int]:
@@ -778,7 +809,15 @@ class CatalogService:
                 # Reclaim WAL sidecar pages without the cost/risk of VACUUM on
                 # every refresh. Freed DB pages remain reusable by SQLite.
                 try:
-                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                    checkpoint_row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                    if checkpoint_row is not None:
+                        self._last_checkpoint_result = {
+                            "mode": "PASSIVE",
+                            "at": time.time(),
+                            "busy": int(checkpoint_row[0]),
+                            "log_frames": int(checkpoint_row[1]),
+                            "checkpointed_frames": int(checkpoint_row[2]),
+                        }
                 except sqlite3.OperationalError:
                     pass
                 return True
@@ -1115,7 +1154,8 @@ class CatalogService:
                         members = member_map.get(author_clean, [dict(v)]) if g_cnt <= GROUP_MEMBER_INLINE_LIMIT else []
                         v["grouped_videos"] = members
                         v["group_members_lazy"] = g_cnt > GROUP_MEMBER_INLINE_LIMIT
-                        v["group_members_url"] = f"/api/catalog/groups/{author_clean}/members" if g_cnt > GROUP_MEMBER_INLINE_LIMIT else None
+                        member_scope = urlencode({"source": source, "revision": rev, "author_filter": author_filter})
+                        v["group_members_url"] = f"/api/catalog/groups/{author_clean}/members?{member_scope}" if g_cnt > GROUP_MEMBER_INLINE_LIMIT else None
                     else:
                         v["is_grouped"] = False
                         v["group_count"] = 1
@@ -1186,7 +1226,10 @@ class CatalogService:
         page_size: Optional[int] = None,
         source: str = "all",
         revision: Optional[int] = None,
+        author_filter: str = "all",
         blocked_models: Optional[List[str]] = None,
+        favorite_authors: Optional[List[str]] = None,
+        favorite_ids: Optional[List[Any]] = None,
         enrich_fn: Optional[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
     ) -> Dict[str, Any]:
         """Lazy, bounded member page for a group summary."""
@@ -1211,6 +1254,36 @@ class CatalogService:
                 placeholders = ",".join("?" for _ in clean_blocked)
                 clauses.append(f"author_clean NOT IN ({placeholders})")
                 params.extend(clean_blocked)
+            clean_fav = [re.sub(r"[^a-z0-9]", "", str(value or "").lower()) for value in (favorite_authors or [])]
+            clean_fav = [value for value in clean_fav if value]
+            favorite_keys = _normalize_favorite_keys(favorite_ids)
+            if author_filter == "exclude_fav":
+                filters = []
+                if clean_fav:
+                    placeholders = ",".join("?" for _ in clean_fav)
+                    filters.append(f"author_clean NOT IN ({placeholders})")
+                    params.extend(clean_fav)
+                by_source: Dict[str, List[str]] = {}
+                for key in favorite_keys:
+                    by_source.setdefault(key.source, []).append(key.provider_id)
+                for fav_source, ids in by_source.items():
+                    placeholders = ",".join("?" for _ in ids)
+                    filters.append(f"(source != ? OR video_id NOT IN ({placeholders}))")
+                    params.extend([fav_source, *ids])
+                if filters:
+                    clauses.append(" AND ".join(filters))
+            elif author_filter == "only_fav":
+                filters = []
+                if clean_fav:
+                    placeholders = ",".join("?" for _ in clean_fav)
+                    filters.append(f"author_clean IN ({placeholders})")
+                    params.extend(clean_fav)
+                if favorite_keys:
+                    marks = ",".join("(?, ?)" for _ in favorite_keys)
+                    filters.append(f"(source, video_id) IN (VALUES {marks})")
+                    for key in favorite_keys:
+                        params.extend([key.source, key.provider_id])
+                clauses.append(f"({' OR '.join(filters)})" if filters else "1 = 0")
             where = " AND ".join(clauses)
             total = int(conn.execute(f"SELECT COUNT(*) AS cnt FROM catalog_items WHERE {where}", params).fetchone()["cnt"] or 0)
             rows = conn.execute(

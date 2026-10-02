@@ -194,7 +194,10 @@ class _PublishedRevisionFixture:
 
 fixture_service = _PublishedRevisionFixture()
 with patch.object(catalog_mod, "catalog_service", fixture_service):
-    response = main.progressive_feed_stream(snapshot_id="1", page=1, revision=1)
+    response = main.progressive_feed_stream(
+        snapshot_id="1", page=1, revision=1,
+        preferences_version=main.storage.preferences_version,
+    )
 
     async def _first_stream_item():
         async for item in response.body_iterator:

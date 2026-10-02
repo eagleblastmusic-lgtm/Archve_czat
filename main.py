@@ -3,7 +3,9 @@ import re
 import json
 import math
 import hashlib
+import copy
 import secrets
+import sqlite3
 import requests
 import threading
 import asyncio
@@ -275,6 +277,26 @@ app.add_middleware(
 )
 
 
+LOCAL_CONTENT_SECURITY_POLICY = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+    "font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data: blob: https:; "
+    "media-src 'self' blob: https:; connect-src 'self' https:; object-src 'none'; "
+    "base-uri 'none'; frame-ancestors 'none'"
+)
+
+
+def _trusted_html_csp(html: str) -> str:
+    """Authorize exact inline scripts in our static HTML, never arbitrary inline JS.
+
+    Runtime transformations must call this again on the final response body.
+    This function must not be used to authorize user-supplied HTML.
+    """
+    import base64
+    hashes = ["'sha256-" + base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii") + "'"
+              for script in re.findall(r"<script\s*>(.*?)</script\s*>", html, re.S | re.I) if script.strip()]
+    return LOCAL_CONTENT_SECURITY_POLICY.replace("script-src 'self'", "script-src 'self'" + (" " + " ".join(hashes) if hashes else ""))
+
+
 @app.middleware("http")
 async def local_security_gate(request: Request, call_next):
     """Reject foreign Host on every request; protect state changes with Origin + token."""
@@ -301,10 +323,7 @@ async def local_security_gate(request: Request, call_next):
     response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
     response.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
-        "font-src 'self' https://cdnjs.cloudflare.com; img-src 'self' data: blob: https:; "
-        "media-src 'self' blob: https:; connect-src 'self' https:; object-src 'none'; "
-        "base-uri 'none'; frame-ancestors 'none'",
+        LOCAL_CONTENT_SECURITY_POLICY,
     )
     return response
 
@@ -350,7 +369,7 @@ def _versioned_html(path):
     html=re.sub(r'/static/([a-zA-Z0-9_.-]+\.(?:js|css))(?:\?v=[^"\s>]+)?',version,html)
     token_meta = f'<meta name="archivebate-mutation-token" content="{html_escape(LOCAL_MUTATION_TOKEN, quote=True)}">'
     html = html.replace("</head>", f"{token_meta}</head>", 1)
-    return HTMLResponse(html,headers={'Cache-Control':'no-cache'})
+    return HTMLResponse(html,headers={'Cache-Control':'no-cache', 'Content-Security-Policy': _trusted_html_csp(html)})
 
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -677,7 +696,7 @@ def get_thumbnail_proxy(url: str = Query(...)):
             return Response(content,media_type=kind,headers={**headers,"X-Cache":"NET"})
         except Exception:
             with MEMORY_CACHE_LOCK:
-                _thumb_failures[key]=time.monotonic()+20
+                _thumb_failures[key]=time.monotonic()+1
                 while len(_thumb_failures)>1000: _thumb_failures.popitem(last=False)
             return Response(status_code=502,headers={"Cache-Control":"no-store"})
         finally:
@@ -1321,8 +1340,11 @@ def progressive_feed(
     force_refresh: bool = False,
     revision: Optional[int] = None,
     initial_items: Optional[int] = Query(None, ge=1, le=32),
+    preferences_version: Optional[int] = Query(None),
 ):
     from catalog_service import catalog_service
+    if preferences_version is not None and preferences_version != storage.preferences_version:
+        raise HTTPException(409, "Preferencje zmieniły się. Odśwież widok.")
     revision = _coerce_optional_revision(revision)
     initial_limit = _coerce_optional_revision(initial_items)
     if initial_limit is not None:
@@ -1360,11 +1382,18 @@ def progressive_feed(
             enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0"),
             item_limit=initial_limit,
         )
+        if preferences_version is not None and preferences_version != storage.preferences_version:
+            raise HTTPException(409, "Preferencje zmieniły się podczas odczytu. Odśwież widok.")
+        result["preferences_version"] = storage.preferences_version
         result["refresh_revision"] = refresh_revision
         result["refresh_pending"] = bool(refresh_revision and refresh_revision != result.get("catalog_revision"))
         return result
 
-    return _feed_snapshot(source, author_filter, group_authors, snapshot_id, force_refresh).read(page)
+    result = _feed_snapshot(source, author_filter, group_authors, snapshot_id, force_refresh).read(page)
+    if preferences_version is not None and preferences_version != storage.preferences_version:
+        raise HTTPException(409, "Preferencje zmieniły się podczas odczytu. Odśwież widok.")
+    result["preferences_version"] = storage.preferences_version
+    return result
 
 
 @app.post("/api/catalog/refresh")
@@ -1388,8 +1417,12 @@ def get_catalog_group_members(
     per_page: int = Query(50, ge=1, le=200),
     source: str = Query("all"),
     revision: Optional[int] = Query(None),
+    author_filter: str = Query("all"),
+    preferences_version: Optional[int] = Query(None),
 ):
     from catalog_service import catalog_service
+    if preferences_version is not None and preferences_version != storage.preferences_version:
+        raise HTTPException(409, "Preferencje zmieniły się. Odśwież widok grupy.")
     rev = _coerce_optional_revision(revision)
     result = catalog_service.query_group_members(
         author_key,
@@ -1397,7 +1430,10 @@ def get_catalog_group_members(
         page_size=per_page,
         source=source,
         revision=rev,
+        author_filter=author_filter,
         blocked_models=storage.get_blocked_models(),
+        favorite_authors=storage.get_favorite_authors(),
+        favorite_ids=storage.get_favorite_keys(),
         enrich_fn=lambda items: _enrich_videos(items, source=source),
     )
     return result
@@ -1431,13 +1467,19 @@ def progressive_feed_stream(
     source: str = "all",
     author_filter: str = "all",
     group_authors: str = "0",
-    revision: Optional[int] = None
+    revision: Optional[int] = None,
+    preferences_version: Optional[int] = Query(None),
 ):
     from catalog_service import catalog_service
+    if preferences_version is not None and preferences_version != storage.preferences_version:
+        raise HTTPException(409, "Preferencje zmieniły się. Odśwież widok.")
     revision = _coerce_optional_revision(revision)
     rev_to_check = revision if revision is not None else (int(snapshot_id) if str(snapshot_id).isdigit() else catalog_service.get_active_revision())
     if rev_to_check is not None and catalog_service.is_revision_complete(rev_to_check):
         async def direct_events():
+            if preferences_version is not None and preferences_version != storage.preferences_version:
+                yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+                return
             is_grouped = group_authors in (True, "1", "true", "True")
             data = await asyncio.to_thread(
                 catalog_service.query_page,
@@ -1452,6 +1494,9 @@ def progressive_feed_stream(
                 favorite_ids=storage.get_favorite_keys(),
                 enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0")
             )
+            if preferences_version is not None and preferences_version != storage.preferences_version:
+                yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+                return
             data["type"] = "complete"
             yield f"data: {json.dumps(data)}\n\n"
         return StreamingResponse(direct_events(), media_type="text/event-stream", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
@@ -1466,6 +1511,9 @@ def progressive_feed_stream(
             idle_since = None
             current_rev = rev_to_check
             while time.monotonic() < deadline:
+                if preferences_version is not None and preferences_version != storage.preferences_version:
+                    yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+                    return
                 # A partial revision may have been the best local snapshot when
                 # the request started. Once a newer revision is atomically
                 # published, follow it instead of keeping the stream pinned to
@@ -1491,6 +1539,9 @@ def progressive_feed_stream(
                     favorite_ids=storage.get_favorite_keys(),
                     enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0"),
                 )
+                if preferences_version is not None and preferences_version != storage.preferences_version:
+                    yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+                    return
                 progress = data.get("indexing_progress") or {}
                 signature = (
                     data.get("catalog_revision"),
@@ -1535,6 +1586,9 @@ def progressive_feed_stream(
         deadline = time.monotonic()+120
         try:
             while time.monotonic()<deadline:
+                if preferences_version is not None and preferences_version != storage.preferences_version:
+                    yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+                    return
                 data = await asyncio.to_thread(snapshot.read, page)
                 if data["revision"] != previous:
                     previous = data["revision"]
@@ -1553,8 +1607,15 @@ def progressive_feed_stream(
 
 
 @app.get("/api/model/{username}")
-def get_model_videos(username: str, page: int = Query(1, ge=1)):
+def get_model_videos(username: str, page: int = Query(1, ge=1), cached_only: bool = Query(False)):
     """Pobiera filmy konkretnej modelki dla określonej strony."""
+    if cached_only is True:
+        from catalog_service import catalog_service
+        cached = catalog_service.query_group_members(
+            username, page=page, page_size=200, blocked_models=storage.get_blocked_models(),
+        )
+        return {"username": username, "page": page, "videos": _enrich_videos(cached.get("items", [])),
+                "cached_only": True, "count": cached.get("count", 0)}
     videos = scraper.get_model_videos(username=username, page=page)
     return {
         "username": username,
@@ -1606,6 +1667,22 @@ _details_refresh_lock = threading.Lock()
 _details_refreshing = set()
 _details_fetch_guard = threading.Lock()
 _details_fetch_locks = {}
+_DETAILS_FETCH_OUTCOMES_LOCK = threading.Lock()
+_DETAILS_FETCH_OUTCOMES = {}
+_DETAILS_FETCH_OUTCOME_LIMIT = 1024
+
+
+def _remember_details_fetch_outcome(video_id: str, started_at: float, details: dict, error: str = "") -> None:
+    with _DETAILS_FETCH_OUTCOMES_LOCK:
+        _DETAILS_FETCH_OUTCOMES[video_id] = {
+            "started_at": started_at,
+            "completed_at": time.monotonic(),
+            "details": copy.deepcopy(details or {}),
+            "error": error,
+        }
+        if len(_DETAILS_FETCH_OUTCOMES) > _DETAILS_FETCH_OUTCOME_LIMIT:
+            oldest = min(_DETAILS_FETCH_OUTCOMES, key=lambda key: _DETAILS_FETCH_OUTCOMES[key]["completed_at"])
+            _DETAILS_FETCH_OUTCOMES.pop(oldest, None)
 
 def _details_fetch_lock(video_id: str):
     key = safe_cache_key(video_id)
@@ -1682,14 +1759,49 @@ def _read_video_caches(video_id: str):
 
 def _normalize_video_details(video_id: str, details: dict) -> dict:
     details = dict(details or {})
+    has_provider_result = bool(details)
     if not details.get("preview_video") and details.get("thumbnail"):
         thumb = details["thumbnail"]
         details["preview_video"] = thumb.replace(".jpg", ".mp4") if ".jpg" in thumb else thumb
     vid_key = details.get("id") or _resolve_clean_video_id(video_id)
     details["id"] = vid_key
+    details.setdefault("source", "camwhores" if str(vid_key).startswith("cw_") else "archivebate")
     # Proxy po ID pozostaje stabilny nawet gdy zewnętrzny direct_url wygaśnie.
-    available = bool(details.get("direct_url")) and not details.get("is_private")
-    details["availability"] = "private" if details.get("is_private") else ("available" if available else "unavailable")
+    has_direct = bool(details.get("direct_url"))
+    supplied_availability = str(details.get("availability") or "").lower()
+    try:
+        checked_at = float(details.get("checked_at") or 0)
+    except (TypeError, ValueError):
+        checked_at = 0
+    confirmed_missing = (
+        supplied_availability == "unavailable"
+        and details.get("availability_reason") in {"source_page_not_found", "embed_file_not_found", "stream_file_not_found"}
+        and details.get("retryable") is False
+        and checked_at > 0
+        and (details.get("availability_reason") != "stream_file_not_found" or details.get("stream_missing_confirmations") == 2)
+    )
+    if details.get("is_private") or supplied_availability == "private":
+        availability = "private"
+    elif has_direct:
+        availability = "available"
+    elif confirmed_missing:
+        availability = "unavailable"
+    else:
+        # Old cache documents and empty/partial resolver results carry no
+        # reliable evidence that the source permanently removed the video.
+        availability = "unknown"
+        if supplied_availability == "unavailable":
+            details["availability_reason"] = "unverified_legacy_unavailable"
+    details["availability"] = availability
+    details.setdefault("availability_reason", {
+        "available": "direct_stream",
+        "private": "private_marker",
+        "unavailable": "source_page_not_found",
+        "unknown": "no_direct_stream" if has_provider_result else "legacy_cache_unverified",
+    }[availability])
+    details.setdefault("checked_at", None)
+    details.setdefault("retryable", availability in ("unknown", "private"))
+    available = availability == "available"
     details["proxy_stream_url"] = f"/api/video/stream?id={vid_key}" if vid_key and available else ""
     details["is_favorite"] = storage.is_favorite(video_id)
 
@@ -1820,10 +1932,50 @@ def _clear_no_stream(clean_id: str):
 
 
 def _fetch_and_cache_details(video_id: str) -> dict:
+    previous, _, _ = _read_video_caches(video_id)
     details = dict(scraper.get_video_details(video_id) or {})
+    fetched_at = time.time()
+    if not details:
+        details = {
+            "id": _resolve_clean_video_id(video_id),
+            "availability": "unknown",
+            "availability_reason": "empty_resolver_result",
+            "checked_at": fetched_at,
+            "retryable": True,
+        }
+
+    # Keep useful metadata after transient/provider parser failures, while
+    # taking availability and stream evidence only from this resolver attempt.
+    direct_url = details.get("direct_url") or ""
+    current_metadata = dict(details)
+    if isinstance(previous, dict) and previous:
+        preserved = {key: value for key, value in previous.items()
+                     if key not in {
+                         "direct_url", "direct_url_fetched_at", "proxy_stream_url",
+                         "availability", "availability_reason", "checked_at", "retryable", "is_private",
+                     }
+                     and value not in (None, "", [], {})}
+        preserved.update({key: value for key, value in current_metadata.items()
+                          if value not in (None, "", [], {}) or key in {
+                              "availability", "availability_reason", "checked_at", "retryable", "is_private"
+                          }})
+        details = preserved
+    if direct_url:
+        details["direct_url"] = direct_url
+    else:
+        details.pop("direct_url", None)
+    details["checked_at"] = details.get("checked_at") or fetched_at
+    if details.get("availability") not in {"available", "private", "unavailable", "unknown"}:
+        details["availability"] = "available" if direct_url else ("private" if details.get("is_private") else "unknown")
+    if not direct_url and details.get("availability") == "available":
+        details["availability"] = "unknown"
+        details["availability_reason"] = "no_direct_stream"
+        details["retryable"] = True
+    if not direct_url and details.get("availability") == "unavailable" and details.get("availability_reason") not in {"source_page_not_found", "embed_file_not_found", "stream_file_not_found"}:
+        details["availability"] = "unknown"
+        details["availability_reason"] = "unverified_unavailable"
+        details["retryable"] = True
     if details:
-        fetched_at = time.time()
-        direct_url = details.get("direct_url")
         stream_payload = {
             "id": _resolve_clean_video_id(video_id),
             "direct_url": direct_url,
@@ -1855,11 +2007,20 @@ def _fetch_and_cache_details(video_id: str) -> dict:
 
 def _fetch_details_singleflight(video_id: str, force=False, rejected_url=None) -> dict:
     video_id = _resolve_clean_video_id(video_id)
-    requested_at = time.time()
+    requested_at = time.monotonic()
     with _details_fetch_lock(video_id):
+        with _DETAILS_FETCH_OUTCOMES_LOCK:
+            outcome = _DETAILS_FETCH_OUTCOMES.get(video_id)
+            shared_outcome = copy.deepcopy(outcome) if outcome and outcome["completed_at"] >= requested_at else None
+        if shared_outcome is not None:
+            shared_details = shared_outcome.get("details") or {}
+            if not rejected_url or shared_details.get("direct_url") != rejected_url:
+                return shared_details
+
         if _has_recent_refresh_failure(video_id) and rejected_url:
             cached, _, _ = _read_video_caches(video_id)
-            return cached if isinstance(cached, dict) else {}
+            if isinstance(cached, dict) and cached.get("direct_url") != rejected_url:
+                return cached
         cached, metadata_mtime, stream_mtime = _read_video_caches(video_id)
         if isinstance(cached, dict):
             metadata_fresh = cache_age_seconds(metadata_mtime) <= DETAILS_CACHE_STALE_SECONDS
@@ -1867,11 +2028,11 @@ def _fetch_details_singleflight(video_id: str, force=False, rejected_url=None) -
             stream_fresh = bool(cached.get("direct_url")) and cache_age_seconds(direct_fetched_at) <= STREAM_URL_FRESH_SECONDS
             if rejected_url and cached.get("direct_url") != rejected_url:
                 return cached
-            if metadata_fresh and stream_fresh and not force:
+            if metadata_fresh and stream_fresh and not force and not rejected_url:
                 return cached
             # A metadata-only cache is still useful for a short period, but a
             # missing/stale stream URL must be resolved before playback.
-            if metadata_fresh and not cached.get("direct_url") and not force and cache_age_seconds(metadata_mtime) <= DETAILS_CACHE_FRESH_SECONDS:
+            if metadata_fresh and not cached.get("direct_url") and not force and not rejected_url and cache_age_seconds(metadata_mtime) <= DETAILS_CACHE_FRESH_SECONDS and _has_recent_no_stream(video_id):
                 return cached
         if force:
             if video_id.startswith("cw_"):
@@ -1880,10 +2041,23 @@ def _fetch_details_singleflight(video_id: str, force=False, rejected_url=None) -
                 scraper._details_cache.pop(video_id, None)
             if rejected_url:
                 invalidate_cached_redirect(rejected_url)
-        fresh = _fetch_and_cache_details(video_id)
+        resolver_started_at = time.monotonic()
+        try:
+            fresh = _fetch_and_cache_details(video_id)
+        except Exception as exc:
+            fresh = {
+                "id": video_id,
+                "availability": "unknown",
+                "availability_reason": "resolver_error",
+                "checked_at": time.time(),
+                "retryable": True,
+            }
+            _remember_details_fetch_outcome(video_id, resolver_started_at, fresh, type(exc).__name__)
+            return fresh
         if rejected_url and fresh and fresh.get("direct_url") == rejected_url:
             _record_refresh_failure(video_id, "Identical rejected URL")
             invalidate_cached_redirect(rejected_url)
+        _remember_details_fetch_outcome(video_id, resolver_started_at, fresh)
         return fresh
 
 
@@ -1942,6 +2116,20 @@ stream_session.headers.update({"Connection": "keep-alive"})
 STREAM_CONNECT_TIMEOUT = 3.5
 STREAM_READ_TIMEOUT = 12.0
 
+
+def _remember_missing_stream(video_id: str, details: dict) -> None:
+    missing = dict(details or {})
+    for field in ("direct_url", "direct_url_fetched_at", "proxy_stream_url"):
+        missing.pop(field, None)
+    missing.update(id=video_id, availability="unavailable", availability_reason="stream_file_not_found",
+                   retryable=False, checked_at=time.time(), stream_missing_confirmations=2)
+    atomic_write_json(_details_cache_path(video_id), missing)
+    try:
+        os.remove(_stream_cache_path(video_id))
+    except OSError:
+        pass
+    _record_no_stream(video_id)
+
 @app.post("/api/playback/status")
 async def update_playback_status(request: Request):
     """Informuje backend o aktywnym odtwarzaczu i stanie bufora (Pakiet C, punkt 6)."""
@@ -1973,6 +2161,7 @@ def stream_video_proxy(
     odświeżaniem na 403 i ConnectionError oraz ochroną przed lawinowymi zapytaniami (Pakiet C)."""
     clean_id = _resolve_clean_video_id(id) if id else None
     embed_url = embed
+    details = None
 
     # Aktywność odtwarzacza wstrzymuje ciężkie prace w tle (Pakiet C, punkt 6)
     if owner == "player":
@@ -2009,6 +2198,8 @@ def stream_video_proxy(
         embed_url = scraper._details_cache[clean_id]["data"].get("embed_url")
 
     if not url:
+        if details and _normalize_video_details(clean_id, details).get("availability") == "unavailable":
+            raise HTTPException(status_code=410, detail="Nagranie zostało usunięte ze źródła")
         raise HTTPException(status_code=400, detail="Brak URL lub ID wideo do odtworzenia")
     if not is_safe_remote_url(url):
         raise HTTPException(status_code=400, detail="Niedozwolony adres strumienia")
@@ -2095,6 +2286,7 @@ def stream_video_proxy(
 
         # Jeśli kod HTTP to 401, 403, 404, 410 (wygaśnięcie linku lub błąd autoryzacji)
         if req.status_code in (401, 403, 404, 410) and clean_id and not attempted_refresh and not _has_recent_refresh_failure(clean_id):
+            first_missing = req.status_code in (404, 410)
             req.close()
             attempted_refresh = True
             try:
@@ -2104,7 +2296,12 @@ def stream_video_proxy(
                 raise HTTPException(status_code=502, detail="Odświeżenie adresu wideo nie powiodło się")
 
             new_url = fresh_details.get("direct_url") if isinstance(fresh_details, dict) else None
-            if not new_url or new_url == url:
+            if not new_url:
+                if _normalize_video_details(clean_id, fresh_details).get("availability") == "unavailable":
+                    raise HTTPException(status_code=410, detail="Nagranie zostało usunięte ze źródła")
+                _record_refresh_failure(clean_id, "Missing URL")
+                raise HTTPException(status_code=502, detail="Nie udało się odświeżyć adresu wideo")
+            if new_url == url and not first_missing:
                 _record_refresh_failure(clean_id, "Identical or missing URL")
                 raise HTTPException(status_code=502, detail="Zdalny serwer wideo zwrócił błąd autoryzacji (nowy adres jest identyczny)")
 
@@ -2118,6 +2315,11 @@ def stream_video_proxy(
             except Exception as retry_err:
                 _record_refresh_failure(clean_id, type(retry_err).__name__)
                 raise HTTPException(status_code=502, detail=f"Nowy adres wideo jest niedostępny: {type(retry_err).__name__}")
+
+            if first_missing and req.status_code in (404, 410):
+                req.close()
+                _remember_missing_stream(clean_id, fresh_details)
+                raise HTTPException(status_code=410, detail="Plik filmu jest niedostępny również po odświeżeniu adresu")
 
         if req.status_code not in (200, 206, 416):
             code = req.status_code
@@ -2136,9 +2338,16 @@ def stream_video_proxy(
         if "Content-Length" in req.headers:
             response_headers["Content-Length"] = req.headers["Content-Length"]
 
+        if request is not None and request.method == "HEAD":
+            req.close()
+            kind = str(response_headers["Content-Type"]).split(";")[0].lower()
+            if req.status_code not in (200, 206) or not (kind.startswith("video/") or kind == "application/octet-stream"):
+                raise HTTPException(status_code=502, detail="Nie potwierdzono pliku wideo")
+            return Response(status_code=req.status_code, headers=response_headers)
+
         def iterfile():
             try:
-                for chunk in req.iter_content(chunk_size=1024 * 64):
+                for chunk in req.iter_content(chunk_size=1024 * 256):
                     if chunk:
                         yield chunk
             except Exception as exc:
@@ -2156,6 +2365,28 @@ def stream_video_proxy(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Błąd strumieniowania wideo: {type(e).__name__}")
+
+
+@app.post("/api/video/availability")
+def check_video_availability(id: str = Query(..., min_length=1, max_length=200), force: bool = Query(False)):
+    """Probe headers of visible candidates, using the same resolver and retry budget as playback."""
+    clean_id = _resolve_clean_video_id(id)
+    if force is True:
+        _clear_refresh_failure(clean_id)
+        _clear_no_stream(clean_id)
+        _fetch_details_singleflight(clean_id, force=True)
+    probe = Request({"type": "http", "method": "HEAD", "headers": [(b"range", b"bytes=0-0")]})
+    try:
+        stream_video_proxy(id=clean_id, url=None, embed=None, owner="availability", priority="low",
+                           reason="visible_card", request=probe)
+    except HTTPException as exc:
+        if exc.status_code == 410:
+            cached, _, _ = _read_video_caches(clean_id)
+            return _normalize_video_details(clean_id, cached)
+        return {"id": clean_id, "availability": "unknown", "availability_reason": "probe_error",
+                "checked_at": time.time(), "retryable": True}
+    cached, _, _ = _read_video_caches(clean_id)
+    return _normalize_video_details(clean_id, cached)
 
 
 @app.post("/api/storyboard/demand")
@@ -2233,10 +2464,12 @@ def storyboard_segment_status_or_start(
     """Dense timeline segment: pobiera lub generuje sprite JPG dla wybranego segmentu osi czasu."""
     clean_id = _resolve_clean_video_id(id)
     cached_seg = get_segment_status(clean_id, duration, segment)
-    if not force and cached_seg.get("status") == "ready" and (request is None or request.method == "GET"):
+    if not force and cached_seg.get("status") == "ready":
         cached_seg["sprite_url"] = f"/api/storyboard/segment/image?id={requests.utils.quote(clean_id)}&segment={segment}&v={cached_seg.get('created_at', 0)}"
         return cached_seg
     if request is not None and request.method == "GET":
+        return cached_seg
+    if not force and cached_seg.get("status") == "building":
         return cached_seg
 
     base = str(request.base_url if request else "http://127.0.0.1:8000/").rstrip("/")
@@ -2501,7 +2734,11 @@ async def get_diagnostics():
         configured_port = None
     return {
         "status": "ok" if health.get("status") == "ready" else health.get("status", "unknown"),
-        "build": {"git_head": _git_head_fingerprint(), "python": os.sys.version.split()[0]},
+        "build": {
+            "git_head": _git_head_fingerprint(),
+            "python": os.sys.version.split()[0],
+            "sqlite": sqlite3.sqlite_version,
+        },
         "runtime": {
             "code_root": os.path.abspath(os.path.dirname(__file__)),
             "data_root": os.path.abspath(os.path.join(os.path.dirname(__file__), "data")),
@@ -2512,6 +2749,7 @@ async def get_diagnostics():
         "catalog": _redact_diagnostic_value({
             "active_revision": catalog_service.get_active_revision(),
             "indexing": getattr(catalog_service, "_indexing_progress", {}),
+            "sqlite": catalog_service.operational_diagnostics(),
         }),
         "jobs": _redact_diagnostic_value({
             "quick_scan": quick_scan_supervisor.status(),

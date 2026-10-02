@@ -2,15 +2,14 @@
   'use strict';
 
   // V4.5.2 modal timeline coordinator.
-  // Pointer motion renders only local cache/coarse/poster. One exact target is
-  // retained and may enter the exact client only after 260 ms of real pointer
-  // idle and a fresh playback-health check.
+  // Pointer motion presents local frames immediately. The shared storyboard
+  // client owns the single intent delay, segment reuse and live QoS gate.
   const PREWARM_DELAY_MS = 1800;
   const PREWARM_BUFFER_SECONDS = 5.0;
   const INTERACTIVE_BUFFER_SECONDS = 3.0;
   const EXACT_MIN_BUFFER_SECONDS = 3.0;
   const LOW_BUFFER_CANCEL_SECONDS = 2.0;
-  const EXACT_IDLE_MS = 260;
+  const EXACT_IDLE_MS = globalThis.ArchivebateYouTubeStoryboard?.HOVER_INTENT_MS || 140;
   const EXACT_RECHECK_MS = 180;
   const RETRY_AFTER_HOVER_MS = 2200;
   const STATUS_WAIT_MS = 1200;
@@ -27,6 +26,7 @@
   let prewarmTimer = null;
   let exactIdleTimer = null;
   let idleExact = null;
+  let exactSuspended = false;
   let lowBufferVideoId = '';
   let lastFrameIdentity = '';
   let renderLatestBoard = null;
@@ -342,7 +342,9 @@
         while ((data.status !== 'ready' || !data.sprite_url) && now() < deadline) {
           if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
           if (data.status === 'error') throw new Error(data.error || 'QUICK build error');
+          const pollStarted = now();
           data = await fetchQuickStatus(videoId, duration, controller.signal, STATUS_WAIT_MS);
+          if (data.status !== 'ready') await sleep(Math.max(0, 180 - (now() - pollStarted)), controller.signal);
         }
         if (data.status !== 'ready' || !data.sprite_url) throw new Error('QUICK build timeout');
 
@@ -371,6 +373,7 @@
     exactIdleTimer = null;
     const entry = idleExact;
     idleExact = null;
+    exactSuspended = false;
     if (entry) metrics.exactIdleCancelled += 1;
     if (cancelActive && entry?.videoId) {
       globalThis.ArchivebateYouTubeStoryboard?.cancelActiveTarget?.(entry.videoId);
@@ -378,43 +381,14 @@
   }
 
   function scheduleIdleExact(args, mainVideo) {
-    const videoId = String(args?.videoId || '').trim();
-    if (!videoId || !originalRequestSegment) return null;
-    if (exactIdleTimer) {
-      clearTimeout(exactIdleTimer);
-      metrics.exactIdleResets += 1;
-    }
-    const previous = idleExact;
-    if (previous?.videoId && previous.videoId !== videoId) {
-      globalThis.ArchivebateYouTubeStoryboard?.cancelVideoClientWork?.(previous.videoId);
-    }
-    idleExact = { ...args, videoId, scheduledAt: now() };
+    if (!args?.videoId || !originalRequestSegment) return null;
+    // requestSegment already owns the intent delay, same-segment reuse and
+    // live QoS rechecks. Keep its latest callback instead of adding another delay.
+    idleExact = args;
+    exactSuspended = false;
     metrics.exactIdleScheduled += 1;
-
-    const attempt = () => {
-      exactIdleTimer = null;
-      const entry = idleExact;
-      if (!entry || !hoverActive || entry.signal?.aborted) {
-        clearIdleExact();
-        return;
-      }
-      const current = synchronizeIdentity(mainVideo, appState());
-      if (!current.videoId || current.videoId !== entry.videoId) {
-        clearIdleExact({ cancelActive: true });
-        return;
-      }
-      if (!playbackSafe(mainVideo, EXACT_MIN_BUFFER_SECONDS)) {
-        metrics.exactIdleBlocked += 1;
-        exactIdleTimer = setTimeout(attempt, EXACT_RECHECK_MS);
-        return;
-      }
-      idleExact = null;
-      metrics.exactIdleStarts += 1;
-      originalRequestSegment(entry);
-    };
-
-    exactIdleTimer = setTimeout(attempt, EXACT_IDLE_MS);
-    return null;
+    if (!playbackSafe(mainVideo, EXACT_MIN_BUFFER_SECONDS)) metrics.exactIdleBlocked += 1;
+    return originalRequestSegment(args);
   }
 
   function install() {
@@ -457,7 +431,7 @@
         previewImg.style.display = 'block';
       }
       if (status) {
-        status.textContent = 'Przygotowywanie podglądu…';
+        status.textContent = storyboard.previewStatusText?.(latestVideoId, latestDuration, latestTargetTime) || 'Przygotowywanie podglądu…';
         status.style.display = 'block';
       }
       metrics.posterFallbacks += 1;
@@ -469,7 +443,11 @@
       if (!result?.ok) return false;
       if (previewVideo) previewVideo.style.display = 'none';
       if (previewImg) previewImg.style.display = 'none';
-      if (status) status.style.display = 'none';
+      if (status) {
+        status.textContent = kind === 'coarse' ? (storyboard.previewStatusText?.(latestVideoId, duration, targetTime) || 'Przygotowywanie dokładnego podglądu…')
+          : (result.isExact === false ? `Najbliższa klatka: ${Number(result.frameTime).toFixed(1)} s` : '');
+        status.style.display = kind === 'coarse' || result.isExact === false ? 'block' : 'none';
+      }
       const identity = `${board.sprite_url}|${result.frameIndex}`;
       if (identity !== lastFrameIdentity) {
         lastFrameIdentity = identity;
@@ -487,9 +465,13 @@
       return applyBoard(board, targetTime, duration, 'coarse');
     }
 
-    renderLatestBoard = showCoarse;
+    renderLatestBoard = (board, targetTime, duration) => {
+      const exact = getExactCached(latestVideoId, duration, targetTime);
+      return exact ? showExact(exact, targetTime, duration) : showCoarse(board, targetTime, duration);
+    };
 
     function ensureInteractiveCoarse(videoId, duration) {
+      if (storyboard.SAMPLE_INTERVAL >= 10) return null;
       const key = cacheKey(videoId, duration);
       const state = appState();
       const existing = state?.timelineSpriteBoard?.sprite_url
@@ -509,7 +491,18 @@
     if (typeof storyboard.requestSegment === 'function' && !storyboard.__v452PlayerQoSCoordinator) {
       originalRequestSegment = storyboard.requestSegment.bind(storyboard);
       storyboard.requestSegment = function coordinatedRequestSegment(args = {}) {
+        // Ten-second segments supply the first preview themselves. A separate
+        // four-anchor overview would repeat CDN IO and delay this request.
+        if (storyboard.SAMPLE_INTERVAL >= 10) {
+          idleExact = args;
+          exactSuspended = false;
+          return originalRequestSegment(args);
+        }
         const state = appState();
+        if (state?.currentTimelinePrefix || !modal?.classList?.contains?.('active') ||
+            (args.videoId && String(args.videoId) !== currentIdentity(mainVideo, state).videoId)) {
+          return originalRequestSegment(args);
+        }
         const identity = synchronizeIdentity(mainVideo, state);
         const videoId = String(args.videoId || identity.videoId || '').trim();
         const duration = Number(args.duration || identity.duration || 0);
@@ -521,6 +514,8 @@
         const normalized = { ...args, videoId, duration, targetTime };
         const exact = getExactCached(videoId, duration, targetTime);
         if (exact) {
+          idleExact = normalized;
+          exactSuspended = false;
           metrics.exactCacheHits += 1;
           return originalRequestSegment(normalized);
         }
@@ -597,6 +592,7 @@
     }
 
     function schedulePrewarm(delay = PREWARM_DELAY_MS) {
+      if (storyboard.SAMPLE_INTERVAL >= 10) return;
       if (prewarmTimer) clearTimeout(prewarmTimer);
       prewarmTimer = setTimeout(() => {
         prewarmTimer = null;
@@ -604,7 +600,7 @@
         const state = appState();
         const { videoId, duration } = synchronizeIdentity(mainVideo, state);
         handleVideoSwitch(videoId);
-        if (!videoId || !duration) return;
+        if (!videoId || !duration || lruGet(coarseBoards, cacheKey(videoId, duration))) return;
         if (!playbackSafe(mainVideo, PREWARM_BUFFER_SECONDS)) {
           metrics.playbackProtectSkips += 1;
           return;
@@ -614,10 +610,31 @@
       }, Math.max(0, Number(delay) || 0));
     }
 
+    function suspendExact() {
+      const retained = idleExact;
+      clearIdleExact({ cancelActive: true });
+      if (hoverActive && retained && !retained.signal?.aborted) {
+        idleExact = retained;
+        exactSuspended = true;
+        retained.onStatus?.('waiting-buffer');
+      }
+    }
+    function resumeExact() {
+      if (!exactSuspended || !hoverActive || !idleExact || idleExact.signal?.aborted) return;
+      const current = currentIdentity(mainVideo, appState());
+      if (current.videoId !== idleExact.videoId || !playbackSafe(mainVideo, EXACT_MIN_BUFFER_SECONDS)) return;
+      exactSuspended = false;
+      originalRequestSegment?.(idleExact);
+    }
+    mainVideo.addEventListener('progress', resumeExact);
+    mainVideo.addEventListener('playing', resumeExact);
+    mainVideo.addEventListener('pause', resumeExact);
+    mainVideo.addEventListener('seeked', resumeExact);
+
     function protectPlayback(reason) {
       const state = appState();
       const { videoId } = synchronizeIdentity(mainVideo, state);
-      clearIdleExact({ cancelActive: true });
+      suspendExact();
       if (videoId && cancelCoarse(videoId, reason)) metrics.playbackProtectSkips += 1;
       requestSoftProtect(reason);
     }
@@ -631,9 +648,8 @@
     }, { passive: true });
 
     timeline.addEventListener('pointermove', event => {
-      // Any real movement resets the single EXACT idle timer and cancels an
-      // already-running target-specific exact client request.
-      clearIdleExact({ cancelActive: true });
+      // The storyboard client reuses work within a segment and cancels only
+      // when the target segment changes. Do not abort it on every pixel.
       schedulePointer(event);
     }, { passive: true });
 
@@ -666,7 +682,17 @@
     mainVideo.addEventListener('seeked', () => {
       if (!hoverActive) schedulePrewarm(PREWARM_DELAY_MS);
     });
+    function resumePrewarm() {
+      if (prewarmTimer || hoverActive || !modal?.classList?.contains?.('active')) return;
+      const { videoId, duration } = currentIdentity(mainVideo, appState());
+      const key = cacheKey(videoId, duration);
+      if (videoId && duration && !coarseBoards.has(key) && !coarseBuilds.has(key) &&
+          playbackSafe(mainVideo, PREWARM_BUFFER_SECONDS)) schedulePrewarm(350);
+    }
+    mainVideo.addEventListener('progress', resumePrewarm);
     mainVideo.addEventListener('timeupdate', () => {
+      resumeExact();
+      resumePrewarm();
       if (mainVideo.paused) return;
       const state = appState();
       const { videoId } = synchronizeIdentity(mainVideo, state);
@@ -675,7 +701,7 @@
       const ahead = bufferedAhead(mainVideo);
       if (ahead < LOW_BUFFER_CANCEL_SECONDS) {
         if (lowBufferVideoId !== videoId) {
-          clearIdleExact({ cancelActive: true });
+          suspendExact();
           if (cancelCoarse(videoId, 'low_buffer')) metrics.lowBufferCancels += 1;
           requestSoftProtect('low_buffer');
           lowBufferVideoId = videoId;

@@ -178,7 +178,7 @@ body {
 /* NAVBAR */
 .navbar {
   position: sticky;
-  top: 38px;
+  top: 0;
   z-index: 100;
   background: rgba(11, 13, 20, 0.92);
   backdrop-filter: blur(16px);
@@ -230,6 +230,29 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
+}
+
+.top-tabs {
+  order: 10;
+  flex-basis: 100%;
+  border-bottom: 1px solid var(--border-color);
+  gap: 4px;
+}
+.top-tabs .nav-link {
+  border-radius: 8px 8px 0 0;
+  padding: 10px 20px;
+  border-bottom: 3px solid transparent;
+}
+.top-tabs .nav-link.active {
+  color: var(--primary);
+  background: var(--bg-surface);
+  border-color: transparent;
+  border-bottom-color: var(--primary);
+}
+.secondary-nav { margin-left: auto; flex-wrap: wrap; }
+@media (max-width: 720px) {
+  .top-tabs .nav-link { padding: 10px 12px; }
+  .secondary-nav { gap: 2px; }
 }
 
 .nav-link {
@@ -971,6 +994,39 @@ body {
   object-fit: cover;
   transition: transform 0.3s ease;
   display: block;
+}
+
+.video-open-link {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+.video-open-link:focus-visible { outline: 3px solid var(--primary); outline-offset: -3px; }
+.play-btn, .grouped-item-row { text-decoration: none; }
+
+.thumbnail-retry {
+  position: absolute;
+  inset: 28% 10%;
+  z-index: 5;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+
+.thumbnail-retry:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.search-retry {
+  grid-column: 1 / -1;
+  justify-self: center;
+  margin: 16px;
 }
 
 .hover-preview-video {
@@ -1956,6 +2012,8 @@ a.model-profile-link.is-favorite-author:hover {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* Loading icons or changing play/pause must not move the hovered timeline. */
+  min-height: 36px;
 }
 
 .controls-left, .controls-right {
@@ -2663,7 +2721,16 @@ a.model-profile-link.is-favorite-author:hover {
   transform-origin: 0 0;
 }
 .timeline-preview-status {
-  display: none !important;
+  display: none;
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 5;
+  padding: 4px 6px;
+  background: rgba(0, 0, 0, 0.78);
+  color: #fff;
+  font-size: 10px;
+  line-height: 1.25;
+  pointer-events: none;
 }
 
 .feed-refresh-indicator {

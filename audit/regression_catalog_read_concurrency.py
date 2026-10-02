@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import threading
@@ -9,6 +10,29 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from catalog_service import CatalogService
+
+
+# Keep the fixture out of the live data directory even when this test is run
+# directly from the source checkout.  The process-specific path also prevents
+# two isolated runs from sharing a database.
+_FIXTURE_ROOT = ROOT / "audit" / f"isolated_catalog_read_{os.getpid()}"
+_FIXTURE_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+class _FixedTemporaryDirectory:
+    def __init__(self, *args, **kwargs):
+        del args, kwargs
+        self.path = _FIXTURE_ROOT
+        self.path.mkdir(parents=True, exist_ok=True)
+
+    def __enter__(self):
+        return str(self.path)
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+tempfile.TemporaryDirectory = _FixedTemporaryDirectory
 
 
 def sample(i):
@@ -25,6 +49,16 @@ def sample(i):
 with tempfile.TemporaryDirectory() as td:
     service = CatalogService(Path(td) / "catalog.db")
     service.import_items([sample(i) for i in range(80)], revision=1, complete=True)
+
+    before_diag = service.operational_diagnostics()
+    assert before_diag["sqlite_version"]
+    assert before_diag["file_backed"] is True
+    assert before_diag["wal_bytes"] is None or before_diag["wal_bytes"] >= 0
+    assert before_diag["active_readers"] == 0
+    assert "last_passive_checkpoint" in before_diag
+    with service._read_snapshot():
+        assert service.operational_diagnostics()["active_readers"] == 1
+    assert service.operational_diagnostics()["active_readers"] == 0
 
     entered = threading.Event()
     release = threading.Event()

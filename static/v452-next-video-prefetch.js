@@ -74,6 +74,8 @@
     const currentId = currentVideoId();
     const candidate = resolveCandidate();
     const candidateId = String(candidate?.id || '').trim();
+    const candidateSource = String(candidate?.source || (candidateId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
+    const options = { source: candidateSource };
 
     if (!prefetch?.prefetchVideoDetails || !currentId || !candidateId || candidateId === currentId) {
       stats.skipped += 1;
@@ -83,24 +85,42 @@
     stats.lastCurrentId = currentId;
     stats.lastCandidateId = candidateId;
 
-    if (prefetch.hasVideoDetails?.(candidateId)) {
-      stats.cacheReady += 1;
-      return prefetch.getVideoDetails?.(candidateId) || null;
-    }
-
-    const startedAt = performance.now();
-    stats.started += 1;
-
     const holder = { id: candidateId, promise: null };
-    holder.promise = Promise.resolve(prefetch.prefetchVideoDetails(candidateId))
+    holder.promise = (async () => {
+      if (prefetch.hasVideoDetails?.(candidateId, options)) {
+        stats.cacheReady += 1;
+        return prefetch.getVideoDetails?.(candidateId, options) || null;
+      }
+
+      if (!prefetch.isDetailsInflight?.(candidateId, options) && prefetch.hasPrefetchCapacity?.() === false) {
+        // A busy result used to be counted as a completed candidate, so the
+        // player never tried again for this video. Wait for one free slot, then
+        // recheck the live player and candidate once; this is a bounded retry,
+        // not a queue of every visible card.
+        const slotReady = await prefetch.waitForPrefetchSlot?.();
+        const liveVideo = globalThis.document?.getElementById?.('modalVideo');
+        const liveCandidate = resolveCandidate();
+        if (!slotReady || !modalIsActive() || currentVideoId() !== currentId ||
+            !liveVideo || liveVideo.paused || liveVideo.ended ||
+            String(liveCandidate?.id || '').trim() !== candidateId ||
+            String(liveCandidate?.source || (String(liveCandidate?.id || '').startsWith('cw_') ? 'camwhores' : 'archivebate')) !== candidateSource) {
+          stats.skipped += 1;
+          return null;
+        }
+      }
+
+      const startedAt = performance.now();
+      stats.started += 1;
+      const details = await prefetch.prefetchVideoDetails(candidate, options);
+      stats.lastDurationMs = Math.round(performance.now() - startedAt);
+      if (details) stats.completed += 1;
+      else stats.failed += 1;
+      return details;
+    })()
       .then(details => {
-        stats.lastDurationMs = Math.round(performance.now() - startedAt);
-        if (details) stats.completed += 1;
-        else stats.failed += 1;
         return details;
       })
       .catch(() => {
-        stats.lastDurationMs = Math.round(performance.now() - startedAt);
         stats.failed += 1;
         return null;
       })

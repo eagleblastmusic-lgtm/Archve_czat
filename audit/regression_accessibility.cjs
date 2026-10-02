@@ -80,4 +80,26 @@ speedButton.dispatch('click');
 assert.equal(video.playbackRate, 1.25);
 assert.match(speedButton.getAttribute('aria-label'), /1\.25x/);
 
+// Both players share the hover-aware timer. The standalone player must not
+// hide controls and abort an exact preview after 2.5 seconds of stationary hover.
+assert.match(watch, /ArchivebatePlayerCore\.setupIdleTimer\(playerBox, controlsBar, player\)/);
+const timers = new Map(); let timerId = 0;
+context.setTimeout = fn => { const id=++timerId; timers.set(id,fn); return id; };
+context.clearTimeout = id => timers.delete(id);
+const wrapper = target(), controls = target(), playingVideo = target();
+playingVideo.paused = false; playingVideo.ended = false;
+let hidden = false;
+controls.classList = {add(){hidden=true;},remove(){hidden=false;}};
+core.setupIdleTimer(wrapper,controls,playingVideo);
+assert.equal(timers.size,1);
+controls.dispatch('pointerenter');
+wrapper.dispatch('pointermove');
+assert.equal(timers.size,0,'stationary hover must not arm auto-hide');
+assert.equal(hidden,false);
+controls.dispatch('pointerleave');
+assert.equal(timers.size,1);
+for(const callback of timers.values())callback();
+assert.equal(hidden,true,'auto-hide resumes after leaving controls');
+for(const match of watch.matchAll(/<script\s*>([\s\S]*?)<\/script>/g))new vm.Script(match[1]);
+
 console.log('PASS: player controls have working shared helpers, keyboard timeline semantics and accessible labels');

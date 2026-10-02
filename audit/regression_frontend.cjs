@@ -12,8 +12,13 @@ ctx.ArchivebateVideoGrid.init({createVideoCard:ctx.createVideoCard});
 ctx.renderVideoGrid(Array.from({length:64},(_,id)=>({id:'old'+id,source:'archivebate'})));
 ctx.renderVideoGrid([{id:'new',source:'archivebate'}]);scheduled.splice(0).forEach(timer=>timer.cb());assert.deepEqual(children.map(card=>card._videoData.id),['new']);
 const firstCard=children[0];
+const pendingThumbnail={dataset:{src:'/pending.jpg'}};
+firstCard.querySelector=selector=>selector==='.thumbnail-img[data-src]'?pendingThumbnail:null;
+const rearmed=[];
+ctx.ArchivebateVideoPrefetch={armLazyThumbnail:img=>rearmed.push(img)};
 ctx.reconcilePage([{id:'new',source:'archivebate',views:'updated'}]);
 assert.equal(children[0],firstCard);assert.equal(firstCard._videoData.views,'updated');
+assert.deepEqual(rearmed,[pendingThumbnail],'retained cards must be re-observed after a view refresh');
 (async()=>{
  let active=0,peak=0,reads=0;
  const perf={window:{},fetch:async()=>{active++;peak=Math.max(peak,active);return{arrayBuffer:async()=>{reads++;await new Promise(r=>setTimeout(r,3));active--;}}}};

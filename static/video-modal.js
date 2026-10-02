@@ -352,6 +352,8 @@
     const sessionController = state.playerController = new AbortController();
 
     // Inicjalizacja sesji pomiarowej otwarcia wideo (Pakiet C, punkt 1)
+    let detailsResolved = false;
+    let streamFailed = false;
     const currentSession = state.activePlaybackSession = (g.ArchivebatePerf?.startPlaybackSession ? g.ArchivebatePerf.startPlaybackSession({
       id: video?.id,
       owner: 'player',
@@ -460,6 +462,8 @@
       };
       dom.modalVideo.onerror = () => {
         if (generation !== state.playerGeneration) return;
+        streamFailed = true;
+        if (!detailsResolved) return;
         hideLoadingPoster();
         perf().setPlaybackBusy(false);
         currentSession?.markError('video_stream_error', 'Błąd strumienia wideo');
@@ -632,28 +636,31 @@
     try {
       let details = null;
       const prefetchMod = g.ArchivebateVideoPrefetch;
-      if (!forceRefresh && video && video.id && prefetchMod && prefetchMod.detailsCache) {
-        details = prefetchMod.detailsCache.get(video.id);
+      const videoSource = video?.source || (String(video?.id || '').startsWith('cw_') ? 'camwhores' : 'archivebate');
+      if (!forceRefresh && video && video.id && typeof prefetchMod?.getVideoDetails === 'function') {
+        details = prefetchMod.getVideoDetails(video, { source: videoSource });
       }
       if (!details || (!details.proxy_stream_url && !details.direct_url) || forceRefresh) {
         if (forceRefresh) {
-          details = await api().getJSON(`/api/video/details?id=${encodeURIComponent(video.id || video.url)}&force_refresh=true`, { signal: sessionController.signal });
+          details = await api().refreshVideoDetails(video.id || video.url, { signal: sessionController.signal });
         } else if (prefetchMod && typeof prefetchMod.prefetchVideoDetails === 'function') {
-          details = await prefetchMod.prefetchVideoDetails(video.id || video.url, { signal: sessionController.signal });
+          details = await prefetchMod.prefetchVideoDetails(video, { source: videoSource, signal: sessionController.signal });
         } else if (typeof g.prefetchVideoDetails === 'function') {
-          details = await g.prefetchVideoDetails(video.id || video.url, true);
+          details = await g.prefetchVideoDetails(video, { source: videoSource, signal: sessionController.signal });
         }
-        if (!details && !sessionController.signal.aborted) {
-          details = await api().getJSON(`/api/video/details?id=${encodeURIComponent(video.id || video.url)}${forceRefresh ? '&force_refresh=true' : ''}`, { signal: sessionController.signal });
+        if (!details && !forceRefresh && !sessionController.signal.aborted) {
+          const detailsUrl = `/api/video/details?id=${encodeURIComponent(video.id || video.url)}`;
+          details = await api().getJSON(detailsUrl, { signal: sessionController.signal });
         }
         if (sessionController.signal.aborted || generation !== state.playerGeneration) return;
         if (!details) throw new Error('Nie udało się pobrać detali filmu');
-        if (video && video.id && (details.proxy_stream_url || details.direct_url) && prefetchMod && prefetchMod.detailsCache) {
-          prefetchMod.detailsCache.set(video.id, details);
+        if (video && video.id && (details.proxy_stream_url || details.direct_url) && typeof prefetchMod?.setVideoDetails === 'function') {
+          prefetchMod.setVideoDetails(video, details, { source: videoSource });
         }
       }
       if (sessionController.signal.aborted || generation !== state.playerGeneration) return;
 
+      detailsResolved = true;
       currentSession?.markUrlResolved(details.proxy_stream_url || details.direct_url, !forceRefresh);
       const resolvedUsername = getEffectiveVideoUsername(video) || getEffectiveVideoUsername(details) || 'Model';
       state.currentVideoDetails = {
@@ -661,23 +668,6 @@
         ...details,
         username: resolvedUsername
       };
-
-      // Przygotowanie co najwyżej 1 kandydata na intencję użytkownika (Pakiet C, punkt 7)
-      try {
-        const playlist = authorPlaylists.get(resolvedUsername?.toLowerCase());
-        if (playlist && Array.isArray(playlist.videos)) {
-          const nextIdx = getAuthorVideoIndex(playlist, video) + 1;
-          if (nextIdx > 0 && nextIdx < playlist.videos.length) {
-            const candidate = playlist.videos[nextIdx];
-            if (candidate?.id && prefetchMod?.prefetchVideoDetails) {
-              g.ArchivebatePerf?.schedule?.(
-                () => prefetchMod.prefetchVideoDetails(candidate.id, { signal: sessionController.signal }),
-                { signal: sessionController.signal }
-              ).catch(() => {});
-            }
-          }
-        }
-      } catch (_) {}
 
       if (resolvedUsername && resolvedUsername.toLowerCase() !== 'model') {
         if (dom.modalModelName) dom.modalModelName.innerText = `${resolvedUsername} • ${video.date || details.date || ''}`;
@@ -698,6 +688,22 @@
 
       updateModalFavButton(!!details.is_favorite);
 
+      if (prefetchMod?.detailsAreUnavailable?.(details)) {
+        dom.modalVideo.onerror = null;
+        dom.modalVideo.pause();
+        dom.modalVideo.removeAttribute('src');
+        dom.modalVideo.load();
+        hideLoadingPoster();
+        perf().setPlaybackBusy(false);
+        currentSession?.markError('video_removed', 'Nagranie zostało usunięte ze źródła');
+        if (dom.videoLoader) {
+          dom.videoLoader.style.display = 'flex';
+          dom.videoLoader.textContent = 'Nagranie zostało usunięte ze źródła. Potwierdzam usunięcie przed ukryciem karty.';
+        }
+        void prefetchMod.confirmUnavailableVideo(video, details, sessionController.signal);
+        return;
+      }
+
       if (details.is_private) {
         perf().setPlaybackBusy(false);
         if (dom.videoLoader) dom.videoLoader.style.display = 'none';
@@ -713,6 +719,8 @@
         }
         return;
       }
+
+      if (streamFailed) dom.modalVideo?.onerror?.();
 
       const rawStream = immediateStream || details.proxy_stream_url || details.direct_url;
       const streamSource = safeUrl(rawStream ? (forceRefresh ? `${rawStream}${rawStream.includes('?') ? '&' : '?'}retry=${generation}` : rawStream) : '');
@@ -771,8 +779,9 @@
       }
     } catch (err) {
       if (generation !== state.playerGeneration) return;
+      detailsResolved = true;
       console.warn('Błąd detali filmu:', err);
-      if (forceRefresh || !immediateStream) dom.modalVideo?.onerror?.();
+      if (streamFailed || forceRefresh || !immediateStream) dom.modalVideo?.onerror?.();
     }
   }
 

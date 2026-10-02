@@ -106,6 +106,16 @@
   }
 
   function updateUserStatus(status) {
+    const nextPreferencesVersion = Number(status?.preferences_version);
+    if (Number.isFinite(nextPreferencesVersion)) {
+      if (state.preferencesVersion !== null && state.preferencesVersion !== undefined &&
+          Number(state.preferencesVersion) !== nextPreferencesVersion) {
+        global.ArchivebateVideoViews?.preferencesChanged?.(nextPreferencesVersion);
+      } else {
+        state.preferencesVersion = nextPreferencesVersion;
+      }
+    }
+
     if (status.logged_in) {
       dom.userEmail.innerText = status.email;
       dom.statusDot.classList.remove('error');

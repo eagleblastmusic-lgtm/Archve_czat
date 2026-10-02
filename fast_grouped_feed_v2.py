@@ -28,6 +28,7 @@ import re
 import threading
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 _CACHE_LIMIT = 8
 _SCAN_CHUNK = 2048
@@ -228,7 +229,7 @@ def _simple_count(conn, where: str, params: List[Any]) -> int:
 
 
 def _selected_items(conn, revision: int, leaders: List[Dict[str, Any]],
-                    where: str, params: List[Any]) -> List[Dict[str, Any]]:
+                    where: str, params: List[Any], source: str, author_filter: str) -> List[Dict[str, Any]]:
     if not leaders:
         return []
 
@@ -273,7 +274,8 @@ def _selected_items(conn, revision: int, leaders: List[Dict[str, Any]],
             video["group_count"] = count
             video["grouped_videos"] = []
             video["group_members_lazy"] = True
-            video["group_members_url"] = f"/api/catalog/groups/{author}/members"
+            scope = urlencode({"source": source, "revision": revision, "author_filter": author_filter})
+            video["group_members_url"] = f"/api/catalog/groups/{author}/members?{scope}"
         else:
             video["is_grouped"] = False
             video["group_count"] = 1
@@ -337,7 +339,7 @@ def _query_grouped(cs, self, *, page: int = 1, page_size: Optional[int] = None,
         limit = materialize_limit or ps
         _ensure_leaders(conn, state, filtered["where"], filtered["params"], offset + limit)
         selected = state["leaders"][offset:offset + limit]
-        items = _selected_items(conn, rev, selected, filtered["where"], filtered["params"])
+        items = _selected_items(conn, rev, selected, filtered["where"], filtered["params"], source, author_filter)
 
         if enrich_fn:
             items = enrich_fn(items)

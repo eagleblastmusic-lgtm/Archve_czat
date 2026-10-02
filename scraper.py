@@ -4,6 +4,7 @@ import json
 import time
 import math
 import logging
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
@@ -12,6 +13,80 @@ from client import ArchivebateSession
 from storage import storage
 
 logger = logging.getLogger("archivebate_scraper")
+
+_REMOVED_PAGE_MARKERS = (
+    "this video has been removed",
+    "this video was removed",
+    "video has been deleted",
+    "video was deleted",
+    "video not found",
+    "recording not found",
+)
+_PRIVATE_PAGE_MARKERS = (
+    "private video",
+    "video is private",
+    "login-required",
+    "members only",
+    "members-only",
+)
+_CHALLENGE_PAGE_MARKERS = (
+    "just a moment",
+    "checking your browser",
+    "cf-chl-",
+    "captcha",
+    "verify you are human",
+)
+
+
+def _detail_availability(status: int, response_url: str, html: str, *, direct_url: str = "", is_private: bool = False) -> Dict[str, Any]:
+    """Return conservative source-page evidence for a video detail read."""
+    from datetime import datetime, timezone
+
+    body = str(html or "").lower()
+    host = (urlparse(str(response_url or "")).hostname or "").lower()
+    valid_source_host = host == "archivebate.com" or host.endswith(".archivebate.com")
+    checked_at = datetime.now(timezone.utc).timestamp()
+    if direct_url:
+        return {"availability": "available", "availability_reason": "direct_stream", "checked_at": checked_at, "retryable": False}
+    if is_private or any(marker in body for marker in _PRIVATE_PAGE_MARKERS):
+        return {"availability": "private", "availability_reason": "private_marker", "checked_at": checked_at, "retryable": True}
+    if status == 404 and valid_source_host and any(marker in body for marker in _REMOVED_PAGE_MARKERS):
+        return {"availability": "unavailable", "availability_reason": "source_page_not_found", "checked_at": checked_at, "retryable": False}
+    if any(marker in body for marker in _CHALLENGE_PAGE_MARKERS):
+        reason = "provider_challenge"
+    elif status in (401, 403):
+        reason = f"http_{status}"
+    elif status == 429:
+        reason = "http_429"
+    elif status >= 500:
+        reason = f"http_{status}"
+    elif status != 200:
+        reason = f"http_{status}"
+    else:
+        reason = "no_direct_stream"
+    return {"availability": "unknown", "availability_reason": reason, "checked_at": checked_at, "retryable": True}
+
+
+def _embed_is_removed(response) -> bool:
+    """Only a named provider's explicit missing-file page proves removal."""
+    from html import unescape
+    parsed = urlparse(str(getattr(response, "url", "") or ""))
+    host = (parsed.hostname or "").lower()
+    trusted = any(host == name or host.endswith("." + name)
+                  for name in ("mixdrop.ag", "mixdrop.co", "mxdrop.top"))
+    body = str(getattr(response, "text", "") or "").lower()
+    if not trusted or not parsed.path.startswith(("/e/", "/f/")):
+        return False
+    if int(getattr(response, "status_code", 0)) not in (200, 404, 410):
+        return False
+    # Shared script bundles can mention captcha/private without displaying it.
+    body = re.sub(r"<(script|style)\b[^>]*>.*?</\1\s*>", " ", body, flags=re.S)
+    body = re.sub(r"<!--.*?-->", " ", body, flags=re.S)
+    visible = " ".join(unescape(re.sub(r"<[^>]+>", " ", body)).split())
+    if any(marker in visible for marker in _CHALLENGE_PAGE_MARKERS + _PRIVATE_PAGE_MARKERS):
+        return False
+    return "we can't find the video you are looking for" in visible
+
 
 # Lista przykładowych, popularnych tagów z serwisu Archivebate / kamerkowych
 POPULAR_TAGS = [
@@ -1060,6 +1135,29 @@ class ArchivebateScraper:
                 return False
             return True
 
+        # Emit saved matching videos before any remote profile or metadata lookup.
+        seen_v_ids = set()
+        streamed_ids = set()
+        all_videos = []
+
+        try:
+            stored = storage.search_stored_videos(clean_q)
+            for sv in stored:
+                sv_id = str(sv.get("id"))
+                if sv_id and sv_id not in seen_v_ids and is_allowed_video(sv):
+                    seen_v_ids.add(sv_id)
+                    all_videos.append(sv)
+            if all_videos:
+                for v in all_videos:
+                    streamed_ids.add(v["id"])
+                yield {
+                    "type": "videos",
+                    "videos": all_videos,
+                    "total_so_far": len(streamed_ids)
+                }
+        except Exception:
+            pass
+
         # 1. Szybkie pobranie profili oraz estymacja całkowitych statystyk
         all_profiles, total_models, last_model_page = self._fetch_search_profiles(clean_q, page=1)
         try:
@@ -1094,29 +1192,6 @@ class ArchivebateScraper:
             "estimated_total_videos": est_total,
             "last_page": est_last_page
         }
-
-        # 2. Wideo z pamięci lokalnej użytkownika (błyskawiczne z bazy, 0.05s)
-        seen_v_ids = set()
-        streamed_ids = set()
-        all_videos = []
-
-        try:
-            stored = storage.search_stored_videos(clean_q)
-            for sv in stored:
-                sv_id = str(sv.get("id"))
-                if sv_id and sv_id not in seen_v_ids and is_allowed_video(sv):
-                    seen_v_ids.add(sv_id)
-                    all_videos.append(sv)
-            if all_videos:
-                for v in all_videos:
-                    streamed_ids.add(v["id"])
-                yield {
-                    "type": "videos",
-                    "videos": all_videos,
-                    "total_so_far": len(streamed_ids)
-                }
-        except Exception:
-            pass
 
         # 3. Progresywne pobieranie partii: Camwhores + Archivebate dla strony 1
         from camwhores import camwhores_scraper, deduplicate_videos, merge_and_deduplicate
@@ -1277,7 +1352,10 @@ class ArchivebateScraper:
                 return camwhores_scraper.get_video_details(video_id_or_url)
             except Exception as e:
                 logger.error(f"Błąd pobierania detali Camwhores ({video_id_or_url}): {e}")
-                return {"url": video_id_or_url, "direct_url": "", "embed_url": video_id_or_url, "source": "camwhores"}
+                result = {"url": video_id_or_url, "direct_url": "", "embed_url": video_id_or_url, "source": "camwhores"}
+                result.update(_detail_availability(0, video_id_or_url, ""))
+                result["availability_reason"] = "request_error"
+                return result
 
         clean_id = video_id_or_url.split("/")[-1].split("?")[0]
         now = time.time()
@@ -1293,9 +1371,46 @@ class ArchivebateScraper:
         else:
             url = f"https://archivebate.com/watch/{clean_id}"
 
+        checked_at = time.time()
         try:
             r = self.session.request("GET", url, timeout=12)
-            html = r.text
+            html = str(getattr(r, "text", "") or "")
+            status = int(getattr(r, "status_code", 200) or 0)
+            response_url = str(getattr(r, "url", "") or url)
+            if status != 200:
+                result = {
+                    "id": clean_id,
+                    "url": response_url,
+                    "embed_url": "",
+                    "direct_url": "",
+                    "download_url": "",
+                    "thumbnail": "",
+                    "username": "",
+                    "date": "",
+                    "keywords": [],
+                    "description": "",
+                }
+                result.update(_detail_availability(status, response_url, html))
+                return result
+
+            page_text = html.lower()
+            source_evidence = bool(
+                re.search(r'<iframe\b', page_text)
+                or re.search(r'name=["\']fid["\']', page_text)
+                or re.search(r'(?:og:image|name=["\']keywords["\']|/profile/)', page_text)
+            )
+            if any(marker in page_text for marker in _PRIVATE_PAGE_MARKERS):
+                result = {"id": clean_id, "url": response_url, "embed_url": "", "direct_url": "", "is_private": True}
+                result.update(_detail_availability(status, response_url, html, is_private=True))
+                return result
+            if any(marker in page_text for marker in _CHALLENGE_PAGE_MARKERS):
+                result = {"id": clean_id, "url": response_url, "embed_url": "", "direct_url": ""}
+                result.update(_detail_availability(status, response_url, html))
+                return result
+            if any(marker in page_text for marker in _REMOVED_PAGE_MARKERS):
+                result = {"id": clean_id, "url": response_url, "embed_url": "", "direct_url": ""}
+                result.update(_detail_availability(404, response_url, html))
+                return result
 
             # Mixdrop iframe
             iframe_m = re.search(r'<iframe[^>]*src="([^"]+)"', html)
@@ -1342,14 +1457,18 @@ class ArchivebateScraper:
 
             # Wyciągamy bezpośredni strumień MP4 z Mixdrop (bez reklam)
             direct_mp4_url = ""
+            embed_removed = False
             if embed_url:
                 try:
                     mixdrop_res = self.session.request("GET", embed_url, timeout=10)
-                    direct_mp4_url = unpack_mixdrop(mixdrop_res.text) or ""
+                    embed_removed = _embed_is_removed(mixdrop_res)
+                    if int(getattr(mixdrop_res, "status_code", 200) or 0) == 200:
+                        direct_mp4_url = unpack_mixdrop(getattr(mixdrop_res, "text", "")) or ""
                 except Exception as e:
                     logger.error(f"Błąd pobierania direct stream z Mixdrop: {e}")
 
             result = {
+                "id": clean_id,
                 "url": url,
                 "embed_url": embed_url,
                 "direct_url": direct_mp4_url,
@@ -1361,13 +1480,28 @@ class ArchivebateScraper:
                 "keywords": keywords,
                 "description": description
             }
+            result.update(_detail_availability(
+                status,
+                response_url,
+                html,
+                direct_url=direct_mp4_url,
+            ))
+            if not direct_mp4_url:
+                if embed_url:
+                    result["availability_reason"] = "embed_without_direct_stream"
+                elif not source_evidence:
+                    result["availability_reason"] = "unrecognized_page"
+                result["retryable"] = True
+            if embed_removed and not direct_mp4_url:
+                result.update(availability="unavailable", availability_reason="embed_file_not_found", retryable=False)
             result["tags"] = extract_video_tags(result)
             if clean_id and direct_mp4_url:
                 self._details_cache[clean_id] = {"data": result, "time": now}
             return result
         except Exception as e:
             logger.error(f"Błąd pobierania detali wideo {video_id_or_url}: {e}")
-            return {
+            result = {
+                "id": clean_id,
                 "url": url,
                 "embed_url": "",
                 "direct_url": "",
@@ -1378,6 +1512,10 @@ class ArchivebateScraper:
                 "keywords": [],
                 "description": ""
             }
+            result.update(_detail_availability(0, url, ""))
+            result["availability_reason"] = "request_error"
+            result["checked_at"] = checked_at
+            return result
 
     def get_account_section_videos(self, endpoint: str, max_pages: int = 12, strict: bool = False) -> List[Dict[str, Any]]:
         """Pobiera listę sekcji konta; w trybie strict nie zamienia awarii na pustą listę."""

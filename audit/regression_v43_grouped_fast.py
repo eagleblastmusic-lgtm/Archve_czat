@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-import tempfile
+import os
 import time
 from pathlib import Path
 
@@ -31,9 +31,15 @@ def make_video(idx: int, author: str, published: float, source: str = "archiveba
 
 
 def main():
-    with tempfile.TemporaryDirectory() as td:
-        db = Path(td) / "catalog.db"
-        svc = CatalogService(db_path=db, page_size=20)
+    if sys.argv[1:] == ["--benchmark-440k"]:
+        from grouped_feed_benchmark import run_benchmark
+
+        run_benchmark()
+        return
+
+    db = ROOT / "audit" / f"isolated_grouped_fast_{os.getpid()}.db"
+    svc = CatalogService(db_path=db, page_size=20)
+    try:
         now = time.time()
         videos = []
         idx = 0
@@ -48,6 +54,20 @@ def main():
             idx += 1
         for member in range(8):
             videos.append(make_video(idx, f"cw_{member}", now - 20000 - member, source="camwhores"))
+            idx += 1
+
+        # The same normalized author exists in both providers, and one raw
+        # provider ID deliberately collides across them. Group-member pages
+        # and favorites must remain source scoped.
+        for source, provider_id, offset in (
+            ("archivebate", "shared-cross-id", 0),
+            ("archivebate", "shared-ab-2", 1),
+            ("camwhores", "shared-cross-id", 2),
+            ("camwhores", "shared-cw-2", 3),
+        ):
+            video = make_video(idx, "Shared_Model", now + 100 - offset, source=source)
+            video["id"] = provider_id
+            videos.append(video)
             idx += 1
 
         svc.import_items(videos, revision=1, complete=True, source="fixture")
@@ -98,12 +118,38 @@ def main():
         baseline_page_2 = original(svc, **{**kwargs, "page": 2})
         assert [v["id"] for v in fast_page_2["videos"]] == [v["id"] for v in baseline_page_2["videos"]]
 
+        shared_group = next(v for v in fast["videos"] if v.get("username") == "Shared_Model")
+        assert shared_group["group_count"] == 2
+        assert "source=only-archivebate" in shared_group["group_members_url"]
+        assert "revision=1" in shared_group["group_members_url"]
+        assert "author_filter=exclude_fav" in shared_group["group_members_url"]
+        all_sources = svc.query_group_members("sharedmodel", page=1, page_size=20, source="all", revision=1)
+        ab_only = svc.query_group_members("sharedmodel", page=1, page_size=20, source="only-archivebate", revision=1)
+        cw_only = svc.query_group_members("sharedmodel", page=1, page_size=20, source="only-camwhores", revision=1)
+        assert all_sources["total"] == 4 and all_sources["count"] == 4
+        assert {v["source"] for v in all_sources["items"]} == {"archivebate", "camwhores"}
+        assert ab_only["total"] == 2 and {v["source"] for v in ab_only["items"]} == {"archivebate"}
+        assert cw_only["total"] == 2 and {v["source"] for v in cw_only["items"]} == {"camwhores"}
+        exclude_cross_source_favorite = svc.query_group_members(
+            "sharedmodel", page=1, page_size=20, source="all", revision=1,
+            author_filter="exclude_fav", favorite_ids=[{"source": "archivebate", "provider_id": "shared-cross-id"}],
+        )
+        assert exclude_cross_source_favorite["total"] == 3
+        assert {v["id"] for v in exclude_cross_source_favorite["items"]} == {
+            "shared-ab-2", "shared-cross-id", "shared-cw-2"
+        }
+
         # Ungrouped mode is delegated to the original implementation.
         ungrouped = svc.query_page(page=1, page_size=20, source="only-archivebate", group_authors=False, revision=1)
         direct = original(svc, page=1, page_size=20, source="only-archivebate", group_authors=False, revision=1)
         assert [v["id"] for v in ungrouped["videos"]] == [v["id"] for v in direct["videos"]]
 
         svc.close()
+    finally:
+        try:
+            svc.close()
+        except Exception:
+            pass
 
     print("PASS V4.3 GROUPED FEED V2")
 

@@ -54,7 +54,7 @@ assert.match(fallbackSource, /currentVideoDetails\?\.id/);
 assert.match(fallbackSource, /showExact/);
 assert.match(fallbackSource, /getExactCached/);
 assert.match(fallbackSource, /ensureInteractiveCoarse/);
-assert.match(fallbackSource, /EXACT_IDLE_MS = 260/);
+assert.match(fallbackSource, /EXACT_IDLE_MS = globalThis\.ArchivebateYouTubeStoryboard\?\.HOVER_INTENT_MS/);
 assert.match(fallbackSource, /EXACT_MIN_BUFFER_SECONDS = 3\.0/);
 assert.match(fallbackSource, /requestSoftProtect/);
 assert.match(fallbackSource, /requestHardCancel/);

@@ -1,9 +1,10 @@
 import requests
 import re
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 import html
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime
 
 logger = logging.getLogger("camwhores")
 if not logger.handlers:
@@ -22,6 +23,33 @@ from requests.adapters import HTTPAdapter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fetch_contract import FetchResult
 from video_identity import VideoKey, normalize_video_url
+
+_CW_REMOVED_MARKERS = (
+    "this video has been removed", "video has been deleted", "video was deleted",
+    "video not found", "recording not found",
+)
+_CW_PRIVATE_MARKERS = ("private video", "login-required", "members only", "members-only", "no-player")
+_CW_CHALLENGE_MARKERS = ("just a moment", "checking your browser", "captcha", "verify you are human", "cf-chl-")
+
+
+def _video_availability(status: int, page_url: str, body: str, *, direct_url: str = "", private: bool = False) -> Dict[str, Any]:
+    text = str(body or "").lower()
+    host = (urlparse(str(page_url or "")).hostname or "").lower()
+    valid_host = any(host == domain or host.endswith(f".{domain}") for domain in ("camwhores.tv", "camwhores.co"))
+    checked_at = datetime.now(timezone.utc).timestamp()
+    if direct_url:
+        return {"availability": "available", "availability_reason": "direct_stream", "checked_at": checked_at, "retryable": False}
+    if private or any(marker in text for marker in _CW_PRIVATE_MARKERS):
+        return {"availability": "private", "availability_reason": "private_marker", "checked_at": checked_at, "retryable": True}
+    if status == 404 and valid_host and any(marker in text for marker in _CW_REMOVED_MARKERS):
+        return {"availability": "unavailable", "availability_reason": "source_page_not_found", "checked_at": checked_at, "retryable": False}
+    if any(marker in text for marker in _CW_CHALLENGE_MARKERS):
+        reason = "provider_challenge"
+    elif status in (401, 403, 429) or status >= 500 or status != 200:
+        reason = f"http_{status}" if status else "request_error"
+    else:
+        reason = "no_direct_stream"
+    return {"availability": "unknown", "availability_reason": reason, "checked_at": checked_at, "retryable": True}
 
 class CamwhoresScraper:
     def __init__(self):
@@ -405,33 +433,63 @@ class CamwhoresScraper:
                 seen_urls.append(u)
 
         r = None
+        removed_evidence = None
         for u in seen_urls:
             try:
                 resp = self.session.get(u, timeout=10)
-                if resp.status_code == 200 and ("video_url" in resp.text or "get_file" in resp.text):
+                body = str(getattr(resp, "text", "") or "")
+                status = int(getattr(resp, "status_code", 0) or 0)
+                response_url = str(getattr(resp, "url", "") or u)
+                if status == 200 and any(marker in body.lower() for marker in _CW_PRIVATE_MARKERS):
+                    result = {
+                        "id": f"cw_{raw_id}", "url": response_url, "direct_url": "",
+                        "embed_url": response_url, "source": "camwhores", "is_private": True,
+                        "error_message": "Ten film jest prywatny na Camwhores (dostępny wyłącznie dla zarejestrowanych członków).",
+                    }
+                    result.update(_video_availability(status, response_url, body, private=True))
+                    return result
+                if status == 404 and any(marker in body.lower() for marker in _CW_REMOVED_MARKERS):
+                    removed_evidence = (status, response_url, body)
+                    continue
+                if status == 200 and ("video_url" in body or "get_file" in body):
                     r = resp
-                    watch_url = u
+                    watch_url = response_url
                     break
             except Exception:
                 continue
 
-        if not r or r.status_code != 200:
+        if not r:
+            if removed_evidence:
+                status, response_url, body = removed_evidence
+                result = {"id": f"cw_{raw_id}", "url": response_url, "direct_url": "", "embed_url": "", "source": "camwhores"}
+                result.update(_video_availability(status, response_url, body))
+                return result
             # Sprawdź czy to film oznaczony jako prywatny na Camwhores
             try:
                 check_resp = self.session.get(watch_url, timeout=6)
-                if check_resp.status_code == 200 and ("private video" in check_resp.text.lower() or "login-required" in check_resp.text.lower() or "no-player" in check_resp.text.lower()):
-                    return {
+                check_text = str(getattr(check_resp, "text", "") or "")
+                check_status = int(getattr(check_resp, "status_code", 0) or 0)
+                check_url = str(getattr(check_resp, "url", "") or watch_url)
+                if check_status == 200 and any(marker in check_text.lower() for marker in _CW_PRIVATE_MARKERS):
+                    result = {
                         "id": f"cw_{raw_id}",
-                        "url": watch_url,
+                        "url": check_url,
                         "direct_url": "",
-                        "embed_url": watch_url,
+                        "embed_url": check_url,
                         "source": "camwhores",
                         "is_private": True,
                         "error_message": "Ten film jest prywatny na Camwhores (dostępny wyłącznie dla zarejestrowanych członków)."
                     }
+                    result.update(_video_availability(check_status, check_url, check_text, private=True))
+                    return result
+                result = {"id": f"cw_{raw_id}", "url": check_url, "direct_url": "", "embed_url": check_url, "source": "camwhores"}
+                result.update(_video_availability(check_status, check_url, check_text))
+                return result
             except Exception:
-                pass
-            return {"id": f"cw_{raw_id}", "url": watch_url, "direct_url": "", "embed_url": watch_url, "source": "camwhores"}
+                result = {"id": f"cw_{raw_id}", "url": watch_url, "direct_url": "", "embed_url": watch_url, "source": "camwhores"}
+                result.update(_video_availability(0, watch_url, ""))
+                result["availability_reason"] = "request_error"
+                return result
 
         try:
             # Bezpośredni URL MP4
@@ -496,6 +554,15 @@ class CamwhoresScraper:
                 "source": "camwhores",
                 "platform": "Camwhores.tv"
             }
+            result.update(_video_availability(
+                int(getattr(r, "status_code", 200) or 0),
+                str(getattr(r, "url", "") or watch_url),
+                str(getattr(r, "text", "") or ""),
+                direct_url=direct_url,
+            ))
+            if not direct_url:
+                result["availability_reason"] = "player_without_direct_stream"
+                result["retryable"] = True
 
             if direct_url:
                 import time
@@ -503,7 +570,10 @@ class CamwhoresScraper:
             return result
         except Exception as e:
             logger.error(f"Błąd pobierania detali Camwhores ({watch_url}): {e}")
-            return {"id": f"cw_{raw_id}", "url": watch_url, "direct_url": "", "embed_url": watch_url, "source": "camwhores"}
+            result = {"id": f"cw_{raw_id}", "url": watch_url, "direct_url": "", "embed_url": watch_url, "source": "camwhores"}
+            result.update(_video_availability(0, watch_url, ""))
+            result["availability_reason"] = "parser_error"
+            return result
 
     def close(self) -> None:
         """Zwalnia pulę połączeń HTTP podczas zamykania aplikacji."""

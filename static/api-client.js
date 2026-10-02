@@ -84,6 +84,14 @@
     }, true);
   }
 
+  function refreshVideoDetails(videoId, options = {}) {
+    return postJSON(
+      `/api/video/details/refresh?id=${encodeURIComponent(String(videoId || ''))}`,
+      {},
+      { timeoutMs: 12000, ...options }
+    );
+  }
+
   function getMutationToken() {
     if (typeof document === 'undefined') return '';
     return document.querySelector('meta[name="archivebate-mutation-token"]')?.content || '';
@@ -96,5 +104,5 @@
     return value;
   }
 
-  window.ArchivebateAPI = { ApiError, request, getJSON, postJSON, friendlyMessage, getMutationToken, expectObject };
+  window.ArchivebateAPI = { ApiError, request, getJSON, postJSON, refreshVideoDetails, friendlyMessage, getMutationToken, expectObject };
 })();

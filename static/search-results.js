@@ -151,7 +151,8 @@
     state.currentQuery = query;
     state.currentPage = page;
 
-    const isTag = query.startsWith('#') || (typeof document !== 'undefined' && document.querySelector(`.tag-pill[data-tag="${query.replace('#','').toLowerCase()}"]`) !== null);
+    const isTag = query.startsWith('#') || (typeof document !== 'undefined' &&
+      Array.from(document.querySelectorAll?.('.tag-pill[data-tag]') || []).some(pill => pill.dataset.tag === query.toLowerCase()));
     const cleanTagName = query.replace('#', '').trim();
     if (global.tabManager && typeof global.tabManager.updateActiveTabInfo === 'function') {
       global.tabManager.updateActiveTabInfo(isTag ? `#${cleanTagName}` : `Szukaj: ${query}`, isTag ? 'fa-solid fa-tag' : 'fa-solid fa-magnifying-glass');
@@ -265,6 +266,10 @@
     }
 
     // DLA STRONY 1: STRUMIENIOWANIE W CZASIE RZECZYWISTYM
+    state.videos = [];
+    state.gridCardMap = new Map();
+    state.lastPage = 1;
+    state.isLoading = true;
     if (dom.videoGrid) dom.videoGrid.innerHTML = '';
     showSkeletons();
     if (dom.matchedProfiles) dom.matchedProfiles.style.display = 'none';
@@ -273,12 +278,58 @@
 
     let accumulatedVideos = [];
     let isFirstBatch = true;
+    let finished = false;
+    let watchdog = null;
+    let progressTimer = null;
+    let evtSource = null;
 
-    const evtSource = new EventSource(`/api/search/stream?q=${encodeURIComponent(query)}&source=${src}&author_filter=${af}&group_authors=${grp}`);
+    const cleanup = () => {
+      finished = true;
+      clearTimeout(watchdog);
+      clearTimeout(progressTimer);
+      controller?.signal.removeEventListener('abort', cleanup);
+      evtSource?.close();
+      if (state.activeSearchSource === evtSource) state.activeSearchSource = null;
+      if (generation === state.viewGeneration) state.isLoading = false;
+    };
+    const fail = () => {
+      if (finished || generation !== state.viewGeneration) return;
+      cleanup();
+      if (isFirstBatch) dom.videoGrid?.replaceChildren();
+      const message = accumulatedVideos.length
+        ? 'Wyszukiwanie przerwane. Zachowano pobrane wyniki; lista może być niepełna.'
+        : 'Nie udało się pobrać wyników. Źródło nie odpowiedziało na czas lub połączenie zostało przerwane.';
+      if (dom.videoCount) dom.videoCount.innerText = message;
+      const retry = document.createElement('button');
+      retry.className = 'btn-card search-retry';
+      retry.textContent = 'Ponów wyszukiwanie';
+      retry.addEventListener('click', () => performSearch(query, 1));
+      dom.videoGrid?.appendChild(retry);
+      renderPagination();
+    };
+    const armWatchdog = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(fail, 30000);
+    };
+    controller?.signal.addEventListener('abort', cleanup, { once: true });
+    if (controller?.signal.aborted) { cleanup(); return; }
+    if (dom.paginationSection) dom.paginationSection.style.display = 'flex';
+    if (dom.paginationSectionTop) dom.paginationSectionTop.style.display = 'flex';
+    renderPagination();
+    progressTimer = setTimeout(() => {
+      if (!finished && generation === state.viewGeneration && isFirstBatch && dom.videoCount) {
+        dom.videoCount.innerText = 'Wyszukiwanie online trwa dłużej. Czekam na odpowiedź źródła…';
+      }
+    }, 5000);
+
+    try {
+      evtSource = new EventSource(`/api/search/stream?q=${encodeURIComponent(query)}&source=${src}&author_filter=${af}&group_authors=${grp}`);
+    } catch (_) { fail(); return; }
     state.activeSearchSource = evtSource;
+    armWatchdog();
 
     evtSource.onmessage = (event) => {
-      if (generation !== state.viewGeneration) return;
+      if (finished || generation !== state.viewGeneration) return;
       try {
         const payload = JSON.parse(event.data);
 
@@ -331,10 +382,12 @@
           }
           const totalP = payload.total_profiles || profiles.length;
           const estTotal = payload.estimated_total_videos ? ` • szacunkowo ~${Number(payload.estimated_total_videos).toLocaleString('pl-PL')} filmów` : '';
-          if (dom.videoCount) dom.videoCount.innerText = `Znaleziono ${totalP} profili${estTotal}. Pobieranie nagrań...`;
+          if (isFirstBatch && dom.videoCount) dom.videoCount.innerText = `Znaleziono ${totalP} profili${estTotal}. Pobieranie nagrań...`;
         } else if (payload.type === 'videos') {
           const newVids = payload.videos || [];
           if (newVids.length > 0) {
+            armWatchdog();
+            clearTimeout(progressTimer);
             if (isFirstBatch) {
               if (dom.videoGrid) dom.videoGrid.innerHTML = '';
               isFirstBatch = false;
@@ -354,12 +407,13 @@
             if (dom.videoCount) dom.videoCount.innerText = `Załadowano ${accumulatedVideos.length} filmów • Strona 1 z ${state.lastPage} (wyszukiwanie trwa...)`;
           }
         } else if (payload.type === 'done') {
-          evtSource.close();
-          state.activeSearchSource = null;
+          cleanup();
 
           if (accumulatedVideos.length === 0) {
             renderEmptySearch(query);
             if (dom.videoCount) dom.videoCount.innerText = '0 filmów';
+            state.lastPage = 1;
+            renderPagination();
           } else {
             if (payload.all_sorted_videos && payload.all_sorted_videos.length > 0) {
               accumulatedVideos = payload.all_sorted_videos;
@@ -374,18 +428,14 @@
             }
             renderPagination();
           }
-        }
+        } else if (payload.type === 'error' || payload.type === 'source_error') fail();
       } catch (err) {
         console.error('Błąd SSE:', err);
+        fail();
       }
     };
 
-    evtSource.onerror = () => {
-      if (generation !== state.viewGeneration) return;
-      evtSource.close();
-      state.activeSearchSource = null;
-      renderPagination();
-    };
+    evtSource.onerror = fail;
   }
 
   const ArchivebateSearchResults = {

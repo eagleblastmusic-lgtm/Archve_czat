@@ -11,6 +11,12 @@ class FakeElement {
     this.style = {};
     this.dataset = {};
     this.children = [];
+    if (tagName === 'img') {
+      for (const dimension of ['width','height']) Object.defineProperty(this,dimension,{
+        get:()=>parseFloat(this.style[dimension]) || this['_'+dimension] || 0,
+        set:value=>{this['_'+dimension]=value;}
+      });
+    }
   }
   querySelector(sel) {
     if (sel.includes('.timeline-sprite-image')) {
@@ -97,6 +103,12 @@ const neutral10sSegment = {
 };
 
 const spriteElem = new FakeElement('div');
+const sampled = {...neutral10sSegment, start_time:60, end_time:90, total_duration:95,
+  sample_interval:10, frame_count:3, columns:3, rows:1, times:[60,70,80]};
+for (const [target, expected] of [[60.1,60],[69.9,60],[70.1,70],[79.9,70],[80.1,80]]) {
+  assert.equal(Storyboard.applyFrame(spriteElem,sampled,target,{targetTime:target}).frameTime,expected,
+    'ten-second preview must use the current ten-second bucket and actual timestamp');
+}
 const renderedIndices = [];
 const timeErrors = [];
 const updateTimesMs = [];
@@ -117,6 +129,12 @@ for (let sec = 0; sec < 10; sec += 1) {
 
 // Sprawdzenie: każda z 10 kolejnych sekund otrzymała dokładnie swój unikalny kadr
 assert.deepEqual(renderedIndices, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+assert.equal(Storyboard.applyFrame(spriteElem, {...neutral10sSegment,approximate:true},5).isExact,false,
+  'an approximate manifest must never claim exactness merely because its assigned time is nearby');
+Storyboard.applyFrame(spriteElem, {...neutral10sSegment,sprite_url:'/quick.jpg',columns:4,rows:1,frame_count:4,times:[1,3,5,7]},3);
+Storyboard.applyFrame(spriteElem,neutral10sSegment,5);
+assert.equal(spriteElem.children[0].style.width,'960px','QUICK -> exact must replace the old rendered atlas width');
+assert.equal(spriteElem.children[0].style.height,'180px','QUICK -> exact must replace the old rendered atlas height');
 console.log('PASS 2: Przeciągnięcie kursora przez 10 kolejnych sekund aktualizuje 10 unikalnych kadrów');
 console.log('PASS 3: Maksymalny błąd czasowy w gęstym cache:', Math.max(...timeErrors), 's (wymóg <= 1s)');
 
@@ -189,6 +207,17 @@ assert.ok(p95 <= 50, `p95 wynosi ${p95}ms, co przekracza próg 50ms`);
   assert.equal(warmCheck.segment_index, 1);
   console.log('PASS 6: Ciepły segment zwracany natychmiast z pamięci podręcznej (0ms, 0 zapytań)');
 
+  const endAC = new AbortController();
+  let endUrl = '';
+  const readyFetch = context.fetch;
+  context.fetch = async url => { endUrl = url; return readyFetch(url); };
+  Storyboard.requestSegment({videoId:'end-boundary',duration:60,targetTime:60,signal:endAC.signal});
+  await new Promise(resolve=>setTimeout(resolve,Storyboard.HOVER_INTENT_MS+40));
+  assert.equal(new URL(endUrl,'http://localhost').searchParams.get('segment'),'1',
+    'the right timeline edge uses the final existing segment, not a segment beyond the film');
+  endAC.abort();
+  context.fetch = readyFetch;
+
   // 5. Skok na odległy czas (np. 125s) wylicza poprawny segment 4
   const distantTime = 125.0;
   const segIndex = Math.floor(distantTime / Storyboard.SEGMENT_DURATION);
@@ -209,6 +238,32 @@ assert.ok(p95 <= 50, `p95 wynosi ${p95}ms, co przekracza próg 50ms`);
   await new Promise(r => setTimeout(r, Storyboard.HOVER_INTENT_MS + 20));
   assert.equal(cancelledSegmentLoaded, false, 'Przerwane zapytanie nie powinno wywołać onReady');
   console.log('PASS 8: Anulowanie zapytania przy zmianie filmu zapobiega niepotrzebnym aktualizacjom UI');
+
+  // A status endpoint that never answers must leave preparing, even without
+  // pointer motion. Scale only the 12-second IO watchdog for this fixture.
+  context.setTimeout = (fn, ms) => setTimeout(fn, ms === 12000 ? 30 : ms);
+  let stalledReads = 0;
+  context.fetch = (url, options = {}) => {
+    stalledReads++;
+    return new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), {once:true});
+    });
+  };
+  const phases = [];
+  const stalled = new AbortController();
+  const request = () => Storyboard.requestSegment({videoId:'hung-status', duration:120,
+    targetTime:47, signal:stalled.signal, onStatus:phase=>phases.push(phase)});
+  request();
+  await new Promise(resolve=>setTimeout(resolve, Storyboard.HOVER_INTENT_MS + 100));
+  assert.equal(phases.at(-1), 'error', 'hung status must finish with an error while pointer remains stationary');
+  assert.ok(Storyboard.previewStatusText('hung-status',120,47).includes('Nie udało'));
+  const beforeRetry = stalledReads;
+  request();
+  await new Promise(resolve=>setTimeout(resolve, Storyboard.HOVER_INTENT_MS + 60));
+  assert.equal(stalledReads, beforeRetry, 'mousemove must not erase errors and flood the same failed endpoint');
+  stalled.abort();
+  context.setTimeout = setTimeout;
+  console.log('PASS 9: Hung status is bounded; stationary hover shows error and pointer churn respects cooldown');
 
   console.log('\n--- WSZYSTKIE TESTY PAKIETU D (FRONTEND) ZAKOŃCZONE SUKCESEM (PASS) ---');
 })().catch(err => {

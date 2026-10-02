@@ -63,7 +63,7 @@ assert 'v452-player-qos.js?v=452' in runtime
 assert 'v452-next-video-prefetch.js?v=452' in runtime
 assert '"next_video_prefetch": True' in runtime
 assert "event?.target?.id !== 'modalVideo'" in next_prefetch
-assert 'prefetch.prefetchVideoDetails(candidateId)' in next_prefetch
+assert 'prefetch.prefetchVideoDetails(candidate, options)' in next_prefetch
 assert 'signal:' not in next_prefetch
 assert 'let activeWarm = null' in next_prefetch
 assert 'active_candidate_id' in next_prefetch

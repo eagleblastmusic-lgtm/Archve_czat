@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, main]
   pull_request:
-    branches: [master]
+    branches: [master, main]
   workflow_dispatch:
 
 permissions:
@@ -27,6 +27,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.lock.txt
           pip check
+      - name: Record Python and SQLite runtime
+        run: python -c "import sqlite3,sys; print(f'Python {sys.version.split()[0]} / SQLite {sqlite3.sqlite_version}')"
       - name: Compile Python
         run: python -m compileall -q .
       - name: V4.2 local security regression
@@ -41,6 +43,14 @@ jobs:
         run: node audit/regression_v452_frontend_qos.cjs
       - name: V4.3 grouped feed fast-path regression
         run: python audit/regression_v43_grouped_fast.py
+      - name: Loading and quarantine backend regression
+        run: python audit/regression_loading.py
+      - name: Loading and grouped-card frontend regression
+        run: node audit/regression_loading_frontend.cjs
+      - name: Current storyboard shared-work regression
+        run: node audit/regression_storyboard_watchers.cjs
+      - name: Composed runtime API smoke
+        run: python audit/regression_v43_runtime_wiring.py
       - name: Consolidated audit-fix regressions
         run: python audit/regression_audit_fixes.py
       - name: Core backend regression
@@ -49,10 +59,10 @@ jobs:
         run: node audit/regression_frontend.cjs
       - name: Accessibility and player-controls regression
         run: node audit/regression_accessibility.cjs
-      - name: Home loading regression
-        run: node audit/regression_home_loading.cjs
-      - name: V4.3 home scope guard
+      - name: Home loading and scope regression
         run: python audit/regression_v43_home_scope.py
+      - name: Home thumbnail recovery regression
+        run: node audit/regression_home_loading.cjs
       - name: Block without reload regression
         run: node audit/regression_block_no_reload.cjs
       - name: Pagination regression
@@ -130,6 +140,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.lock.txt
           pip check
+      - name: Record Python and SQLite runtime
+        run: python -c "import sqlite3,sys; print(f'Python {sys.version.split()[0]} / SQLite {sqlite3.sqlite_version}')"
       - name: Secret and destructive-launch negative controls
         shell: pwsh
         run: |
@@ -153,6 +165,14 @@ jobs:
         run: node audit/regression_v452_frontend_qos.cjs
       - name: V4.3 grouped feed fast-path regression
         run: python audit/regression_v43_grouped_fast.py
+      - name: Loading and quarantine backend regression
+        run: python audit/regression_loading.py
+      - name: Loading and grouped-card frontend regression
+        run: node audit/regression_loading_frontend.cjs
+      - name: Composed runtime API smoke
+        run: python audit/regression_v43_runtime_wiring.py
+      - name: Home loading and scope regression
+        run: python audit/regression_v43_home_scope.py
       - name: Next-generation contract regression
         run: python audit/regression_next_generation.py
       - name: Consolidated audit-fix regression
@@ -194,6 +214,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.lock.txt
           pip check
+      - name: Record Python and SQLite runtime
+        run: python -c "import sqlite3,sys; print(f'Python {sys.version.split()[0]} / SQLite {sqlite3.sqlite_version}')"
       - name: Compile Python
         run: python -m compileall -q .
       - name: V4.2 local security regression
@@ -208,6 +230,14 @@ jobs:
         run: node audit/regression_v452_frontend_qos.cjs
       - name: V4.3 grouped feed fast-path regression
         run: python audit/regression_v43_grouped_fast.py
+      - name: Loading and quarantine backend regression
+        run: python audit/regression_loading.py
+      - name: Loading and grouped-card frontend regression
+        run: node audit/regression_loading_frontend.cjs
+      - name: Composed runtime API smoke
+        run: python audit/regression_v43_runtime_wiring.py
+      - name: Home loading and scope regression
+        run: python audit/regression_v43_home_scope.py
       - name: V4.1 catalog concurrency regression
         run: python audit/regression_catalog_v41.py
       - name: Active frontend regression

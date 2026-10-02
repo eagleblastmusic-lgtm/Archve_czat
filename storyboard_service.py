@@ -26,13 +26,14 @@ from cache_store import (
 # - a second worker is reserved for useful neighbor/prewarm work,
 # - stale generations are rejected before FFmpeg,
 # - GET status calls briefly wait on state changes instead of busy-polling.
-STORYBOARD_VERSION = 8
+STORYBOARD_VERSION = 10
 FRAME_WIDTH = 160
 FRAME_HEIGHT = 90
 QUICK_FRAMES = 8
 QUICK_COLUMNS = 4
 SEGMENT_DURATION = 30.0
 SEGMENT_FPS = 1
+SEGMENT_SAMPLE_INTERVAL = 10.0
 SEGMENT_COLUMNS = 6
 WORKER_COUNT = 2
 QUEUE_CAPACITY = 96
@@ -465,10 +466,17 @@ def _run_segment_extract(
     video_id: Optional[str] = None,
     segment_index: Optional[int] = None,
     priority: int = 0,
+    sample_interval: float = 1.0,
 ) -> Tuple[List[Path], List[float], bool]:
     _cleanup_segment_frames(tmp_dir)
+    # Preserve timestamps of actual decoded frames. fps rewrites PTS and can
+    # duplicate one source frame across missing seconds, falsely marking it exact.
+    trim = "" if seek_before_input else (
+        f"trim=start={start_time:.3f}:duration={target_duration:.3f},"
+        f"setpts=PTS-{start_time:.3f}/TB,"
+    )
     vf = (
-        f"setpts=PTS-STARTPTS,fps={SEGMENT_FPS},showinfo,"
+        trim + f"select='isnan(prev_selected_t)+gte(t-prev_selected_t,{sample_interval - 0.001:.6f})',showinfo,"
         f"scale={FRAME_WIDTH}:{FRAME_HEIGHT}:force_original_aspect_ratio=increase,"
         f"crop={FRAME_WIDTH}:{FRAME_HEIGHT}"
     )
@@ -476,11 +484,11 @@ def _run_segment_extract(
     if seek_before_input:
         cmd += ["-ss", f"{start_time:.3f}"]
     cmd += ["-i", source_url]
-    if not seek_before_input:
-        cmd += ["-ss", f"{start_time:.3f}"]
     cmd += [
         "-t", f"{target_duration:.3f}",
         "-vf", vf,
+        "-fps_mode", "vfr",
+        "-enc_time_base", "1:1000",
         "-an", "-sn", "-dn",
         "-threads", "1",
         "-q:v", "7",
@@ -518,7 +526,7 @@ def _run_segment_extract(
     if exact:
         times = [float(start_time) + max(0.0, pts[i]) for i in range(len(frames))]
     else:
-        times = [float(start_time) + i * (1.0 / SEGMENT_FPS) for i in range(len(frames))]
+        times = [float(start_time) + i * sample_interval for i in range(len(frames))]
     return frames, times, exact
 
 
@@ -556,6 +564,23 @@ def _extract_segment_frames(
         ffmpeg, source_url, start_time, target_duration, tmp_dir, timeout
     )
     return frames
+
+
+def _extract_preview_frames_with_times(ffmpeg, source_url, start_time, target_duration, tmp_dir, **kwargs):
+    """One source open and seek per segment, with actual decoded ten-second PTS.
+
+    Reopening a remote MP4 for each anchor repeats connection and index reads.
+    Its former eight-second deadline also rejected slow but healthy sources.
+    Keep the dense extractor's validated output and cancellation contract.
+    """
+    for fast_seek in (True, False):
+        result = _run_segment_extract(
+            ffmpeg, source_url, start_time, target_duration, tmp_dir, 25,
+            fast_seek, sample_interval=SEGMENT_SAMPLE_INTERVAL, **kwargs,
+        )
+        if result[0] or (kwargs.get("cancel_check") and kwargs["cancel_check"]()):
+            return result
+    return [], [], False
 
 
 def _extract_one(ffmpeg: str, source_url: str, target: float, output_path: Path, timeout: int) -> bool:
@@ -650,7 +675,7 @@ def _build_segment(video_id: str, duration: float, segment_index: int, source_ur
     with tempfile.TemporaryDirectory(prefix=f"archivebate_seg_{segment_index}_") as tmp_dir:
         tmp = Path(tmp_dir)
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-        frames, decoded_times, precise_timing = _extract_segment_frames_with_times(
+        frames, decoded_times, precise_timing = _extract_preview_frames_with_times(
             ffmpeg,
             source_url,
             start_time,
@@ -688,13 +713,14 @@ def _build_segment(video_id: str, duration: float, segment_index: int, source_ur
         "duration": round(seg_duration, 3),
         "total_duration": float(duration),
         "frame_count": frame_count,
+        "sample_interval": SEGMENT_SAMPLE_INTERVAL,
         "columns": columns,
         "rows": rows,
         "frame_width": FRAME_WIDTH,
         "frame_height": FRAME_HEIGHT,
         "times": times,
         "approximate": not precise_timing,
-        "time_precision": "decoded_pts_1fps" if precise_timing else "nominal_1fps_fallback",
+        "time_precision": "decoded_pts_10s" if precise_timing else "nominal_10s_fallback",
         "created_at": revision,
         "sprite_file": sprite_path_out.name,
     }

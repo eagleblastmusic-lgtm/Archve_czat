@@ -24,14 +24,19 @@
       </div>
 
       <!-- NAWIGACJA ZAKŁADEK -->
-      <nav class="nav-menu">
+      <nav class="nav-menu top-tabs" aria-label="Główne zakładki">
         <button class="nav-link active" id="navHomeBtn">
-          <i class="fa-solid fa-house"></i> Odkrywaj
+          <i class="fa-solid fa-house"></i> Główna
         </button>
         <button class="nav-link" id="navFavoritesBtn">
           <i class="fa-solid fa-heart"></i> Ulubione
           <span class="nav-counter" id="navFavCount">0</span>
         </button>
+        <button class="nav-link" id="navProfilesBtn">
+          <i class="fa-solid fa-user-group"></i> Profile
+        </button>
+      </nav>
+      <nav class="nav-menu secondary-nav" aria-label="Konto i historia">
         <button class="nav-link" id="navHistoryBtn">
           <i class="fa-solid fa-clock-rotate-left"></i> Historia
           <span class="nav-counter" id="navHistCount">0</span>
@@ -268,6 +273,9 @@
         <span class="count-badge" id="videoCount">Ładowanie...</span>
       </div>
       <div class="content-header-actions" style="display: flex; align-items: center; gap: 10px;">
+        <button class="btn-card" id="refreshCatalogBtn" type="button" title="Rozpocznij nową rewizję katalogu i śledź jej postęp">
+          <i class="fa-solid fa-rotate"></i> Odśwież katalog
+        </button>
         <button class="btn-scan-profiles" id="quickScanBtn" title="Błyskawicznie przeskanuj i uzupełnij tagi wszystkich profili w tle">
           <i class="fa-solid fa-bolt"></i> Baza profili: <span id="scannedModelsCount">--</span>
         </button>

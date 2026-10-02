@@ -5,12 +5,14 @@
   // Dense 1-fps 30-second segments remain authoritative, but uncached FFmpeg
   // work is never allowed to compete with critical primary playback.
   const SEGMENT_DURATION = 30;
+  const SAMPLE_INTERVAL = 10;
   const SEGMENT_MEMORY_LIMIT = 48;
   const QUICK_MEMORY_LIMIT = 24;
   const HOVER_INTENT_MS = 140;
   const QOS_RECHECK_MS = 180;
   const EXACT_BUFFER_SECONDS = 3.0;
   const BACKGROUND_BUFFER_SECONDS = 8.0;
+  const SEGMENT_BUILD_TIMEOUT_MS = 60000;
   const preloadMemory = new Map();
   const quickMemory = new Map();
   const segmentMemory = new Map();
@@ -18,8 +20,10 @@
   const activeTargetRequests = new Map();
   const targetLeases = new Map();
   const recentTargets = new Map();
+  const previewStates = new Map();
   const warmInFlight = new Map();
   const playbackPrewarmTimers = new WeakMap();
+  const videoPreparations = new Map();
 
   const metrics = {
     cacheHits: 0,
@@ -55,12 +59,20 @@
     return Number(ordered[index].toFixed(2));
   }
 
-  function mutationRequest(url, options = {}) {
+  async function mutationRequest(url, options = {}) {
     if (globalThis.ArchivebateAPI?.request) return globalThis.ArchivebateAPI.request(url, options);
     const headers = { ...(options.headers || {}) };
     const token = globalThis.document?.querySelector?.('meta[name="archivebate-mutation-token"]')?.content || '';
     if (token) headers['X-Archivebate-Mutation-Token'] = token;
-    return fetch(url, { ...options, headers });
+    const controller = new AbortController();
+    const unlink = linkAbort(options.signal, controller);
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+      return await fetch(url, { ...options, headers, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+      unlink();
+    }
   }
 
   function cacheKey(videoId, duration) {
@@ -69,6 +81,12 @@
 
   function segmentKey(videoId, duration, segmentIndex) {
     return `${cacheKey(videoId, duration)}:seg_${Number(segmentIndex) || 0}`;
+  }
+
+  function segmentIndexFor(duration, targetTime) {
+    const lastTime = Math.max(0, (Number(duration) || 0) - 0.001);
+    const time = Math.max(0, Math.min(lastTime, Number(targetTime) || 0));
+    return Math.floor(time / SEGMENT_DURATION);
   }
 
   function lruGet(map, key) {
@@ -246,9 +264,17 @@
 
   async function fetchSegmentStatus(videoId, duration, segmentIndex, signal) {
     const endpoint = `/api/storyboard/segment?id=${encodeURIComponent(videoId)}&duration=${encodeURIComponent(duration)}&segment=${encodeURIComponent(segmentIndex)}`;
-    const response = await fetch(endpoint, { cache: 'no-store', signal });
-    if (!response.ok) throw new Error(`Storyboard segment HTTP ${response.status}`);
-    return response.json();
+    const controller = new AbortController();
+    const unlink = linkAbort(signal, controller);
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+      const response = await fetch(endpoint, { cache: 'no-store', signal: controller.signal });
+      if (!response.ok) throw new Error(`Storyboard segment HTTP ${response.status}`);
+      return await response.json();
+    } finally {
+      clearTimeout(timer);
+      unlink();
+    }
   }
 
   async function normalizeReadyBoard(data, signal) {
@@ -303,11 +329,17 @@
     if (targetLeases.get(videoId) === holder) targetLeases.delete(videoId);
   }
 
-  function cancelVideoClientWork(videoId) {
+  function cancelHoverClientWork(videoId) {
     releaseTargetLease(videoId);
     cancelActiveTarget(videoId);
     cancelWarmForVideo(videoId);
     abortSegmentEntriesForVideo(videoId);
+  }
+
+  function cancelVideoClientWork(videoId) {
+    videoPreparations.get(videoId)?.controller.abort();
+    videoPreparations.delete(videoId);
+    cancelHoverClientWork(videoId);
   }
 
   function ensureTargetLease(videoId, signal) {
@@ -325,7 +357,7 @@
     const release = () => {
       if (holder.released) return;
       releaseTargetLease(videoId, holder);
-      cancelVideoClientWork(videoId);
+      cancelHoverClientWork(videoId);
     };
     holder.release = release;
     targetLeases.set(videoId, holder);
@@ -378,6 +410,7 @@
     entry.promise = (async () => {
       metrics.requests += 1;
       const consumer = createConsumerToken(`seg-${segmentIndex}`);
+      const buildTimer = setTimeout(() => controller.abort(), SEGMENT_BUILD_TIMEOUT_MS);
       try {
         // Re-check immediately before demand/POST so a hover that became a
         // player stall while waiting at the intent gate cannot start FFmpeg.
@@ -389,6 +422,7 @@
         });
         if (!startResponse.ok) throw new Error(`Segment start HTTP ${startResponse.status}`);
         let data = await startResponse.json();
+        if (data.status === 'error') throw new Error(data.error || 'Segment error');
         if (data.status === 'ready' && data.sprite_url) {
           const board = await normalizeReadyBoard(data, controller.signal);
           lruSet(segmentMemory, key, board, SEGMENT_MEMORY_LIMIT);
@@ -396,8 +430,14 @@
           return board;
         }
 
-        for (let attempt = 0; attempt < 70; attempt += 1) {
+        const deadline = now() + SEGMENT_BUILD_TIMEOUT_MS;
+        let renewedAt = now();
+        for (let attempt = 0; now() < deadline; attempt += 1) {
           await sleep(attempt < 6 ? 80 : 180, controller.signal);
+          if (now() - renewedAt >= 15000) {
+            await acquireLease(videoId, consumer, controller.signal);
+            renewedAt = now();
+          }
           data = await fetchSegmentStatus(videoId, duration, segmentIndex, controller.signal);
           if (data.status === 'ready' && data.sprite_url) {
             const board = await normalizeReadyBoard(data, controller.signal);
@@ -406,9 +446,19 @@
             return board;
           }
           if (data.status === 'error') throw new Error(data.error || 'Segment error');
+          // A superseded/cancelled backend job may disappear while a new
+          // consumer is already waiting. Restart only the still-live target.
+          if (data.status === 'missing') {
+            await waitForPlaybackBudget(videoId, EXACT_BUFFER_SECONDS, controller.signal);
+            const retry = await mutationRequest(postUrl, { method: 'POST', cache: 'no-store', signal: controller.signal });
+            if (!retry.ok) throw new Error(`Segment restart HTTP ${retry.status}`);
+            data = await retry.json();
+            if (data.status === 'error') throw new Error(data.error || 'Segment error');
+          }
         }
         throw new Error('Przekroczono czas przygotowania segmentu');
       } finally {
+        clearTimeout(buildTimer);
         await releaseLease(entry.leaseUrl);
         if (segmentInFlight.get(key) === entry) segmentInFlight.delete(key);
       }
@@ -445,6 +495,7 @@
   }
 
   async function prepareSegment({ videoId, duration, segmentIndex, signal }) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     duration = Number(duration);
     segmentIndex = Number(segmentIndex) || 0;
     if (!videoId || !Number.isFinite(duration) || duration <= 0 || segmentIndex < 0) {
@@ -456,14 +507,15 @@
       metrics.cacheHits += 1;
       return cached;
     }
+
     metrics.cacheMisses += 1;
     let entry = segmentInFlight.get(key);
-    if (!entry) entry = createSegmentEntry({ videoId, duration, segmentIndex });
+    if (!entry || entry.controller.signal.aborted) entry = createSegmentEntry({ videoId, duration, segmentIndex });
     return consumeSegmentEntry(entry, signal);
   }
 
   function getSegmentFromCache(videoId, duration, targetTime) {
-    const segmentIndex = Math.max(0, Math.floor((Number(targetTime) || 0) / SEGMENT_DURATION));
+    const segmentIndex = segmentIndexFor(duration, targetTime);
     const cached = lruGet(segmentMemory, segmentKey(videoId, duration, segmentIndex));
     if (cached) metrics.cacheHits += 1;
     return cached;
@@ -507,8 +559,18 @@
     if (!active.controller.signal.aborted) active.controller.abort();
   }
 
-  function requestSegment({ videoId, duration, targetTime, signal, onReady }) {
-    const segmentIndex = Math.max(0, Math.floor((Number(targetTime) || 0) / SEGMENT_DURATION));
+  function previewStatusText(videoId, duration, targetTime) {
+    const key = segmentKey(videoId, duration, segmentIndexFor(duration, targetTime));
+    const phase = previewStates.get(key)?.phase;
+    if (phase === 'waiting-buffer') return 'Podgląd czeka na bufor filmu. Wstrzymaj film, aby go przygotować.';
+    if (phase === 'error') return 'Nie udało się pobrać podglądu. Najedź ponownie, aby spróbować.';
+    const preparation = videoPreparations.get(videoId);
+    if (preparation) return `Przygotowywanie podglądów filmu: ${Math.round(100 * preparation.ready / preparation.total)}%…`;
+    return 'Przygotowywanie podglądu…';
+  }
+
+  function requestSegment({ videoId, duration, targetTime, signal, onReady, onStatus }) {
+    const segmentIndex = segmentIndexFor(duration, targetTime);
     const key = segmentKey(videoId, duration, segmentIndex);
     noteTarget(videoId, targetTime);
 
@@ -524,10 +586,18 @@
       return cached;
     }
 
+    // Keep a failed preview visible instead of restarting it on every mouse move.
+    const previous = previewStates.get(key);
+    if (previous?.phase === 'error' && now() - previous.updated < 10000) {
+      onStatus?.('error');
+      return null;
+    }
+
     let active = activeTargetRequests.get(videoId);
     if (active && active.segmentIndex === segmentIndex && !active.controller.signal.aborted) {
       active.onReady = typeof onReady === 'function' ? onReady : active.onReady;
       active.targetTime = Number(targetTime) || 0;
+      active.onStatus = typeof onStatus === 'function' ? onStatus : active.onStatus;
       return null;
     }
 
@@ -535,6 +605,8 @@
       metrics.targetSwitches += 1;
       cancelActiveTarget(videoId);
     }
+    // Foreground hover has priority over advance preparation of other segments.
+    cancelWarmForVideo(videoId);
 
     const controller = new AbortController();
     const unlink = linkAbort(signal, controller);
@@ -545,17 +617,19 @@
       unlink,
       parentSignal: signal || null,
       parentAbort: null,
+      onStatus: typeof onStatus === 'function' ? onStatus : null,
       onReady: typeof onReady === 'function' ? onReady : null,
       promise: null,
       timer: null,
       started: false,
       qosBlocked: false,
+      cacheChecked: false,
     };
     activeTargetRequests.set(videoId, active);
     metrics.intentScheduled += 1;
 
     const parentAbort = () => {
-      if (activeTargetRequests.get(videoId) === active) cancelActiveTarget(videoId);
+      if (activeTargetRequests.get(videoId) === active) cancelHoverClientWork(videoId);
     };
     active.parentAbort = parentAbort;
     signal?.addEventListener?.('abort', parentAbort, { once: true });
@@ -564,12 +638,41 @@
       return null;
     }
 
+    const setPhase = phase => {
+      lruSet(previewStates, key, {phase, updated: now()}, SEGMENT_MEMORY_LIMIT);
+      if (!controller.signal.aborted) active.onStatus?.(phase);
+    };
+    const finishActive = () => {
+      active.parentSignal?.removeEventListener?.('abort', active.parentAbort);
+      if (activeTargetRequests.get(videoId) === active) activeTargetRequests.delete(videoId);
+      unlink();
+    };
     const tryStart = () => {
       active.timer = null;
       if (controller.signal.aborted || activeTargetRequests.get(videoId) !== active) return;
+      // A disk-cached sprite needs no decoder or remote video traffic. Read it
+      // before the playback gate, including while the primary player buffers.
+      if (!active.cacheChecked) {
+        active.cacheChecked = true;
+        active.promise = fetchSegmentStatus(videoId, duration, segmentIndex, controller.signal)
+          .then(async data => {
+            if (controller.signal.aborted) return;
+            if (data.status === 'ready' && data.sprite_url) {
+              const board = await normalizeReadyBoard(data, controller.signal);
+              lruSet(segmentMemory, key, board, SEGMENT_MEMORY_LIMIT);
+              metrics.cacheHits += 1;
+              setPhase('ready');
+              active.onReady?.(board);
+              finishActive();
+            } else tryStart();
+          })
+          .catch(() => { if (!controller.signal.aborted) setPhase('error'); finishActive(); });
+        return;
+      }
       if (!playbackAllowsStoryboard(videoId, EXACT_BUFFER_SECONDS)) {
         if (!active.qosBlocked) {
           active.qosBlocked = true;
+          setPhase('waiting-buffer');
           metrics.qosBlockedStarts += 1;
         }
         metrics.qosWaitLoops += 1;
@@ -578,17 +681,17 @@
       }
       ensureTargetLease(videoId, signal);
       active.started = true;
+      setPhase('loading');
       active.promise = prepareSegment({ videoId, duration, segmentIndex, signal: controller.signal })
         .then(segment => {
-          if (!controller.signal.aborted && typeof active.onReady === 'function') active.onReady(segment);
+          if (!controller.signal.aborted) {
+            setPhase('ready');
+            if (typeof active.onReady === 'function') active.onReady(segment);
+          }
           return segment;
         })
-        .catch(() => null)
-        .finally(() => {
-          active.parentSignal?.removeEventListener?.('abort', active.parentAbort);
-          if (activeTargetRequests.get(videoId) === active) activeTargetRequests.delete(videoId);
-          unlink();
-        });
+        .catch(() => { if (!controller.signal.aborted) setPhase('error'); return null; })
+        .finally(finishActive);
     };
 
     // One idle dwell per target. If playback is not healthy after the dwell,
@@ -600,7 +703,7 @@
   function warm({ videoId, duration, targetTime = 0 }) {
     duration = Number(duration);
     if (!videoId || !Number.isFinite(duration) || duration <= 0) return Promise.resolve(null);
-    const segmentIndex = Math.max(0, Math.floor((Number(targetTime) || 0) / SEGMENT_DURATION));
+    const segmentIndex = segmentIndexFor(duration, targetTime);
     const key = segmentKey(videoId, duration, segmentIndex);
     const cached = lruGet(segmentMemory, key);
     if (cached) return Promise.resolve(cached);
@@ -613,7 +716,7 @@
 
     metrics.prewarmRequests += 1;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 15000);
+    const timer = setTimeout(() => controller.abort(), SEGMENT_BUILD_TIMEOUT_MS);
     const holder = { videoId, controller, promise: null };
     holder.promise = waitForPlaybackBudget(videoId, BACKGROUND_BUFFER_SECONDS, controller.signal)
       .then(() => prepareSegment({ videoId, duration, segmentIndex, signal: controller.signal }))
@@ -630,11 +733,13 @@
     const videoId = resolvePlaybackVideoId(video);
     const duration = Number(video?.duration);
     if (!videoId || !Number.isFinite(duration) || duration <= 0) return;
+    if (getSegmentFromCache(videoId, duration, Number(video.currentTime) || 0)) return;
 
     const oldTimer = playbackPrewarmTimers.get(video);
     if (oldTimer) clearTimeout(oldTimer);
     let attempts = 0;
     const check = () => {
+      playbackPrewarmTimers.delete(video);
       if (video.paused || video.ended) return;
       attempts += 1;
       const ready = Number(video.readyState || 0) >= 3 && bufferedAhead(video) >= BACKGROUND_BUFFER_SECONDS;
@@ -649,7 +754,8 @@
         return;
       }
       playbackPrewarmTimers.delete(video);
-      warm({ videoId, duration, targetTime: Number(video.currentTime) || 0 });
+      warm({ videoId, duration, targetTime: Number(video.currentTime) || 0 })
+        .then(() => prepareVideoAhead(video));
     };
     const timer = setTimeout(check, 650);
     playbackPrewarmTimers.set(video, timer);
@@ -659,6 +765,67 @@
     const video = event?.target;
     if (video?.id === 'modalVideo' || video?.id === 'mainPlayer') schedulePlaybackPrewarm(video);
   }, true);
+
+  globalThis.document?.addEventListener?.('progress', event => {
+    const video = event?.target;
+    if ((video?.id === 'modalVideo' || video?.id === 'mainPlayer') && !video.paused &&
+        !playbackPrewarmTimers.has(video)) schedulePlaybackPrewarm(video);
+  }, true);
+
+  function prepareVideoAhead(video) {
+    const videoId = resolvePlaybackVideoId(video);
+    const duration = Number(video?.duration);
+    if (!videoId || !Number.isFinite(duration) || duration <= 0 || videoPreparations.has(videoId)) return;
+    const controller = new AbortController();
+    const holder = { controller, ready: 0, total: Math.ceil(duration / SEGMENT_DURATION) };
+    videoPreparations.set(videoId, holder);
+    holder.promise = (async () => {
+      // Fill the existing disk/memory segment cache before the pointer gets
+      // there. No second media element or alternate storyboard format.
+      for (let index = 0; index < holder.total && !controller.signal.aborted;) {
+        if (video.isConnected === false || resolvePlaybackVideoId(video) !== videoId) break;
+        if (activeTargetRequests.has(videoId) || !playbackAllowsStoryboard(videoId, BACKGROUND_BUFFER_SECONDS) ||
+            globalThis.document?.hidden) {
+          await sleep(500, controller.signal);
+          continue;
+        }
+        const targetTime = index * SEGMENT_DURATION;
+        let board = getSegmentFromCache(videoId, duration, targetTime);
+        let interrupted = false;
+        if (!board) {
+          const task = warm({ videoId, duration, targetTime });
+          const warming = warmInFlight.get(segmentKey(videoId, duration, index));
+          board = await task;
+          interrupted = !!warming?.controller.signal.aborted;
+        }
+        if (controller.signal.aborted) break;
+        if (board) { holder.ready += 1; index += 1; }
+        else {
+          // A failed source must not block all other parts or create a retry storm.
+          if (!interrupted && !activeTargetRequests.has(videoId) && playbackAllowsStoryboard(videoId, BACKGROUND_BUFFER_SECONDS)) index += 1;
+          await sleep(1000, controller.signal);
+        }
+      }
+    })().catch(() => {}).finally(() => {
+      if (videoPreparations.get(videoId) === holder) videoPreparations.delete(videoId);
+    });
+  }
+
+  globalThis.document?.addEventListener?.('loadedmetadata', event => {
+    const video = event?.target;
+    if (video?.id === 'modalVideo' || video?.id === 'mainPlayer') prepareVideoAhead(video);
+  }, true);
+  globalThis.document?.addEventListener?.('pause', event => {
+    const video = event?.target;
+    if (video?.id === 'modalVideo' || video?.id === 'mainPlayer') prepareVideoAhead(video);
+  }, true);
+  globalThis.document?.addEventListener?.('emptied', event => {
+    const video = event?.target;
+    if (video?.id === 'modalVideo' || video?.id === 'mainPlayer') cancelVideoClientWork(resolvePlaybackVideoId(video));
+  }, true);
+  globalThis.addEventListener?.('pagehide', () => {
+    for (const videoId of videoPreparations.keys()) cancelVideoClientWork(videoId);
+  }, { once: true });
 
   function ensureSpriteImage(element, board) {
     if (!element || !board || !board.sprite_url) return null;
@@ -675,10 +842,14 @@
       element.dataset.boardIdentity = identity;
       element.dataset.frameIndex = '-1';
       img.src = board.sprite_url;
-      img.width = (Number(board.columns) || 1) * (Number(board.frame_width) || 160);
-      img.height = (Number(board.rows) || 1) * (Number(board.frame_height) || 90);
-      img.style.width = `${img.width}px`;
-      img.style.height = `${img.height}px`;
+      const atlasWidth = (Number(board.columns) || 1) * (Number(board.frame_width) || 160);
+      const atlasHeight = (Number(board.rows) || 1) * (Number(board.frame_height) || 90);
+      img.width = atlasWidth;
+      img.height = atlasHeight;
+      // HTMLImageElement.width/height read the previous CSS-rendered size.
+      // Use manifest dimensions when replacing a small QUICK with a dense atlas.
+      img.style.width = `${atlasWidth}px`;
+      img.style.height = `${atlasHeight}px`;
       img.style.transform = 'translate3d(0,0,0)';
     }
     return img;
@@ -700,7 +871,11 @@
     } else targetTime = Number(posOrTime) || 0;
 
     let index;
-    if (Array.isArray(board.times) && board.times.length) index = findNearestIndex(board.times, targetTime);
+    if (Array.isArray(board.times) && board.times.length) {
+      const sampleTime = Number(board.sample_interval) > 1
+        ? Math.floor(targetTime / Number(board.sample_interval)) * Number(board.sample_interval) : targetTime;
+      index = findNearestIndex(board.times, sampleTime);
+    }
     else {
       const clamped = Math.max(0, Math.min(1, Number(posOrTime) || 0));
       index = Math.min(count - 1, Math.floor(clamped * count));
@@ -716,12 +891,13 @@
       img.style.transform = `translate3d(${-col * frameWidth}px, ${-row * frameHeight}px, 0)`;
     }
     const frameTime = board.times?.[index] ?? (count > 1 ? (index / (count - 1)) * Number(board.duration || 0) : 0);
+    element.dataset.frameTime = String(frameTime);
     return {
       ok: true,
       frameIndex: index,
       frameTime,
       targetTime,
-      isExact: Array.isArray(board.times) && Math.abs(Number(frameTime) - targetTime) <= 1.0,
+      isExact: board.approximate !== true && Array.isArray(board.times) && Math.abs(Number(frameTime) - targetTime) <= 1.0,
     };
   }
 
@@ -767,6 +943,7 @@
       segment_cache_entries: segmentMemory.size,
       segment_inflight: segmentInFlight.size,
       warm_inflight: warmInFlight.size,
+      videos_preparing_ahead: videoPreparations.size,
       active_target_requests: activeTargetRequests.size,
       target_leases: targetLeases.size,
       preload_entries: preloadMemory.size,
@@ -780,6 +957,7 @@
   }
 
   const api = {
+    SAMPLE_INTERVAL,
     warm,
     prepare,
     applyFrame,
@@ -788,6 +966,7 @@
     findNearestIndex,
     getSegmentFromCache,
     requestSegment,
+    previewStatusText,
     prepareSegment,
     cancelActiveTarget,
     cancelVideoClientWork,
