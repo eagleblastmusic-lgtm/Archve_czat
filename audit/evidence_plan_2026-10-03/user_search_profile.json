@@ -1,0 +1,266 @@
+{
+  "environment": {
+    "python": "3.14.4",
+    "sqlite": "3.50.4",
+    "OS": "Windows-10-10.0.19045-SP0",
+    "CPU": "Intel64 Family 6 Model 94 Stepping 3, GenuineIntel"
+  },
+  "account": [
+    {
+      "size": 3000,
+      "cold_page": {
+        "samples_ms": [
+          48.024
+        ],
+        "p50_ms": 48.024,
+        "p95_ms": 48.024
+      },
+      "projection": {
+        "samples_ms": [
+          0.703,
+          9.018,
+          0.526,
+          0.541,
+          0.477
+        ],
+        "p50_ms": 0.541,
+        "p95_ms": 9.018
+      },
+      "slice_sort_copy": {
+        "samples_ms": [
+          8.018,
+          8.267,
+          8.01,
+          8.669,
+          8.078
+        ],
+        "p50_ms": 8.078,
+        "p95_ms": 8.669
+      },
+      "enrichment": {
+        "samples_ms": [
+          13.554,
+          10.225,
+          11.971,
+          13.066,
+          13.894
+        ],
+        "p50_ms": 13.066,
+        "p95_ms": 13.894
+      },
+      "warm_page": {
+        "samples_ms": [
+          22.045,
+          23.517,
+          24.096,
+          23.835,
+          21.564
+        ],
+        "p50_ms": 23.517,
+        "p95_ms": 24.096
+      },
+      "four_parallel_requests_5ms_heartbeat": {
+        "samples_ms": [
+          91.525
+        ],
+        "p50_ms": 91.525,
+        "p95_ms": 91.525
+      }
+    },
+    {
+      "size": 10000,
+      "cold_page": {
+        "samples_ms": [
+          45.836
+        ],
+        "p50_ms": 45.836,
+        "p95_ms": 45.836
+      },
+      "projection": {
+        "samples_ms": [
+          2.196,
+          2.813,
+          3.72,
+          23.126,
+          2.524
+        ],
+        "p50_ms": 2.813,
+        "p95_ms": 23.126
+      },
+      "slice_sort_copy": {
+        "samples_ms": [
+          25.368,
+          20.921,
+          27.185,
+          27.643,
+          25.309
+        ],
+        "p50_ms": 25.368,
+        "p95_ms": 27.643
+      },
+      "enrichment": {
+        "samples_ms": [
+          13.09,
+          14.57,
+          18.792,
+          11.415,
+          14.469
+        ],
+        "p50_ms": 14.469,
+        "p95_ms": 18.792
+      },
+      "warm_page": {
+        "samples_ms": [
+          44.979,
+          46.794,
+          43.665,
+          36.549,
+          44.196
+        ],
+        "p50_ms": 44.196,
+        "p95_ms": 46.794
+      },
+      "four_parallel_requests_5ms_heartbeat": {
+        "samples_ms": [
+          38.979,
+          9.056,
+          16.259,
+          16.299,
+          15.975,
+          10.728,
+          16.368,
+          10.486,
+          6.007
+        ],
+        "p50_ms": 15.975,
+        "p95_ms": 38.979
+      }
+    }
+  ],
+  "cold_definition": "First operation on reopened store/SQLite reader; OS filesystem cache is not evicted.",
+  "local_search": {
+    "rows": 440000,
+    "database_bytes": 454475776,
+    "count_query_plan": [
+      [
+        3,
+        0,
+        203,
+        "SCAN catalog_items"
+      ]
+    ],
+    "page_query_plan": [
+      [
+        5,
+        0,
+        202,
+        "SEARCH catalog_items USING INDEX idx_cat_rev_order (revision=?)"
+      ]
+    ],
+    "queries": [
+      {
+        "query": "special_rare_term",
+        "total": 88,
+        "reader_cold": {
+          "samples_ms": [
+            25.079
+          ],
+          "p50_ms": 25.079,
+          "p95_ms": 25.079
+        },
+        "warm": {
+          "samples_ms": [
+            3.252,
+            3.387,
+            3.727,
+            4.346,
+            3.338
+          ],
+          "p50_ms": 3.387,
+          "p95_ms": 4.346
+        }
+      },
+      {
+        "query": "neutral",
+        "total": 440000,
+        "reader_cold": {
+          "samples_ms": [
+            1184.981
+          ],
+          "p50_ms": 1184.981,
+          "p95_ms": 1184.981
+        },
+        "warm": {
+          "samples_ms": [
+            1115.565,
+            1123.388,
+            1128.593,
+            1169.011,
+            1134.055
+          ],
+          "p50_ms": 1128.593,
+          "p95_ms": 1169.011
+        }
+      },
+      {
+        "query": "missing_fixture_term",
+        "total": 0,
+        "reader_cold": {
+          "samples_ms": [
+            28.087
+          ],
+          "p50_ms": 28.087,
+          "p95_ms": 28.087
+        },
+        "warm": {
+          "samples_ms": [
+            0.793,
+            0.833,
+            0.861,
+            0.836,
+            0.813
+          ],
+          "p50_ms": 0.833,
+          "p95_ms": 0.861
+        }
+      },
+      {
+        "query": "author_103",
+        "total": 777,
+        "reader_cold": {
+          "samples_ms": [
+            60.365
+          ],
+          "p50_ms": 60.365,
+          "p95_ms": 60.365
+        },
+        "warm": {
+          "samples_ms": [
+            28.977,
+            32.382,
+            32.401,
+            35.354,
+            30.61
+          ],
+          "p50_ms": 32.382,
+          "p95_ms": 35.354
+        }
+      }
+    ],
+    "initial_index_and_search_ms": 18731.145,
+    "candidate_query_plan": [
+      [
+        4,
+        0,
+        132,
+        "SCAN f VIRTUAL TABLE INDEX 0:L0"
+      ],
+      [
+        12,
+        0,
+        44,
+        "SEARCH c USING INTEGER PRIMARY KEY (rowid=?)"
+      ]
+    ]
+  }
+}

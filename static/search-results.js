@@ -194,18 +194,18 @@
         : '';
       try {
         const data = await api().getJSON(
-          `/api/search/local?q=${encodeURIComponent(query)}&page=${page}&per_page=200&source=${src}${revision}`,
-          { timeoutMs: 30000, signal: controller.signal }
+          `/api/search/local?q=${encodeURIComponent(query)}&page=${page}&per_page=200&source=${src}&author_filter=${af}${revision}${page > 1 && state.preferencesVersion != null ? `&preferences_version=${encodeURIComponent(state.preferencesVersion)}` : ''}`,
+          { timeoutMs: 120000, signal: controller.signal }
         );
         if (generation !== state.viewGeneration) return;
-        const items = Array.isArray(data.items) ? data.items : [];
+        const items = Array.isArray(data.items) ? data.items.map(item => ({ ...item, _mediaScope: 'local_catalog' })) : [];
+        if (Number.isFinite(Number(data.preferences_version))) state.preferencesVersion = Number(data.preferences_version);
         state.catalogRevision = data.catalog_revision || null;
         state.lastPage = Math.max(1, Number(data.page_count || data.last_page) || 1);
         state.currentPage = Math.min(page, state.lastPage);
         state.videos = items;
         if (items.length > 0) {
-          renderVideoGrid(items);
-          scheduleThumbnailWarmup(items);
+          renderVideoGrid(items, { scope: 'local_catalog' });
         } else {
           renderEmptySearch(query);
         }

@@ -5,8 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="referrer" content="no-referrer">
   <title>Odtwarzacz Wideo — Archivebate Browser</title>
-  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" media="print" onload="this.media='all'">
+  <link rel="stylesheet" href="/static/vendor/fontawesome/css/all.min.css">
   <link rel="preconnect" href="https://cdn.freefile.io">
   <link rel="dns-prefetch" href="https://cdn.freefile.io">
   <link rel="preconnect" href="https://cdn.camwhores.tv">
@@ -14,9 +13,9 @@
   <link rel="stylesheet" href="/static/style.css?v=24.0">
   <style>
     body {
-      background: #0b0e14;
-      color: #f1f5f9;
-      font-family: system-ui, 'Segoe UI', Arial, sans-serif;
+      background: var(--bg-main);
+      color: var(--text-main);
+      font-family: var(--font-family);
       margin: 0;
       padding: 0;
       min-height: 100vh;
@@ -502,6 +501,8 @@
 
   <script src="/static/api-client.js?v=1"></script>
   <script src="/static/dom-utils.js?v=1"></script>
+  <script src="/static/toast.js?v=2"></script>
+  <script src="/static/favorites.js?v=2"></script>
   <script src="/static/performance.js?v=1"></script>
   <script src="/static/video-prefetch.js?v=20260924"></script>
   <script src="/static/player-core.js?v=2.2"></script>
@@ -1028,6 +1029,7 @@
       const forceRefresh = !!options?.forceRefresh;
       let detailsResolved = false;
       let streamFailed = false;
+      let failureCheckStarted = false;
       loader.innerHTML = watchLoadingMarkup;
       loader.style.display = 'flex';
       ArchivebatePerf.setPlaybackBusy(true);
@@ -1121,6 +1123,16 @@
             initWatch({ forceRefresh: true, reason: 'retry_button' });
           };
         }
+        if (!failureCheckStarted && window.ArchivebateVideoPrefetch?.checkPlaybackFailure) {
+          failureCheckStarted = true;
+          void ArchivebateVideoPrefetch.checkPlaybackFailure(videoId, controller.signal).then(() => {
+            if (controller.signal.aborted || generation !== watchGeneration) return;
+            if (ArchivebateVideoPrefetch.isKnownUnavailableVideo(videoId)) {
+              loader.textContent = 'Nagranie jest niedostępne. Usunięto je z kafelków.';
+              if (centerPlayOverlay) centerPlayOverlay.style.display = 'none';
+            }
+          });
+        }
       };
 
       // 1. NATYCHMIASTOWY START STRUMIENIA (równolegle, równolegle z pobieraniem metadanych)
@@ -1187,7 +1199,12 @@
           if (watchPoster) watchPoster.style.display = 'none';
           loader.style.display = 'flex';
           loader.textContent = 'Nagranie zostało usunięte ze źródła. Potwierdzam usunięcie przed ukryciem karty.';
-          void ArchivebateVideoPrefetch.confirmUnavailableVideo(videoId, data, controller.signal);
+          await ArchivebateVideoPrefetch.confirmUnavailableVideo(videoId, data, controller.signal);
+          if (!controller.signal.aborted && generation === watchGeneration) {
+            loader.textContent = ArchivebateVideoPrefetch.isKnownUnavailableVideo(videoId)
+              ? 'Nagranie jest niedostępne. Usunięto je z kafelków.'
+              : 'Nagranie jest niedostępne. Nie udało się jeszcze potwierdzić usunięcia.';
+          }
           return;
         }
 
@@ -1312,7 +1329,7 @@
           }
         }
 
-        const recordHistory = () => ArchivebateAPI.postJSON('/api/account/history/record', {source: data.source || (String(videoId).startsWith('cw_') ? 'camwhores' : 'archivebate'), id:videoId,url:data.url,username:data.username,thumbnail:data.thumbnail,date:data.date}, {timeoutMs:5000}).catch(()=>{});
+        const recordHistory = () => ArchivebatePlayerCore.recordHistory({source: data.source || (String(videoId).startsWith('cw_') ? 'camwhores' : 'archivebate'), id:videoId,url:data.url,username:data.username,thumbnail:data.thumbnail,date:data.date});
         if (!player.paused && player.readyState >= 2) recordHistory();
         else player.addEventListener('playing', recordHistory, {once:true,signal:controller.signal});
 
@@ -1326,6 +1343,8 @@
     window.addEventListener('pagehide',()=>{watchController?.abort();watchSeeker?.destroy();});
 
     function updateFavState(isFav) {
+      favBtn.setAttribute('aria-pressed', String(isFav));
+      favBtn.setAttribute('aria-label', isFav ? 'Usuń z ulubionych' : 'Dodaj do ulubionych');
       if (isFav) {
         favBtn.classList.add('active');
         favBtn.innerHTML = '<i class="fa-solid fa-heart"></i> W ulubionych';
@@ -1336,19 +1355,34 @@
     }
 
     favBtn.addEventListener('click', async () => {
-      if (!currentDetails) return;
+      if (!currentDetails || favBtn.disabled) return;
+      favBtn.disabled = true;
+      const source = currentDetails.source || (String(videoId).startsWith('cw_') ? 'camwhores' : 'archivebate');
       try {
         const data = await ArchivebateAPI.postJSON('/api/account/favorites/toggle', {
-          source: currentDetails.source || (String(videoId).startsWith('cw_') ? 'camwhores' : 'archivebate'),
+          source,
+          desired: !favBtn.classList.contains('active'),
           id: videoId,
           url: currentDetails.url,
           username: currentDetails.username,
           thumbnail: currentDetails.thumbnail,
           date: currentDetails.date
-        }, { timeoutMs: 8000 });
+        }, { timeoutMs: 30000 });
+        if (!data.local_committed || typeof data.is_favorite !== 'boolean') throw new Error('Brak potwierdzenia zmiany');
         updateFavState(data.is_favorite);
+        const outcome = ArchivebateFavorites.outcomeMessage(data);
+        ArchivebateToast.show(outcome.message, outcome.type);
       } catch (err) {
-        alert(err?.message || 'Nie udało się zmienić ulubionych.');
+        try {
+          const state = await ArchivebateAPI.getJSON(`/api/account/favorites/state?source=${encodeURIComponent(source)}&provider_id=${encodeURIComponent(String(videoId).replace(/^cw_/, ''))}`, { timeoutMs: 5000 });
+          if (typeof state.is_favorite !== 'boolean') throw new Error('Nieznany stan zapisu');
+          updateFavState(state.is_favorite);
+          ArchivebateToast.show('Odczytano lokalny stan ulubionego. Wynik operacji zdalnej może być niepewny.', 'warning');
+        } catch (_) {
+          ArchivebateToast.show('Nie udało się ustalić wyniku zmiany ulubionego. Ponów odczyt stanu.', 'warning');
+        }
+      } finally {
+        favBtn.disabled = false;
       }
     });
 

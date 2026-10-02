@@ -10,6 +10,8 @@ import re
 import shutil
 import tempfile
 import threading
+import uuid
+from functools import wraps
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set
 
@@ -43,6 +45,7 @@ def _defaults() -> Dict[str, Any]:
     return {
         "schema_version": STORE_SCHEMA_VERSION,
         "preferences_version": 0,
+        "restore_generation": 0,
         "favorites": [],
         "history": [],
         "following": [],
@@ -82,6 +85,15 @@ def _locked_method(fn):
 
     wrapped.__name__ = fn.__name__
     wrapped.__doc__ = fn.__doc__
+    return wrapped
+
+
+def _read_method(fn):
+    """Readers wait for the writer's commit or rollback, never its draft."""
+    @wraps(fn)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
     return wrapped
 
 
@@ -197,10 +209,9 @@ class UserStorage:
                 raise ValueError(f"user store field {field!r} must be a list")
         if "blocked_model_video_counts" in loaded and not isinstance(loaded["blocked_model_video_counts"], dict):
             raise ValueError("blocked_model_video_counts must be an object")
-        if "preferences_version" in loaded and (
-            not isinstance(loaded["preferences_version"], int) or loaded["preferences_version"] < 0
-        ):
-            raise ValueError("preferences_version must be a non-negative integer")
+        for generation in ("preferences_version", "restore_generation"):
+            if generation in loaded and (type(loaded[generation]) is not int or loaded[generation] < 0):
+                raise ValueError(f"{generation} must be a non-negative integer")
         normalized = _defaults()
         normalized.update(copy.deepcopy(loaded))
         normalized["schema_version"] = STORE_SCHEMA_VERSION
@@ -213,6 +224,7 @@ class UserStorage:
         """Load without overwriting a corrupt original or creating a repair illusion."""
         with self._lock:
             self._ensure_open()
+            self._projection_cache = None
             if not os.path.exists(self.store_file):
                 self.data = _defaults()
                 self._health.update({"status": "ready", "original_exists": False, "last_error": None})
@@ -307,6 +319,7 @@ class UserStorage:
             payload["schema_version"] = STORE_SCHEMA_VERSION
             atomic_write_json(self.store_file, payload)
             self.data = payload
+            self._projection_cache = None
             self._health.update({"status": "ready", "last_error": None, "original_exists": True})
         return True
 
@@ -330,6 +343,8 @@ class UserStorage:
 
     def _without_blocked_models(self, values: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
         blocked = self._blocked_model_norms()
+        if not blocked:
+            return list(values)
         visible = []
         for value in values:
             normalized = self._norm_author(value.get("username"))
@@ -341,7 +356,7 @@ class UserStorage:
     def _strip_group_fields(video: Dict[str, Any]) -> Dict[str, Any]:
         return {
             key: value for key, value in video.items()
-            if key not in {"grouped_videos", "playlist", "is_grouped", "group_count", "_groupedVideos"}
+            if key not in {"grouped_videos", "playlist", "is_grouped", "group_count", "_groupedVideos", "desired"}
         }
 
     @staticmethod
@@ -365,6 +380,7 @@ class UserStorage:
         return VideoKey.from_value(video_id, source=source)
 
     @property
+    @_read_method
     def preferences_version(self) -> int:
         return int(self.data.get("preferences_version", 0) or 0)
 
@@ -372,12 +388,14 @@ class UserStorage:
         self.data["preferences_version"] = self.preferences_version + 1
 
     # ULUBIONE
+    @_read_method
     def get_favorites(self, include_blocked: bool = True) -> List[Dict[str, Any]]:
         values = self.data.get("favorites", [])
         if not include_blocked:
             values = self._without_blocked_models(values)
         return _sort_items_newest(copy.deepcopy(values))
 
+    @_read_method
     def get_favorite_keys(self) -> List[Dict[str, str]]:
         result = []
         for item in self.data.get("favorites", []):
@@ -386,6 +404,7 @@ class UserStorage:
                 result.append(key.as_dict())
         return result
 
+    @_read_method
     def is_favorite(self, video_id: Any, source: Optional[str] = None) -> bool:
         key = self._coerce_lookup_key(video_id, source=source)
         if key:
@@ -426,23 +445,31 @@ class UserStorage:
         self.save()
         return True
 
-    @_locked_method
     def toggle_favorite(self, video: Dict[str, Any]) -> bool:
+        return self.commit_favorite_toggle(video)["is_favorite"]
+
+    @_locked_method
+    def commit_favorite_toggle(self, video: Dict[str, Any], remote_required: bool = False) -> dict:
+        """Commit the local choice and its remote intent in one durable write."""
         key = self._require_key(video)
-        if self.is_favorite(video):
+        before = self.is_favorite(video)
+        result = video["desired"] if isinstance(video.get("desired"), bool) else not before
+        if before and not result:
             self.data["favorites"] = [value for value in self.data.get("favorites", []) if not self._same_key(value, key)]
-            result = False
-        else:
+        elif result and not before:
             item = self._strip_group_fields(dict(video))
             item["source"] = key.source
             item["id"] = f"cw_{key.provider_id}" if key.source == "camwhores" else key.provider_id
             item["added_at"] = datetime.now(timezone.utc).isoformat()
             self.data.setdefault("favorites", []).insert(0, item)
-            result = True
-        self._bump_preferences()
+        if before != result:
+            self._bump_preferences()
+        # A new local-only choice also supersedes an older remote intent.
+        intent = self._put_remote_intent(video, result, "pending" if remote_required else "local_only")
         self.save()
-        return result
+        return {"is_favorite": result, "operation_id": intent["operation_id"], "preferences_version": self.preferences_version}
 
+    @_read_method
     def get_favorite_authors(self) -> List[str]:
         blocked = self._blocked_model_norms()
         authors = {
@@ -454,6 +481,7 @@ class UserStorage:
         return sorted(authors)
 
     # HISTORIA
+    @_read_method
     def get_history(self, include_blocked: bool = True) -> List[Dict[str, Any]]:
         values = self.data.get("history", [])
         if not include_blocked:
@@ -479,6 +507,7 @@ class UserStorage:
         self.save()
 
     # OBSERWOWANE
+    @_read_method
     def get_following(self, include_blocked: bool = True) -> List[Dict[str, Any]]:
         values = self.data.get("following", [])
         if not include_blocked:
@@ -517,13 +546,38 @@ class UserStorage:
         watchlater: List[Dict[str, Any]],
         history: List[Dict[str, Any]],
         following: List[Dict[str, Any]],
+        observed_intents: Optional[dict] = None,
+        favorites_complete: bool = True,
+        expected_restore_generation: Optional[int] = None,
+        sync_complete: bool = True,
     ) -> None:
-        self._merge_video_collection("favorites", watchlater, "added_at")
+        if expected_restore_generation is not None and self.data.get("restore_generation", 0) != expected_restore_generation:
+            raise RuntimeError("Magazyn przywrócono podczas synchronizacji. Ponów synchronizację.")
+        previous_keys = {self._stored_key(v) for v in self.data.get("favorites", [])}
+        remote_keys = {self._stored_key(v) for v in watchlater}
+        protected = {}
+        for intent in self.data.get("remote_outbox", []):
+            key = VideoKey.from_value(intent.get("provider_id"), source=intent.get("source"))
+            if not key:
+                continue
+            protected[key] = bool(intent.get("desired"))
+            observed = observed_intents is not None and observed_intents.get(key.as_string()) == intent.get("operation_id")
+            matches = (key in remote_keys) == bool(intent.get("desired"))
+            if observed and matches and (intent.get("desired") or favorites_complete) and intent.get("status") != "local_only":
+                intent.update(status="confirmed", error=None, updated_at=datetime.now(timezone.utc).isoformat())
+        # A delayed snapshot cannot resurrect a tombstone or change a newer choice.
+        incoming = [v for v in watchlater if protected.get(self._stored_key(v), True)]
+        self._merge_video_collection("favorites", incoming, "added_at")
+        self.data["favorites"] = [v for v in self.data["favorites"] if protected.get(self._stored_key(v), True)]
         self._merge_video_collection("history", history, "watched_at")
         self._merge_video_collection("following", following, "added_at")
-        self.data["last_synced"] = datetime.now(timezone.utc).isoformat()
+        if {self._stored_key(v) for v in self.data["favorites"]} != previous_keys:
+            self._bump_preferences()
+        if sync_complete:
+            self.data["last_synced"] = datetime.now(timezone.utc).isoformat()
         self.save()
 
+    @_read_method
     def search_stored_videos(self, query: str) -> List[Dict[str, Any]]:
         q = str(query or "").lower().replace("#", "").strip()
         if not q:
@@ -544,6 +598,7 @@ class UserStorage:
         return results
 
     # BLOKOWANIE / CZARNA LISTA — wyłącznie projekcja, bez kasowania danych.
+    @_read_method
     def is_model_blocked(self, username: str) -> bool:
         norm = self._norm_author(username)
         if not norm:
@@ -582,6 +637,7 @@ class UserStorage:
             "preferences_version": self.preferences_version,
         }
 
+    @_read_method
     def get_blocked_stats(self) -> dict:
         counts = self.data.get("blocked_model_video_counts", {}) or {}
         total = sum(int(counts.get(self._norm_author(value), 0) or 0) for value in self.get_blocked_models())
@@ -607,12 +663,18 @@ class UserStorage:
         self.save()
         return True
 
+    @_read_method
     def get_blocked_models(self) -> List[str]:
         return sorted(set(str(value) for value in self.data.get("blocked_models", [])))
 
     # Remote mutation intent/status (durable and explicit; no implicit retry).
     @_locked_method
     def set_remote_intent(self, video: Dict[str, Any], desired: bool, status: str = "pending") -> dict:
+        entry = self._put_remote_intent(video, desired, status)
+        self.save()
+        return copy.deepcopy(entry)
+
+    def _put_remote_intent(self, video: Dict[str, Any], desired: bool, status: str) -> dict:
         key = self._require_key(video)
         outbox = self.data.setdefault("remote_outbox", [])
         entry = {
@@ -621,12 +683,13 @@ class UserStorage:
             "desired": bool(desired),
             "status": str(status),
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            "operation_id": uuid.uuid4().hex,
         }
         outbox[:] = [value for value in outbox if not (value.get("source") == key.source and value.get("provider_id") == key.provider_id)]
         outbox.append(entry)
-        self.save()
         return copy.deepcopy(entry)
 
+    @_read_method
     def get_remote_intent(self, video: Dict[str, Any]) -> Optional[dict]:
         key = VideoKey.from_video(video, require_source=True)
         if not key:
@@ -637,7 +700,7 @@ class UserStorage:
         return None
 
     @_locked_method
-    def set_remote_status(self, video: Dict[str, Any], status: str, error: Optional[str] = None) -> Optional[dict]:
+    def set_remote_status(self, video: Dict[str, Any], status: str, error: Optional[str] = None, operation_id: Optional[str] = None) -> Optional[dict]:
         key = self._require_key(video)
         found = None
         for entry in reversed(self.data.setdefault("remote_outbox", [])):
@@ -646,11 +709,82 @@ class UserStorage:
                 break
         if found is None:
             return None
+        if operation_id is not None and found.get("operation_id") != operation_id:
+            return None
         found["status"] = str(status)
         found["error"] = str(error) if error else None
         found["updated_at"] = datetime.now(timezone.utc).isoformat()
         self.save()
         return copy.deepcopy(found)
+
+    @_read_method
+    def projection_snapshot(self) -> dict:
+        """One committed projection, without copying entire video collections."""
+        cached = getattr(self, "_projection_cache", None)
+        if cached is not None and cached["preferences_version"] == self.preferences_version:
+            return self._copy_projection(cached)
+        blocked_models = list(self.data.get("blocked_models", []))
+        blocked = self._blocked_model_norms()
+        favorite_keys, authors = [], set()
+        counts = {}
+        for field in ("favorites", "history", "following"):
+            values = self.data.get(field, [])
+            visible_count = len(values) if not blocked else 0
+            for value in values if blocked or field == "favorites" else ():
+                username = str(value.get("username") or "").lower().strip()
+                visible = not blocked or self._norm_author(username) not in blocked
+                if blocked and visible:
+                    visible_count += 1
+                if field == "favorites":
+                    key = self._stored_key(value)
+                    if key:
+                        favorite_keys.append(key.as_dict())
+                    if visible and username not in {"", "model"}:
+                        authors.add(username)
+            counts[f"{field}_count"] = visible_count
+        blocked_counts = copy.deepcopy(self.data.get("blocked_model_video_counts", {}))
+        hidden = sum(int(blocked_counts.get(norm, 0) or 0) for norm in blocked)
+        projection = {
+            "preferences_version": self.preferences_version,
+            "restore_generation": self.data.get("restore_generation", 0),
+            "favorite_keys": favorite_keys,
+            "favorite_authors": sorted(authors),
+            "blocked_models": blocked_models,
+            "blocked_model_video_counts": blocked_counts,
+            "blocked_authors_count": len(blocked_models), "blocked_videos_total": hidden,
+            "hidden_videos_estimate": hidden, "accuracy": "estimate", "non_destructive": True,
+            **counts,
+            "last_synced": self.data.get("last_synced"),
+            "store_health": self.health(),
+            "remote_outbox": copy.deepcopy(self.data.get("remote_outbox", [])),
+        }
+        self._projection_cache = projection
+        return self._copy_projection(projection)
+
+    @staticmethod
+    def _copy_projection(projection: dict) -> dict:
+        result = dict(projection)
+        result["favorite_keys"] = [dict(key) for key in projection["favorite_keys"]]
+        for field in ("favorite_authors", "blocked_models"):
+            result[field] = list(projection[field])
+        for field in ("remote_outbox", "store_health", "blocked_model_video_counts"):
+            result[field] = copy.deepcopy(projection[field])
+        return result
+
+    @_read_method
+    def account_page(self, field: str, page: int, page_size: int) -> dict:
+        if field not in {"favorites", "history", "following"}:
+            raise ValueError("invalid account collection")
+        values = _sort_items_newest(self._without_blocked_models(self.data.get(field, [])))
+        start = (page - 1) * page_size
+        return {"videos": copy.deepcopy(values[start:start + page_size]), "total": len(values), "preferences": self.projection_snapshot()}
+
+    @_read_method
+    def favorite_state(self, video: dict) -> dict:
+        projection = self.projection_snapshot()
+        return {"is_favorite": self.is_favorite(video), "total_favorites": projection["favorites_count"],
+                "favorite_authors": projection["favorite_authors"], "preferences_version": projection["preferences_version"],
+                "remote_intent": self.get_remote_intent(video)}
 
     # Backup / restore
     def export_snapshot(self) -> dict:
@@ -680,6 +814,8 @@ class UserStorage:
         with self._lock:
             self._ensure_open()
             restored = self.validate_snapshot(snapshot)
+            restored["preferences_version"] = max(self.preferences_version, restored["preferences_version"]) + 1
+            restored["restore_generation"] = max(int(self.data.get("restore_generation", 0)), int(restored.get("restore_generation", 0))) + 1
             previous_data = copy.deepcopy(self.data)
             previous_health = copy.deepcopy(self._health)
             was_recovery = previous_health.get("status") == "recovery_required"

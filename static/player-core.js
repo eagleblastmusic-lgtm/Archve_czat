@@ -404,6 +404,30 @@
     return Math.abs(times[low] - target) < Math.abs(times[high] - target) ? low : high;
   }
 
+  const historyFailureToasts = new Map();
+  async function recordHistory(video, onCommitted = null) {
+    const key = `${video.source}:${video.id}`;
+    try {
+      const result = await window.ArchivebateAPI.postJSON('/api/account/history/record', video, { timeoutMs: 5000 });
+      if (!result?.success) throw new Error('Brak potwierdzenia zapisu historii');
+      onCommitted?.(result);
+      const prior = historyFailureToasts.get(key);
+      if (prior) {
+        window.ArchivebateToast?.show('Obejrzenie zapisane w historii.', 'success', prior);
+        historyFailureToasts.delete(key);
+      }
+      return true;
+    } catch (error) {
+      const message = error?.status === 503 ? 'Nie zapisano obejrzenia w historii.' : 'Nie potwierdzono zapisu obejrzenia w historii.';
+      const toast = window.ArchivebateToast?.show(message, 'warning', historyFailureToasts.get(key), [
+        { label: 'Ponów zapis', onClick: async button => { button.disabled = true; await recordHistory(video, onCommitted); } }
+      ], { durationMs: 15000 });
+      if (toast) historyFailureToasts.set(key, toast);
+      while (historyFailureToasts.size > 20) historyFailureToasts.delete(historyFailureToasts.keys().next().value);
+      return false;
+    }
+  }
+
   window.ArchivebatePlayerCore = {
     clamp,
     ratioFromPointer,
@@ -417,6 +441,7 @@
     setupIdleTimer,
     waitForPresentedFrame,
     createPreviewSeeker,
-    findNearestFrameIndex
+    findNearestFrameIndex,
+    recordHistory
   };
 })();

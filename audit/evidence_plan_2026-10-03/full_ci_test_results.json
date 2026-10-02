@@ -1,0 +1,663 @@
+{
+  "source_head": "6c2065b0d2eee9a0fce3986185ff1731e3869991",
+  "source_manifest_sha256": "10d4e8030de419738773fe126c47ef200e4086fc3d84c656cae8250abd115828",
+  "host_python": "3.14.4 (tags/v3.14.4:23116f9, Apr  7 2026, 14:10:54) [MSC v.1944 64 bit (AMD64)]",
+  "host_sqlite": "3.50.4",
+  "host_node": "v24.19.0",
+  "mode": "full-ci",
+  "tests": [
+    {
+      "job": "offline-regression",
+      "command": "python -c import sqlite3,sys; print(f'Python {sys.version.split()[0]} / SQLite {sqlite3.sqlite_version}')",
+      "exit_code": 0,
+      "seconds": 0.109,
+      "log": "001_offline-regression_python_-c_import_sqlite3_sys_print_f_Python_sys_version_split_0_SQLite_sqlite3_sqlite_version.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python -m compileall -q .",
+      "exit_code": 0,
+      "seconds": 1.049,
+      "log": "002_offline-regression_python_-m_compileall_-q.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_dependency_lock.py",
+      "exit_code": 0,
+      "seconds": 0.497,
+      "log": "003_offline-regression_python_audit_regression_dependency_lock_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_user_projection.py",
+      "exit_code": 0,
+      "seconds": 2.176,
+      "log": "004_offline-regression_python_audit_regression_user_projection_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_security_v42.py",
+      "exit_code": 0,
+      "seconds": 1.374,
+      "log": "005_offline-regression_python_audit_regression_security_v42_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_v42_full.py",
+      "exit_code": 0,
+      "seconds": 3.512,
+      "log": "006_offline-regression_python_audit_regression_v42_full_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_v43_storyboard_scheduler.py",
+      "exit_code": 0,
+      "seconds": 1.262,
+      "log": "007_offline-regression_python_audit_regression_v43_storyboard_scheduler_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_v452_player_qos.py",
+      "exit_code": 0,
+      "seconds": 0.195,
+      "log": "008_offline-regression_python_audit_regression_v452_player_qos_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_v452_frontend_qos.cjs",
+      "exit_code": 0,
+      "seconds": 6.338,
+      "log": "009_offline-regression_node_audit_regression_v452_frontend_qos_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_v43_grouped_fast.py",
+      "exit_code": 0,
+      "seconds": 0.487,
+      "log": "010_offline-regression_python_audit_regression_v43_grouped_fast_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_loading.py",
+      "exit_code": 0,
+      "seconds": 1.695,
+      "log": "011_offline-regression_python_audit_regression_loading_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_loading_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 3.367,
+      "log": "012_offline-regression_node_audit_regression_loading_frontend_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_storyboard_watchers.cjs",
+      "exit_code": 0,
+      "seconds": 0.252,
+      "log": "013_offline-regression_node_audit_regression_storyboard_watchers_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_v43_runtime_wiring.py",
+      "exit_code": 0,
+      "seconds": 1.666,
+      "log": "014_offline-regression_python_audit_regression_v43_runtime_wiring_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_audit_fixes.py",
+      "exit_code": 0,
+      "seconds": 2.129,
+      "log": "015_offline-regression_python_audit_regression_audit_fixes_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_checks.py",
+      "exit_code": 0,
+      "seconds": 1.403,
+      "log": "016_offline-regression_python_audit_regression_checks_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 0.129,
+      "log": "017_offline-regression_node_audit_regression_frontend_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_accessibility.cjs",
+      "exit_code": 0,
+      "seconds": 0.069,
+      "log": "018_offline-regression_node_audit_regression_accessibility_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_v43_home_scope.py",
+      "exit_code": 0,
+      "seconds": 0.194,
+      "log": "019_offline-regression_python_audit_regression_v43_home_scope_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_home_loading.cjs",
+      "exit_code": 0,
+      "seconds": 0.072,
+      "log": "020_offline-regression_node_audit_regression_home_loading_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_block_no_reload.cjs",
+      "exit_code": 0,
+      "seconds": 0.066,
+      "log": "021_offline-regression_node_audit_regression_block_no_reload_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_pagination.cjs",
+      "exit_code": 0,
+      "seconds": 0.094,
+      "log": "022_offline-regression_node_audit_regression_pagination_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_search_filters.cjs",
+      "exit_code": 0,
+      "seconds": 0.095,
+      "log": "023_offline-regression_node_audit_regression_search_filters_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_local_search.cjs",
+      "exit_code": 0,
+      "seconds": 0.106,
+      "log": "024_offline-regression_node_audit_regression_local_search_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_search_pagination.py",
+      "exit_code": 0,
+      "seconds": 0.51,
+      "log": "025_offline-regression_python_audit_regression_search_pagination_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_storyboard_client.cjs",
+      "exit_code": 0,
+      "seconds": 1.111,
+      "log": "026_offline-regression_node_audit_regression_storyboard_client_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_v43_modal_identity.cjs",
+      "exit_code": 0,
+      "seconds": 0.083,
+      "log": "027_offline-regression_node_audit_regression_v43_modal_identity_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_storyboard_cross_tab.cjs",
+      "exit_code": 0,
+      "seconds": 0.111,
+      "log": "028_offline-regression_node_audit_regression_storyboard_cross_tab_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_package_d_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 1.098,
+      "log": "029_offline-regression_node_audit_regression_package_d_frontend_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "node audit/regression_catalog_partial_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 0.15,
+      "log": "030_offline-regression_node_audit_regression_catalog_partial_frontend_cjs.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_feed.py",
+      "exit_code": 0,
+      "seconds": 3.74,
+      "log": "031_offline-regression_python_audit_regression_feed_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_catalog_bootstrap.py",
+      "exit_code": 0,
+      "seconds": 1.367,
+      "log": "032_offline-regression_python_audit_regression_catalog_bootstrap_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_catalog_resume.py",
+      "exit_code": 0,
+      "seconds": 4.015,
+      "log": "033_offline-regression_python_audit_regression_catalog_resume_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_catalog_transient_resume.py",
+      "exit_code": 0,
+      "seconds": 1.67,
+      "log": "034_offline-regression_python_audit_regression_catalog_transient_resume_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_catalog_revision_monotonicity.py",
+      "exit_code": 0,
+      "seconds": 0.488,
+      "log": "035_offline-regression_python_audit_regression_catalog_revision_monotonicity_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_latest_sparse_migration_scope.py",
+      "exit_code": 0,
+      "seconds": 0.559,
+      "log": "036_offline-regression_python_audit_regression_latest_sparse_migration_scope_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_archivebate_sparse_pagination.py",
+      "exit_code": 0,
+      "seconds": 1.568,
+      "log": "037_offline-regression_python_audit_regression_archivebate_sparse_pagination_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_deep_archivebate.py",
+      "exit_code": 0,
+      "seconds": 0.458,
+      "log": "038_offline-regression_python_audit_regression_deep_archivebate_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_catalog_v41.py",
+      "exit_code": 0,
+      "seconds": 0.583,
+      "log": "039_offline-regression_python_audit_regression_catalog_v41_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_camwhores_sparse_pagination.py",
+      "exit_code": 0,
+      "seconds": 1.49,
+      "log": "040_offline-regression_python_audit_regression_camwhores_sparse_pagination_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_legacy_resume_cursor.py",
+      "exit_code": 0,
+      "seconds": 3.572,
+      "log": "041_offline-regression_python_audit_regression_legacy_resume_cursor_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_archivebate_true_end.py",
+      "exit_code": 0,
+      "seconds": 1.251,
+      "log": "042_offline-regression_python_audit_regression_archivebate_true_end_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_archivebate_source_limit.py",
+      "exit_code": 0,
+      "seconds": 6.836,
+      "log": "043_offline-regression_python_audit_regression_archivebate_source_limit_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_grouped_query_batch.py",
+      "exit_code": 0,
+      "seconds": 0.944,
+      "log": "044_offline-regression_python_audit_regression_grouped_query_batch_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_catalog_read_concurrency.py",
+      "exit_code": 0,
+      "seconds": 0.421,
+      "log": "045_offline-regression_python_audit_regression_catalog_read_concurrency_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_integration.py",
+      "exit_code": 0,
+      "seconds": 2.548,
+      "log": "046_offline-regression_python_audit_regression_integration_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python audit/regression_package_d.py",
+      "exit_code": 0,
+      "seconds": 1.952,
+      "log": "047_offline-regression_python_audit_regression_package_d_py.log"
+    },
+    {
+      "job": "offline-regression",
+      "command": "python -m unittest test_suite -q",
+      "exit_code": 0,
+      "seconds": 1.244,
+      "log": "048_offline-regression_python_-m_unittest_test_suite_-q.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python -c import sqlite3,sys; print(f'Python {sys.version.split()[0]} / SQLite {sqlite3.sqlite_version}')",
+      "exit_code": 0,
+      "seconds": 0.104,
+      "log": "049_windows-contracts_python_-c_import_sqlite3_sys_print_f_Python_sys_version_split_0_SQLite_sqlite3_sqlite_version.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python -m compileall -q .",
+      "exit_code": 0,
+      "seconds": 0.203,
+      "log": "050_windows-contracts_python_-m_compileall_-q.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_dependency_lock.py",
+      "exit_code": 0,
+      "seconds": 0.51,
+      "log": "051_windows-contracts_python_audit_regression_dependency_lock_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_user_projection.py",
+      "exit_code": 0,
+      "seconds": 2.055,
+      "log": "052_windows-contracts_python_audit_regression_user_projection_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_security_v42.py",
+      "exit_code": 0,
+      "seconds": 1.274,
+      "log": "053_windows-contracts_python_audit_regression_security_v42_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_v42_full.py",
+      "exit_code": 0,
+      "seconds": 3.318,
+      "log": "054_windows-contracts_python_audit_regression_v42_full_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_v43_storyboard_scheduler.py",
+      "exit_code": 0,
+      "seconds": 0.8,
+      "log": "055_windows-contracts_python_audit_regression_v43_storyboard_scheduler_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_v452_player_qos.py",
+      "exit_code": 0,
+      "seconds": 0.102,
+      "log": "056_windows-contracts_python_audit_regression_v452_player_qos_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "node audit/regression_v452_frontend_qos.cjs",
+      "exit_code": 0,
+      "seconds": 6.331,
+      "log": "057_windows-contracts_node_audit_regression_v452_frontend_qos_cjs.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_v43_grouped_fast.py",
+      "exit_code": 0,
+      "seconds": 0.468,
+      "log": "058_windows-contracts_python_audit_regression_v43_grouped_fast_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_loading.py",
+      "exit_code": 0,
+      "seconds": 1.526,
+      "log": "059_windows-contracts_python_audit_regression_loading_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "node audit/regression_loading_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 3.214,
+      "log": "060_windows-contracts_node_audit_regression_loading_frontend_cjs.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_v43_runtime_wiring.py",
+      "exit_code": 0,
+      "seconds": 1.365,
+      "log": "061_windows-contracts_python_audit_regression_v43_runtime_wiring_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_v43_home_scope.py",
+      "exit_code": 0,
+      "seconds": 0.178,
+      "log": "062_windows-contracts_python_audit_regression_v43_home_scope_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_next_generation.py",
+      "exit_code": 0,
+      "seconds": 2.031,
+      "log": "063_windows-contracts_python_audit_regression_next_generation_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python audit/regression_audit_fixes.py",
+      "exit_code": 0,
+      "seconds": 2.012,
+      "log": "064_windows-contracts_python_audit_regression_audit_fixes_py.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "node audit/regression_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 0.1,
+      "log": "065_windows-contracts_node_audit_regression_frontend_cjs.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "node audit/regression_accessibility.cjs",
+      "exit_code": 0,
+      "seconds": 0.065,
+      "log": "066_windows-contracts_node_audit_regression_accessibility_cjs.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "node audit/regression_v43_modal_identity.cjs",
+      "exit_code": 0,
+      "seconds": 0.071,
+      "log": "067_windows-contracts_node_audit_regression_v43_modal_identity_cjs.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "node audit/regression_package_d_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 1.076,
+      "log": "068_windows-contracts_node_audit_regression_package_d_frontend_cjs.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "node audit/regression_package_b_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 0.099,
+      "log": "069_windows-contracts_node_audit_regression_package_b_frontend_cjs.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "node audit/regression_catalog_partial_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 0.161,
+      "log": "070_windows-contracts_node_audit_regression_catalog_partial_frontend_cjs.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "node audit/regression_local_search.cjs",
+      "exit_code": 0,
+      "seconds": 0.091,
+      "log": "071_windows-contracts_node_audit_regression_local_search_cjs.log"
+    },
+    {
+      "job": "windows-contracts",
+      "command": "python -m unittest -v test_suite.py",
+      "exit_code": 0,
+      "seconds": 1.167,
+      "log": "072_windows-contracts_python_-m_unittest_-v_test_suite_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python -c import sqlite3,sys; print(f'Python {sys.version.split()[0]} / SQLite {sqlite3.sqlite_version}')",
+      "exit_code": 0,
+      "seconds": 0.096,
+      "log": "073_windows-python314_python_-c_import_sqlite3_sys_print_f_Python_sys_version_split_0_SQLite_sqlite3_sqlite_version.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python -m compileall -q .",
+      "exit_code": 0,
+      "seconds": 0.204,
+      "log": "074_windows-python314_python_-m_compileall_-q.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_dependency_lock.py",
+      "exit_code": 0,
+      "seconds": 0.498,
+      "log": "075_windows-python314_python_audit_regression_dependency_lock_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_user_projection.py",
+      "exit_code": 0,
+      "seconds": 2.04,
+      "log": "076_windows-python314_python_audit_regression_user_projection_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_security_v42.py",
+      "exit_code": 0,
+      "seconds": 1.225,
+      "log": "077_windows-python314_python_audit_regression_security_v42_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_v42_full.py",
+      "exit_code": 0,
+      "seconds": 3.266,
+      "log": "078_windows-python314_python_audit_regression_v42_full_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_v43_storyboard_scheduler.py",
+      "exit_code": 0,
+      "seconds": 0.752,
+      "log": "079_windows-python314_python_audit_regression_v43_storyboard_scheduler_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_v452_player_qos.py",
+      "exit_code": 0,
+      "seconds": 0.096,
+      "log": "080_windows-python314_python_audit_regression_v452_player_qos_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "node audit/regression_v452_frontend_qos.cjs",
+      "exit_code": 0,
+      "seconds": 6.332,
+      "log": "081_windows-python314_node_audit_regression_v452_frontend_qos_cjs.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_v43_grouped_fast.py",
+      "exit_code": 0,
+      "seconds": 0.455,
+      "log": "082_windows-python314_python_audit_regression_v43_grouped_fast_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_loading.py",
+      "exit_code": 0,
+      "seconds": 1.525,
+      "log": "083_windows-python314_python_audit_regression_loading_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "node audit/regression_loading_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 3.213,
+      "log": "084_windows-python314_node_audit_regression_loading_frontend_cjs.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_v43_runtime_wiring.py",
+      "exit_code": 0,
+      "seconds": 1.319,
+      "log": "085_windows-python314_python_audit_regression_v43_runtime_wiring_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_v43_home_scope.py",
+      "exit_code": 0,
+      "seconds": 0.17,
+      "log": "086_windows-python314_python_audit_regression_v43_home_scope_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python audit/regression_catalog_v41.py",
+      "exit_code": 0,
+      "seconds": 0.596,
+      "log": "087_windows-python314_python_audit_regression_catalog_v41_py.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "node audit/regression_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 0.097,
+      "log": "088_windows-python314_node_audit_regression_frontend_cjs.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "node audit/regression_accessibility.cjs",
+      "exit_code": 0,
+      "seconds": 0.076,
+      "log": "089_windows-python314_node_audit_regression_accessibility_cjs.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "node audit/regression_v43_modal_identity.cjs",
+      "exit_code": 0,
+      "seconds": 0.073,
+      "log": "090_windows-python314_node_audit_regression_v43_modal_identity_cjs.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "node audit/regression_package_d_frontend.cjs",
+      "exit_code": 0,
+      "seconds": 1.08,
+      "log": "091_windows-python314_node_audit_regression_package_d_frontend_cjs.log"
+    },
+    {
+      "job": "windows-python314",
+      "command": "python -m unittest -v test_suite.py",
+      "exit_code": 0,
+      "seconds": 1.155,
+      "log": "092_windows-python314_python_-m_unittest_-v_test_suite_py.log"
+    },
+    {
+      "job": "browser-acceptance",
+      "command": "python audit/regression_timeline_browser.py",
+      "exit_code": 1,
+      "seconds": 1.923,
+      "log": "093_browser-acceptance_python_audit_regression_timeline_browser_py.log"
+    }
+  ],
+  "isolation": "temporary source copy; user data, credentials, and git metadata excluded",
+  "commands_source": ".github/workflows/ci.yml"
+}

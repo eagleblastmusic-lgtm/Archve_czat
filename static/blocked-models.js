@@ -104,11 +104,13 @@
           username,
           norm,
           expiresAt: Date.now() + 10000,
+          view: JSON.stringify([state.mode, state.currentPage, state.currentQuery, state.currentModel]),
           previousVideos: Array.isArray(state.videos) ? state.videos.map(video => ({ ...video })) : null
         };
+        const undo = lastBlock;
         showToast(`${msg} Możesz cofnąć przez 10 sekund.`, 'success', progressToast, [
-          { label: 'Cofnij', onClick: () => undoLastBlock() }
-        ]);
+          { label: 'Cofnij', onClick: async button => { button.disabled = true; const ok = await undoLastBlock(undo); if (!ok && Date.now() < undo.expiresAt) button.disabled = false; } }
+        ], { expiresAt: undo.expiresAt });
 
         pruneBlockedAuthorFromClientState(norm);
 
@@ -142,17 +144,17 @@
     return false;
   }
 
-  async function undoLastBlock() {
-    const pending = lastBlock;
-    if (!pending || pending.expiresAt < Date.now()) {
-      lastBlock = null;
+  async function undoLastBlock(pending = lastBlock) {
+    if (!pending || pending.expiresAt <= Date.now()) {
+      if (lastBlock === pending) lastBlock = null;
       showToast('Okno cofnięcia blokady wygasło.', 'info');
       return false;
     }
-    lastBlock = null;
     const restored = await unblock(pending.username);
-    if (restored && pending.previousVideos) {
-      state.videos = pending.previousVideos;
+    if (restored && lastBlock === pending) lastBlock = null;
+    if (restored && pending.previousVideos && pending.view === JSON.stringify([state.mode, state.currentPage, state.currentQuery, state.currentModel])) {
+      const merged = deduplicateVideos([...(state.videos || []), ...pending.previousVideos]);
+      state.videos = merged.filter(video => !clientBlockedAuthors().has(normalizeUsername(video.username)));
       renderVideoGrid(state.videos);
     }
     return restored;
@@ -212,7 +214,8 @@
       close.className = 'btn-card';
       close.textContent = 'Zamknij';
       close.style.marginTop = '16px';
-      const closeManager = () => { overlay.remove(); document.removeEventListener('keydown', onKey); };
+      let releaseFocus = null;
+      const closeManager = () => { overlay.remove(); document.removeEventListener('keydown', onKey); releaseFocus?.(); };
       const onKey = event => { if (event.key === 'Escape') closeManager(); };
       const render = () => {
         list.replaceChildren();
@@ -234,6 +237,7 @@
               if (index >= 0) blocked.splice(index, 1);
               render();
               if (blocked.length === 0) closeManager();
+              else search.focus();
             } else button.disabled = false;
           });
           row.append(label, button);
@@ -252,8 +256,9 @@
       overlay.appendChild(panel);
       document.body.appendChild(overlay);
       document.addEventListener('keydown', onKey);
-      search.focus();
       render();
+      releaseFocus = global.ArchivebateDOM?.manageDialogFocus?.(overlay, search, closeManager);
+      search.focus();
     } catch (e) {
       showToast('Błąd pobierania listy zablokowanych profili', 'error');
     }

@@ -1,0 +1,19 @@
+{
+  "source_head": "6c2065b0d2eee9a0fce3986185ff1731e3869991",
+  "source_manifest_sha256": "60247cfc7385fd3a917120630327bef87cd7a4b9fceb8cacf9eecce5cea6b932",
+  "host_python": "3.14.4 (tags/v3.14.4:23116f9, Apr  7 2026, 14:10:54) [MSC v.1944 64 bit (AMD64)]",
+  "host_sqlite": "3.50.4",
+  "host_node": "v24.19.0",
+  "mode": "targeted",
+  "tests": [
+    {
+      "job": "targeted",
+      "command": "python audit/regression_user_projection.py",
+      "exit_code": 0,
+      "seconds": 3.888,
+      "log": "001_targeted_python_audit_regression_user_projection_py.log"
+    }
+  ],
+  "isolation": "temporary source copy; user data, credentials, and git metadata excluded",
+  "commands_source": ".github/workflows/ci.yml"
+}

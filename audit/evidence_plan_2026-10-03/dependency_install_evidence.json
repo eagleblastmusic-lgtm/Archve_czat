@@ -1,0 +1,20 @@
+{
+  "lock": "requirements.lock.txt",
+  "platform": "Windows 10 x64",
+  "python": [
+    {
+      "version": "3.13.14",
+      "sqlite": "3.50.4",
+      "pip_check": "No broken requirements found.",
+      "ffmpeg": "ffmpeg version 7.1-essentials_build-www.gyan.dev"
+    },
+    {
+      "version": "3.14.4",
+      "sqlite": "3.50.4",
+      "pip_check": "No broken requirements found.",
+      "ffmpeg": "ffmpeg version 7.1-essentials_build-www.gyan.dev"
+    }
+  ],
+  "network_tests": false,
+  "user_data_used": false
+}

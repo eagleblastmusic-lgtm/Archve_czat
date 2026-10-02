@@ -9,7 +9,7 @@
   const context = global.ArchivebateAppContext || { dom: {} };
   const dom = context.dom || {};
 
-  function show(message, type = 'info', existingToast = null, actions = []) {
+  function show(message, type = 'info', existingToast = null, actions = [], options = {}) {
     let toast = existingToast;
     let icon = 'fa-info-circle';
     if (type === 'success') icon = 'fa-circle-check';
@@ -18,8 +18,19 @@
     if (!toast || !toast.parentNode) {
       toast = document.createElement('div');
       toast.className = 'toast';
-      dom.toastContainer.appendChild(toast);
+      const dialog = Array.from(document.querySelectorAll('[aria-modal="true"]')).find(element => element.getClientRects().length > 0);
+      let container = dialog?.querySelector('.toast-container') || (dialog ? null : dom.toastContainer || document.getElementById('toastContainer'));
+      if (!container) {
+        container = document.createElement('div');
+        if (!dialog) container.id = 'toastContainer';
+        container.className = 'toast-container';
+        (dialog || document.body).appendChild(container);
+      }
+      container.appendChild(toast);
     }
+    clearTimeout(toast._removeTimer);
+    toast.setAttribute('role', 'status');
+    toast.setAttribute('aria-atomic', 'true');
     toast.replaceChildren();
     const iconEl = document.createElement('i');
     iconEl.className = `fa-solid ${icon}`;
@@ -43,12 +54,14 @@
     toast.style.transform = 'none';
 
     clearTimeout(toast._timer);
+    const duration = options.expiresAt != null ? Math.max(0, options.expiresAt - Date.now()) : (options.durationMs ?? 4000);
     toast._timer = setTimeout(() => {
+      toast.querySelectorAll('button').forEach(button => { button.disabled = true; });
       toast.style.opacity = '0';
       toast.style.transform = 'translateY(10px)';
       toast.style.transition = 'all 0.3s ease';
-      setTimeout(() => toast.remove(), 300);
-    }, 4000);
+      toast._removeTimer = setTimeout(() => toast.remove(), 300);
+    }, duration);
 
     return toast;
   }

@@ -5,6 +5,7 @@ launch the same FastAPI app.
 """
 
 import re
+import os
 from urllib.parse import quote
 
 from fast_grouped_feed_v2 import install as install_grouped_feed_fast_path
@@ -97,6 +98,7 @@ def v43_runtime_marker():
 
     return {
         "runtime": RUNTIME_ID,
+        "process_id": os.getpid(),
         "grouped_fast_path_v2": bool(getattr(CatalogService, "_v43_grouped_fast_v2_installed", False)),
         "dynamic_timeline_fallback": True,
         # Compatibility marker retained for older diagnostics.

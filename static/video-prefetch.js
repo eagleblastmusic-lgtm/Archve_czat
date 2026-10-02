@@ -476,6 +476,14 @@
     const identity = videoIdentity(videoId, initialDetails?.source);
     const key = identity?.key;
     if (!key || !detailsAreUnavailable(initialDetails) || signal?.aborted) return initialDetails;
+    // The backend has already refreshed the URL and confirmed two missing
+    // stream responses. Re-resolving metadata can return the same dead URL as
+    // "available" and undo that stronger evidence.
+    if (initialDetails.availability_reason === 'stream_file_not_found') {
+      videoDetailsCache.set(detailsCacheKey(videoId, identity.source), initialDetails);
+      markUnavailableVideo(videoId, initialDetails);
+      return initialDetails;
+    }
     if (unavailableConfirmInflight.has(key)) return unavailableConfirmInflight.get(key);
     const generation = bumpAvailabilityGeneration(key);
 
@@ -526,6 +534,24 @@
 
     unavailableConfirmInflight.set(key, request);
     return request;
+  }
+
+  async function checkPlaybackFailure(video, signal = null) {
+    const identity = videoIdentity(video);
+    if (!identity || signal?.aborted) return null;
+    try {
+      // Media errors do not expose HTTP status. Probe the actual stream via
+      // the backend, rather than trusting cached metadata with a dead URL.
+      const details = await api.postJSON(
+        `/api/video/availability?id=${encodeURIComponent(requestVideoId(video, identity))}&force=true`,
+        {}, { timeoutMs: 30000, signal }
+      );
+      if (signal?.aborted) return null;
+      if (detailsAreUnavailable(details)) return confirmUnavailableVideo(video, details, signal);
+      return details;
+    } catch (_) {
+      return null;
+    }
   }
 
   // Ładuj obrazy dopiero, gdy karta zbliża się do viewportu. Wcześniej
@@ -595,6 +621,7 @@
   }
 
   function prefetchVideoDetails(videoId, options = {}) {
+    if (videoId?._mediaScope === 'local_catalog' && !options.userInitiated) return Promise.resolve(null);
     if (!videoId) return Promise.resolve(null);
     const sourceHint = options?.source || '';
     const identity = videoIdentity(videoId, sourceHint);
@@ -623,6 +650,9 @@
     const entry = { key: cacheKey, controller, consumers: 0, promise: null };
     entry.promise = api.getJSON(`/api/video/details?id=${encodeURIComponent(requestId)}`, { timeoutMs: 9000, signal: controller.signal })
       .then(details => {
+        if (isKnownUnavailableVideo(identity, identity?.source)) {
+          return videoDetailsCache.get(cacheKey) || details;
+        }
         if (details && !controller.signal.aborted) {
           videoDetailsCache.set(cacheKey, details);
           if (detailsAreUnavailable(details)) {
@@ -691,6 +721,13 @@
 
   function thumbnailUrlForVideo(v) {
     if (!v) return '';
+    if (v._mediaScope === 'local_catalog') {
+      let poster = v.poster || v.thumbnail || '';
+      if (!poster) {
+        try { poster = new URL(v.poster_proxy || v.thumbnail_proxy, global.location?.href).searchParams.get('url') || ''; } catch (_) {}
+      }
+      return poster ? `/api/thumb?url=${encodeURIComponent(poster)}&cache_only=true` : '';
+    }
     return v.poster_proxy || v.thumbnail_proxy || (v.poster ? `/api/thumb?url=${encodeURIComponent(v.poster)}` : '');
   }
 
@@ -710,7 +747,7 @@
     while (availabilityActive < 2 && availabilityQueue.size) {
       const [key, work] = availabilityQueue.entries().next().value;
       availabilityQueue.delete(key);
-      if (work.signal?.aborted || work.card.isConnected === false || !work.visible()) continue;
+      if (work.signal?.aborted || work.card._videoData?._mediaScope === 'local_catalog' || work.card.isConnected === false || !work.visible()) continue;
       availabilityActive += 1;
       const id = requestVideoId(work.card._videoData, work.identity);
       api.postJSON(`/api/video/availability?id=${encodeURIComponent(id)}`, {}, { timeoutMs: 20000, signal: work.signal })
@@ -737,7 +774,7 @@
         const card = entry.target;
         const video = card._videoData;
         const identity = videoIdentity(video);
-        if (!identity || isKnownUnavailableVideo(video)) continue;
+        if (!identity || video?._mediaScope === 'local_catalog' || isKnownUnavailableVideo(video)) continue;
         if (Date.now() - (availabilityChecked.get(identity.key) || 0) < 5 * 60 * 1000) continue;
         const state = global.ArchivebateAppContext?.state || global.state;
         const visible = () => {
@@ -749,7 +786,7 @@
       }
     }, { threshold: 0.01 }) : null;
 
-  function observeAvailability(card) { availabilityObserver?.observe(card); }
+  function observeAvailability(card) { if (card?._videoData?._mediaScope !== 'local_catalog') availabilityObserver?.observe(card); }
   function cancelAvailabilityChecks() {
     availabilityQueue.clear();
     clearTimeout(availabilityTimer);
@@ -768,6 +805,7 @@
 
   function scheduleThumbnailWarmup(videos, start = 12, count = 60) {
     cancelThumbnailWarmup();
+    if (videos?.some?.(video => video?._mediaScope === 'local_catalog')) return;
     if (!Array.isArray(videos) || videos.length <= start) return;
     const controller = thumbnailWarmupController = new AbortController();
 
@@ -803,10 +841,10 @@
 
   function setVideoDetails(videoId, details, options = {}) {
     const source = options?.source || details?.source || '';
+    // A resolved URL is metadata, not proof that the file still exists.
+    // Late player/cache writes must not restore a confirmed removed card.
+    if (isKnownUnavailableVideo(videoId, source) && !detailsAreUnavailable(details)) return;
     videoDetailsCache.set(detailsCacheKey(videoId, source) || String(videoId), details);
-    if (details && (details.availability === 'available' || details.direct_url || details.proxy_stream_url)) {
-      forgetUnavailableVideo(videoId, source);
-    }
   }
 
   function isDetailsInflight(videoId, options = {}) {
@@ -842,6 +880,7 @@
     forgetUnavailableVideo,
     videoIdentity,
     confirmUnavailableVideo,
+    checkPlaybackFailure,
     detailsAreUnavailable
   };
 

@@ -54,6 +54,9 @@ STREAM_CACHE_DIR = str(STREAM_CACHE_DIR)
 STORYBOARD_CACHE_DIR = str(STORYBOARD_CACHE_DIR)
 
 _account_sync_lock = threading.Lock()
+_favorite_remote_lock = threading.Lock()
+_account_sync_state_lock = threading.Lock()
+_account_sync_state = {"status": "idle", "result": None}
 LOCAL_MUTATION_TOKEN = os.getenv("ARCHIVEBATE_MUTATION_TOKEN") or secrets.token_urlsafe(32)
 ALLOWED_LOCAL_ORIGINS = {
     "http://127.0.0.1:8000",
@@ -119,18 +122,16 @@ def _redact_diagnostic_value(value):
     return value
 
 
-def _account_counts() -> dict:
+def _account_counts(projection: Optional[dict] = None) -> dict:
+    projection = projection if projection is not None else storage.projection_snapshot()
+    health = dict(projection["store_health"])
+    health.pop("store_path", None)
     return {
         "email": session.email,
         "logged_in": session.is_logged_in,
         "account_configured": bool(session.email and session.password),
-        "favorites_count": len(storage.get_favorites(include_blocked=False)),
-        "history_count": len(storage.get_history(include_blocked=False)),
-        "following_count": len(storage.get_following(include_blocked=False)),
-        "last_synced": storage.data.get("last_synced"),
-        "favorite_authors": storage.get_favorite_authors(),
-        "preferences_version": storage.preferences_version,
-        "store_health": _public_store_health(),
+        **{key: projection[key] for key in ("favorites_count", "history_count", "following_count", "last_synced", "favorite_authors", "preferences_version")},
+        "store_health": health,
     }
 
 
@@ -138,17 +139,23 @@ def sync_account_data() -> dict:
     """Synchronizuje konto i zawsze zwraca strukturalny wynik operacji."""
     if not _account_sync_lock.acquire(blocking=False):
         return {"success": False, "status": "busy", **_account_counts()}
+    with _account_sync_state_lock:
+        _account_sync_state.update(status="running", phase="auth", started_at=time.time(), finished_at=None, result=None)
+    def finish(result):
+        with _account_sync_state_lock:
+            _account_sync_state.update(status="completed" if result.get("success") else "failed", phase=result["status"], finished_at=time.time(), result=_redact_diagnostic_value(result))
+        return result
     try:
         print("[Archivebate Browser] Głęboka synchronizacja danych konta online...")
         if not session.email or not session.password:
-            return {"success": False, "status": "not_configured", **_account_counts()}
+            return finish({"success": False, "status": "not_configured", **_account_counts()})
         if not session.is_logged_in and not session.login():
-            return {
+            return finish({
                 "success": False,
                 "status": "auth_failed",
                 "error": session.get_status().get("login_error") or "Nie udało się zalogować",
                 **_account_counts(),
-            }
+            })
 
         def mark_archivebate_source(items):
             return [
@@ -157,24 +164,37 @@ def sync_account_data() -> dict:
                 if isinstance(item, dict)
             ]
 
-        watchlater = mark_archivebate_source(scraper.get_account_section_videos("watchlater", max_pages=15, strict=True))
-        history = mark_archivebate_source(scraper.get_account_section_videos("history", max_pages=15, strict=True))
-        following = mark_archivebate_source(scraper.get_account_section_videos("following", max_pages=15, strict=True))
-        storage.merge_remote_data(watchlater, history, following)
+        projection = storage.projection_snapshot()
+        observed = {f"{v['source']}:id:{v['provider_id']}": v.get("operation_id") for v in projection["remote_outbox"]}
+        sections = {}
+        for section in ("watchlater", "history", "following"):
+            with _account_sync_state_lock:
+                _account_sync_state["phase"] = section
+            sections[section] = scraper.get_account_section_videos(section, max_pages=1000, strict=True, return_meta=True)
+        watchlater = mark_archivebate_source(sections["watchlater"]["items"])
+        history = mark_archivebate_source(sections["history"]["items"])
+        following = mark_archivebate_source(sections["following"]["items"])
+        complete = all(v["complete"] for v in sections.values())
+        storage.merge_remote_data(watchlater, history, following, observed_intents=observed,
+                                  favorites_complete=sections["watchlater"]["complete"],
+                                  expected_restore_generation=projection["restore_generation"], sync_complete=complete)
         print(f"[Archivebate Browser] Zsynchronizowano: {len(watchlater)} ulubionych, {len(history)} historii, {len(following)} obserwowanych.")
-        return {
-            "success": True,
-            "status": "synced",
+        return finish({
+            "success": complete,
+            "status": "synced" if complete else "partial",
+            "complete": complete,
+            "sections": {key: {k: value[k] for k in ("complete", "pages", "error")} for key, value in sections.items()},
+            "error": None if complete else "Pobrano część danych; limit stron lub błąd źródła pozostawił synchronizację niepełną.",
             "remote_counts": {
                 "favorites": len(watchlater),
                 "history": len(history),
                 "following": len(following),
             },
             **_account_counts(),
-        }
+        })
     except Exception as e:
         print(f"[Archivebate Browser] Błąd synchronizacji: {e}")
-        return {"success": False, "status": "dependency_failed", "error": str(e), **_account_counts()}
+        return finish({"success": False, "status": "dependency_failed", "error": str(e), **_account_counts()})
     finally:
         _account_sync_lock.release()
 
@@ -182,10 +202,13 @@ def sync_account_data() -> dict:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[Archivebate Browser] Błyskawiczny start serwera...")
+    startup_stop = threading.Event()
     def background_startup():
         try:
             if session.email and session.password:
                 session.login()
+            if startup_stop.is_set():
+                return
             # Czyszczenie cache poza ścieżką krytyczną startu.
             trim_cache_directory(THUMBS_CACHE_DIR, max_bytes=750 * 1024 * 1024)
             trim_cache_directory(DETAILS_CACHE_DIR, max_bytes=150 * 1024 * 1024)
@@ -195,6 +218,8 @@ async def lifespan(app: FastAPI):
             # Zasil trwały indeks z lokalnych stron i wznowij brakujące strony
             # poza ścieżką krytyczną pierwszego renderu.
             try:
+                if startup_stop.is_set():
+                    return
                 from catalog_service import catalog_service
                 _ensure_catalog_indexing(catalog_service)
             except Exception as exc:
@@ -202,14 +227,19 @@ async def lifespan(app: FastAPI):
             # Deep Archivebate runs independently from the shallow home-feed index.
             # It discovers profiles and walks their historical pages with durable checkpoints.
             try:
+                if startup_stop.is_set():
+                    return
                 from deep_archivebate import deep_archivebate_service
                 deep_archivebate_service.start(scraper.clone_for_background())
             except Exception as exc:
                 print(f"[Deep Archivebate] Błąd startu: {exc}")
         except Exception as e:
             print(f"[Archivebate Browser] Błąd inicjalizacji: {e}")
-    threading.Thread(target=background_startup, daemon=True).start()
+    startup_thread = threading.Thread(target=background_startup, name="archivebite-startup", daemon=True)
+    startup_thread.start()
     yield
+    startup_stop.set()
+    await asyncio.to_thread(startup_thread.join, 30.0)
     # Shutdown is a real lifecycle boundary: stop producers, drain workers, then close readers.
     try:
         from fast_scan import quick_scan_supervisor
@@ -376,14 +406,15 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 os.makedirs(STATIC_DIR, exist_ok=True)
 app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
 
-def _enrich_videos(videos: list, author_filter: str = "all", source: str = "all", group_authors: str = "0") -> list:
+def _enrich_videos(videos: list, author_filter: str = "all", source: str = "all", group_authors: str = "0", preferences: Optional[dict] = None) -> list:
     """Dodaje flagę is_favorite, usuwa wszelkie duplikaty oraz filtruje zablokowane profile z całego programu."""
     videos = [dict(v) for v in videos if isinstance(v, dict)]
     from camwhores import deduplicate_videos
     videos = deduplicate_videos(videos)
 
     # 0. Filtr zablokowanych modeli - natychmiastowe usunięcie z każdego widoku programu
-    blocked_models = storage.get_blocked_models()
+    preferences = preferences if preferences is not None else storage.projection_snapshot()
+    blocked_models = preferences["blocked_models"]
     if blocked_models:
         blocked_set = set(re.sub(r'[^a-z0-9]', '', b.lower()) for b in blocked_models)
         videos = [
@@ -403,11 +434,11 @@ def _enrich_videos(videos: list, author_filter: str = "all", source: str = "all"
             if isinstance(v, dict) and not (v.get("source") == "camwhores" or str(v.get("id", "")).startswith("cw_") or "camwhores" in str(v.get("platform", "")).lower())
         ]
 
-    fav_authors_raw = storage.get_favorite_authors()
+    fav_authors_raw = preferences["favorite_authors"]
     fav_authors_clean = set(re.sub(r'[^a-z0-9]', '', a.lower()) for a in fav_authors_raw)
     favorite_keys = {
         f"{value['source']}:id:{value['provider_id']}"
-        for value in storage.get_favorite_keys()
+        for value in preferences["favorite_keys"]
         if value.get("source") and value.get("provider_id")
     }
 
@@ -644,14 +675,15 @@ def _remember_thumbnail(key, content, content_type):
 
 
 @app.get("/api/thumb")
-def get_thumbnail_proxy(url: str = Query(...)):
+def get_thumbnail_proxy(url: str = Query(...), cache_only: bool = False):
     import io
     import tempfile
     from PIL import Image
     if not url.startswith("http"):
         url = "https:"+url if url.startswith("//") else f"https://archivebate.com{url}"
     if url.endswith(".mp4"): url=url[:-4]+".jpg"
-    if not is_safe_remote_url(url): raise HTTPException(400,"Niedozwolony adres miniatury")
+    # Cache-only reads never resolve DNS, fetch redirects or contact a source.
+    if not cache_only and not is_safe_remote_url(url): raise HTTPException(400,"Niedozwolony adres miniatury")
     key=hashlib.sha256(url.encode()).hexdigest()
     headers={"Cache-Control":"public, max-age=86400"}
     with _thumb_fetch_lock(key):
@@ -671,6 +703,8 @@ def get_thumbnail_proxy(url: str = Query(...)):
             with MEMORY_CACHE_LOCK: _remember_thumbnail(key,content,kind)
             return Response(content,media_type=kind,headers={**headers,"X-Cache":"DISK"})
         except (OSError,ValueError): pass
+        if cache_only:
+            return Response(status_code=404, headers={"Cache-Control": "no-store"})
         res=None
         try:
             res=_validated_session_get(thumb_session,url,timeout=6,stream=True)
@@ -723,7 +757,7 @@ def stop_deep_archivebate():
 
 
 @app.get("/api/status")
-async def get_status():
+def get_status():
     """Zwraca status natychmiast z pamięci lokalnej.
 
     Logowanie odbywa się już w wątku startowym aplikacji. Nie wykonujemy tutaj
@@ -732,14 +766,7 @@ async def get_status():
     miniaturami oraz listą filmów.
     """
     status = session.get_status()
-    status["account_configured"] = bool(session.email and session.password)
-    status["favorites_count"] = len(storage.get_favorites(include_blocked=False))
-    status["history_count"] = len(storage.get_history(include_blocked=False))
-    status["following_count"] = len(storage.get_following(include_blocked=False))
-    status["last_synced"] = storage.data.get("last_synced")
-    status["favorite_authors"] = storage.get_favorite_authors()
-    status["preferences_version"] = storage.preferences_version
-    status["store_health"] = _public_store_health()
+    status.update(_account_counts())
     return status
 
 @app.post("/api/relogin")
@@ -749,43 +776,42 @@ async def relogin():
     session.email = email
     session.password = password
     success = await asyncio.to_thread(session.login)
-    if success:
-        threading.Thread(target=sync_account_data, daemon=True).start()
-    return {"success": success, "status": await get_status()}
+    # Authentication and synchronization have separate outcomes and phases.
+    return {"success": success, "sync_started": False, "status": await asyncio.to_thread(get_status)}
 
 # ENDPOINTY PANELU KONTA
 async def _ensure_account_synced():
-    if storage.data.get("last_synced"):
+    if (await asyncio.to_thread(storage.projection_snapshot))["last_synced"]:
         return None
     return await asyncio.to_thread(sync_account_data)
 
 @app.get("/api/account/summary")
-async def get_account_summary():
+def get_account_summary():
     """Read-only account summary. Synchronization is explicit POST /api/account/sync."""
-    return {
-        **_account_counts(),
-        **storage.get_blocked_stats(),
-    }
+    projection = storage.projection_snapshot()
+    return {**_account_counts(projection), **{key: projection[key] for key in ("blocked_authors_count", "blocked_videos_total", "hidden_videos_estimate", "accuracy", "non_destructive")}}
+
+
+def _account_page(field: str, page: int, per_page: int) -> dict:
+    snapshot = storage.account_page(field, page, per_page)
+    items = snapshot["videos"]
+    return {"total": snapshot["total"], "page": page, "last_page": max(1, math.ceil(snapshot["total"] / per_page)),
+            "count": len(items), "videos": _enrich_videos(items, preferences=snapshot["preferences"]),
+            "preferences_version": snapshot["preferences"]["preferences_version"],
+            "projection": {"scope": f"account_{field}", "accuracy": "exact", "blocked": "hidden"}}
 
 @app.get("/api/account/favorites")
 async def get_account_favorites(page: int = Query(1, ge=1), per_page: int = Query(280, ge=1, le=1000)):
     """Zwraca listę ulubionych wideo z obsługą stron."""
-    favs = storage.get_favorites(include_blocked=False)
+    return await asyncio.to_thread(_account_page, "favorites", page, per_page)
 
-    total = len(favs)
-    last_page = max(1, math.ceil(total / per_page))
-    start_idx = (page - 1) * per_page
-    sliced = favs[start_idx : start_idx + per_page]
 
-    return {
-        "total": total,
-        "page": page,
-        "last_page": last_page,
-        "count": len(sliced),
-        "videos": _enrich_videos(sliced),
-        "preferences_version": storage.preferences_version,
-        "projection": {"scope": "account_favorites", "accuracy": "exact", "blocked": "hidden"},
-    }
+@app.get("/api/account/favorites/state")
+def get_favorite_state(source: str, provider_id: str):
+    video = {"source": source, "id": provider_id}
+    if not VideoKey.from_video(video, require_source=True):
+        raise HTTPException(422, "Nieprawidłowa tożsamość filmu")
+    return {"success": True, **storage.favorite_state(video)}
 
 def invalidate_feed_cache(filter_pattern: Optional[str] = None):
     """Czyści pliki pamięci podręcznej feedów (np. po dodaniu do ulubionych lub zablokowaniu profilu)."""
@@ -811,44 +837,44 @@ def toggle_favorite(video: dict = Body(...)):
     key = VideoKey.from_video(video, require_source=True)
     if not key:
         raise HTTPException(status_code=422, detail="Film wymaga jednoznacznego source i provider_id")
+    remote_required = bool(session.email and session.password and key.source == "archivebate")
     try:
-        is_fav = storage.toggle_favorite(video)
+        committed = storage.commit_favorite_toggle(video, remote_required=remote_required)
+        is_fav = committed["is_favorite"]
     except (InvalidVideoIdentity, StoreRecoveryRequired) as exc:
         raise HTTPException(status_code=503, detail=f"Nie udało się trwale zapisać ulubionych: {exc}") from exc
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Nie udało się trwale zapisać ulubionych: {exc}") from exc
 
     v_id = key.provider_id
-    remote_required = bool(session.email and session.password and key.source == "archivebate")
     remote_synced = None
     remote_state = "local_only"
     remote_error = None
     if remote_required:
-        try:
-            storage.set_remote_intent(video, is_fav, status="pending")
-        except Exception as exc:
-            remote_state = "unknown"
-            remote_error = f"Nie zapisano kolejki synchronizacji: {exc}"
-            raw_result = None
-        if remote_state == "local_only":
+        with _favorite_remote_lock:
+            current = storage.get_remote_intent(video)
             try:
-                raw_result = scraper.toggle_remote_save(v_id)
+                if not current or current.get("operation_id") != committed["operation_id"]:
+                    raw_result = {"status": "unknown", "error": "Nowsza decyzja oczekuje na synchronizację"}
+                else:
+                    raw_result = scraper.set_remote_save(v_id, is_fav)
                 if isinstance(raw_result, dict):
                     candidate = str(raw_result.get("status") or "unknown")
                     remote_state = candidate if candidate in {"confirmed", "failed", "unknown"} else "unknown"
                     remote_error = raw_result.get("error")
                 else:
-                    remote_state = "confirmed" if raw_result is True else "failed"
+                    remote_state = "unknown"
             except Exception as exc:
                 remote_state = "unknown"
                 remote_error = str(exc)
+            try:
+                status = storage.set_remote_status(video, remote_state, remote_error, operation_id=committed["operation_id"])
+                if status is None:
+                    remote_state = "unknown"
+            except Exception as exc:
+                remote_error = remote_error or str(exc)
+                remote_state = "unknown"
         remote_synced = True if remote_state == "confirmed" else (False if remote_state == "failed" else None)
-        try:
-            storage.set_remote_status(video, remote_state, remote_error)
-        except Exception as exc:
-            remote_error = remote_error or str(exc)
-            remote_state = "unknown"
-            remote_synced = None
     sync_state = remote_state
     invalidate_feed_cache("fav")
     return {
@@ -860,31 +886,14 @@ def toggle_favorite(video: dict = Body(...)):
         "sync_state": sync_state,
         "id": v_id,
         "source": key.source,
-        "is_favorite": is_fav,
-        "total_favorites": len(storage.get_favorites(include_blocked=False)),
-        "favorite_authors": storage.get_favorite_authors(),
-        "preferences_version": storage.preferences_version,
+        "operation_id": committed["operation_id"],
+        **storage.favorite_state(video),
     }
 
 @app.get("/api/account/history")
 async def get_account_history(page: int = Query(1, ge=1), per_page: int = Query(280, ge=1, le=1000)):
     """Zwraca historię oglądanych wideo z obsługą stron."""
-    hist = storage.get_history(include_blocked=False)
-
-    total = len(hist)
-    last_page = max(1, math.ceil(total / per_page))
-    start_idx = (page - 1) * per_page
-    sliced = hist[start_idx : start_idx + per_page]
-
-    return {
-        "total": total,
-        "page": page,
-        "last_page": last_page,
-        "count": len(sliced),
-        "videos": _enrich_videos(sliced),
-        "preferences_version": storage.preferences_version,
-        "projection": {"scope": "account_history", "accuracy": "exact", "blocked": "hidden"},
-    }
+    return await asyncio.to_thread(_account_page, "history", page, per_page)
 
 @app.post("/api/account/history/record")
 def record_history(video: dict = Body(...)):
@@ -911,22 +920,7 @@ def clear_history():
 @app.get("/api/account/following")
 async def get_account_following(page: int = Query(1, ge=1), per_page: int = Query(280, ge=1, le=1000)):
     """Zwraca wideo z obserwowanych kanałów z obsługą stron."""
-    foll = storage.get_following(include_blocked=False)
-
-    total = len(foll)
-    last_page = max(1, math.ceil(total / per_page))
-    start_idx = (page - 1) * per_page
-    sliced = foll[start_idx : start_idx + per_page]
-
-    return {
-        "total": total,
-        "page": page,
-        "last_page": last_page,
-        "count": len(sliced),
-        "videos": _enrich_videos(sliced),
-        "preferences_version": storage.preferences_version,
-        "projection": {"scope": "account_following", "accuracy": "exact", "blocked": "hidden"},
-    }
+    return await asyncio.to_thread(_account_page, "following", page, per_page)
 
 @app.post("/api/account/sync")
 def sync_account():
@@ -1315,15 +1309,16 @@ def get_videos(
         "retryable": False
     }
 
-def _feed_snapshot(source, author_filter, group_authors, snapshot_id=None, force=False):
+def _feed_snapshot(source, author_filter, group_authors, snapshot_id=None, force=False, projection=None):
     from feed_service import get_snapshot
-    preferences = {"blocked": sorted(storage.get_blocked_models()), "favorites": sorted(storage.get_favorite_keys()), "preferences_version": storage.preferences_version}
+    projection = projection if projection is not None else storage.projection_snapshot()
+    preferences = {"blocked": projection["blocked_models"], "favorites": sorted(projection["favorite_keys"], key=lambda v: (v["source"], v["provider_id"])), "preferences_version": projection["preferences_version"]}
     spec = {"source": source, "author_filter": author_filter, "group_authors": group_authors, "preferences": preferences}
     fetchers = {}
     if source != "only-camwhores": fetchers["archivebate"] = lambda page: scraper._fetch_single_ab_home_page(page, strict=True)
     if source != "only-archivebate": fetchers["camwhores"] = lambda page: camwhores_scraper.get_latest_videos(page, strict=True)
     try:
-        return get_snapshot(spec, fetchers, lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors=group_authors), snapshot_id, force)
+        return get_snapshot(spec, fetchers, lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors=group_authors, preferences=projection), snapshot_id, force)
     except KeyError:
         raise HTTPException(409, "Snapshot wygasł lub zmieniły się preferencje. Odśwież widok.")
     except RuntimeError as exc:
@@ -1343,7 +1338,8 @@ def progressive_feed(
     preferences_version: Optional[int] = Query(None),
 ):
     from catalog_service import catalog_service
-    if preferences_version is not None and preferences_version != storage.preferences_version:
+    preferences = storage.projection_snapshot()
+    if preferences_version is not None and preferences_version != preferences["preferences_version"]:
         raise HTTPException(409, "Preferencje zmieniły się. Odśwież widok.")
     revision = _coerce_optional_revision(revision)
     initial_limit = _coerce_optional_revision(initial_items)
@@ -1365,9 +1361,9 @@ def progressive_feed(
             rev_to_use = active_rev if active_rev is not None else available_rev
 
         is_grouped = group_authors in (True, "1", "true", "True")
-        blocked_models = storage.get_blocked_models()
-        fav_authors = storage.get_favorite_authors()
-        fav_ids = storage.get_favorite_keys()
+        blocked_models = preferences["blocked_models"]
+        fav_authors = preferences["favorite_authors"]
+        fav_ids = preferences["favorite_keys"]
 
         result = catalog_service.query_page(
             page=page,
@@ -1379,20 +1375,20 @@ def progressive_feed(
             blocked_models=blocked_models,
             favorite_authors=fav_authors,
             favorite_ids=fav_ids,
-            enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0"),
+            enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0", preferences=preferences),
             item_limit=initial_limit,
         )
-        if preferences_version is not None and preferences_version != storage.preferences_version:
+        if preferences["preferences_version"] != storage.preferences_version:
             raise HTTPException(409, "Preferencje zmieniły się podczas odczytu. Odśwież widok.")
-        result["preferences_version"] = storage.preferences_version
+        result["preferences_version"] = preferences["preferences_version"]
         result["refresh_revision"] = refresh_revision
         result["refresh_pending"] = bool(refresh_revision and refresh_revision != result.get("catalog_revision"))
         return result
 
-    result = _feed_snapshot(source, author_filter, group_authors, snapshot_id, force_refresh).read(page)
-    if preferences_version is not None and preferences_version != storage.preferences_version:
+    result = _feed_snapshot(source, author_filter, group_authors, snapshot_id, force_refresh, projection=preferences).read(page)
+    if preferences["preferences_version"] != storage.preferences_version:
         raise HTTPException(409, "Preferencje zmieniły się podczas odczytu. Odśwież widok.")
-    result["preferences_version"] = storage.preferences_version
+    result["preferences_version"] = preferences["preferences_version"]
     return result
 
 
@@ -1421,7 +1417,8 @@ def get_catalog_group_members(
     preferences_version: Optional[int] = Query(None),
 ):
     from catalog_service import catalog_service
-    if preferences_version is not None and preferences_version != storage.preferences_version:
+    preferences = storage.projection_snapshot()
+    if preferences_version is not None and preferences_version != preferences["preferences_version"]:
         raise HTTPException(409, "Preferencje zmieniły się. Odśwież widok grupy.")
     rev = _coerce_optional_revision(revision)
     result = catalog_service.query_group_members(
@@ -1431,12 +1428,14 @@ def get_catalog_group_members(
         source=source,
         revision=rev,
         author_filter=author_filter,
-        blocked_models=storage.get_blocked_models(),
-        favorite_authors=storage.get_favorite_authors(),
-        favorite_ids=storage.get_favorite_keys(),
-        enrich_fn=lambda items: _enrich_videos(items, source=source),
+        blocked_models=preferences["blocked_models"],
+        favorite_authors=preferences["favorite_authors"],
+        favorite_ids=preferences["favorite_keys"],
+        enrich_fn=lambda items: _enrich_videos(items, source=source, preferences=preferences),
     )
-    return result
+    if storage.preferences_version != preferences["preferences_version"]:
+        raise HTTPException(409, "Preferencje zmieniły się podczas odczytu grupy.")
+    return {**result, "preferences_version": preferences["preferences_version"]}
 
 
 @app.get("/api/search/local")
@@ -1446,18 +1445,29 @@ def search_local_catalog(
     per_page: int = Query(200, ge=1, le=200),
     source: str = Query("all"),
     revision: Optional[int] = Query(None),
+    author_filter: str = Query("all", pattern="^(all|only_fav|exclude_fav)$"),
+    preferences_version: Optional[int] = Query(None),
 ):
     from catalog_service import catalog_service
     rev = _coerce_optional_revision(revision)
-    return catalog_service.search_local(
+    preferences = storage.projection_snapshot()
+    if preferences_version is not None and preferences_version != preferences["preferences_version"]:
+        raise HTTPException(409, "Preferencje zmieniły się. Odśwież wyszukiwanie.")
+    result = catalog_service.search_local(
         q,
         page=page,
         page_size=per_page,
         source=source,
         revision=rev,
-        blocked_models=storage.get_blocked_models(),
-        enrich_fn=lambda items: _enrich_videos(items, source=source),
+        blocked_models=preferences["blocked_models"],
+        author_filter=author_filter,
+        favorite_authors=preferences["favorite_authors"],
+        favorite_ids=preferences["favorite_keys"],
+        enrich_fn=lambda items: _enrich_videos(items, source=source, preferences=preferences),
     )
+    if storage.preferences_version != preferences["preferences_version"]:
+        raise HTTPException(409, "Preferencje zmieniły się podczas wyszukiwania. Odśwież widok.")
+    return {**result, "preferences_version": preferences["preferences_version"]}
 
 
 @app.get("/api/feed/stream")
@@ -1471,14 +1481,18 @@ def progressive_feed_stream(
     preferences_version: Optional[int] = Query(None),
 ):
     from catalog_service import catalog_service
-    if preferences_version is not None and preferences_version != storage.preferences_version:
+    preferences = storage.projection_snapshot()
+    if preferences_version is not None and preferences_version != preferences["preferences_version"]:
         raise HTTPException(409, "Preferencje zmieniły się. Odśwież widok.")
+    preferences_version = preferences["preferences_version"]
+    async def current_preferences_version():
+        return await asyncio.to_thread(lambda: storage.preferences_version)
     revision = _coerce_optional_revision(revision)
     rev_to_check = revision if revision is not None else (int(snapshot_id) if str(snapshot_id).isdigit() else catalog_service.get_active_revision())
     if rev_to_check is not None and catalog_service.is_revision_complete(rev_to_check):
         async def direct_events():
-            if preferences_version is not None and preferences_version != storage.preferences_version:
-                yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+            if preferences_version is not None and preferences_version != await current_preferences_version():
+                yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': await current_preferences_version()})}\n\n"
                 return
             is_grouped = group_authors in (True, "1", "true", "True")
             data = await asyncio.to_thread(
@@ -1489,14 +1503,15 @@ def progressive_feed_stream(
                 author_filter=author_filter,
                 group_authors=is_grouped,
                 revision=rev_to_check,
-                blocked_models=storage.get_blocked_models(),
-                favorite_authors=storage.get_favorite_authors(),
-                favorite_ids=storage.get_favorite_keys(),
-                enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0")
+                blocked_models=preferences["blocked_models"],
+                favorite_authors=preferences["favorite_authors"],
+                favorite_ids=preferences["favorite_keys"],
+                enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0", preferences=preferences)
             )
-            if preferences_version is not None and preferences_version != storage.preferences_version:
-                yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+            if preferences_version is not None and preferences_version != await current_preferences_version():
+                yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': await current_preferences_version()})}\n\n"
                 return
+            data["preferences_version"] = preferences_version
             data["type"] = "complete"
             yield f"data: {json.dumps(data)}\n\n"
         return StreamingResponse(direct_events(), media_type="text/event-stream", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
@@ -1511,8 +1526,8 @@ def progressive_feed_stream(
             idle_since = None
             current_rev = rev_to_check
             while time.monotonic() < deadline:
-                if preferences_version is not None and preferences_version != storage.preferences_version:
-                    yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+                if preferences_version is not None and preferences_version != await current_preferences_version():
+                    yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': await current_preferences_version()})}\n\n"
                     return
                 # A partial revision may have been the best local snapshot when
                 # the request started. Once a newer revision is atomically
@@ -1534,14 +1549,15 @@ def progressive_feed_stream(
                     author_filter=author_filter,
                     group_authors=group_authors in (True, "1", "true", "True"),
                     revision=current_rev,
-                    blocked_models=storage.get_blocked_models(),
-                    favorite_authors=storage.get_favorite_authors(),
-                    favorite_ids=storage.get_favorite_keys(),
-                    enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0"),
+                    blocked_models=preferences["blocked_models"],
+                    favorite_authors=preferences["favorite_authors"],
+                    favorite_ids=preferences["favorite_keys"],
+                    enrich_fn=lambda items: _enrich_videos(items, author_filter=author_filter, source=source, group_authors="0", preferences=preferences),
                 )
-                if preferences_version is not None and preferences_version != storage.preferences_version:
-                    yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+                if preferences_version is not None and preferences_version != await current_preferences_version():
+                    yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': await current_preferences_version()})}\n\n"
                     return
+                data["preferences_version"] = preferences_version
                 progress = data.get("indexing_progress") or {}
                 signature = (
                     data.get("catalog_revision"),
@@ -1579,17 +1595,18 @@ def progressive_feed_stream(
 
         return StreamingResponse(catalog_events(), media_type="text/event-stream", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
 
-    snapshot = _feed_snapshot(source, author_filter, group_authors, snapshot_id)
+    snapshot = _feed_snapshot(source, author_filter, group_authors, snapshot_id, projection=preferences)
     async def events():
         snapshot.subscribe(page)
         previous = -1
         deadline = time.monotonic()+120
         try:
             while time.monotonic()<deadline:
-                if preferences_version is not None and preferences_version != storage.preferences_version:
-                    yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': storage.preferences_version})}\n\n"
+                if preferences_version is not None and preferences_version != await current_preferences_version():
+                    yield f"data: {json.dumps({'type': 'preferences_changed', 'stopped': True, 'retryable': True, 'preferences_version': await current_preferences_version()})}\n\n"
                     return
                 data = await asyncio.to_thread(snapshot.read, page)
+                data["preferences_version"] = preferences_version
                 if data["revision"] != previous:
                     previous = data["revision"]
                     data["type"] = "source_error" if data["source_error"] else ("complete" if data["complete"] else "batch")
@@ -2593,11 +2610,11 @@ def estimate_model_total_videos(username: str) -> int:
     return max(total, 1)
 
 @app.post("/api/model/{username}/block")
-async def block_model_endpoint(username: str, count: Optional[int] = Query(None)):
+def block_model_endpoint(username: str, count: Optional[int] = Query(None)):
     """Block a profile as a reversible projection; no remote/library records are deleted."""
     final_count = count if (count and count > 0) else None
     try:
-        result = await asyncio.to_thread(storage.block_model, username, video_count=final_count)
+        result = storage.block_model(username, video_count=final_count)
     except (InvalidVideoIdentity, StoreRecoveryRequired) as exc:
         raise HTTPException(status_code=503, detail=f"Nie udało się trwale zablokować profilu: {exc}") from exc
     except Exception as exc:
@@ -2640,17 +2657,18 @@ def unblock_model_endpoint(username: str):
     }
 
 @app.get("/api/blocked_models")
-async def get_blocked_models_endpoint():
+def get_blocked_models_endpoint():
     """Zwraca listę wszystkich zablokowanych profili wraz ze statystykami i liczbą filmów."""
-    stats = storage.get_blocked_stats()
+    projection = storage.projection_snapshot()
+    stats = {key: projection[key] for key in ("blocked_authors_count", "blocked_videos_total", "hidden_videos_estimate", "accuracy", "non_destructive", "preferences_version")}
     catalog_stats = get_catalog_stats()
     return {
-        "blocked_models": storage.get_blocked_models(),
-        "blocked_model_video_counts": storage.data.get("blocked_model_video_counts", {}),
+        "blocked_models": projection["blocked_models"],
+        "blocked_model_video_counts": projection["blocked_model_video_counts"],
         "catalog_videos": catalog_stats["total_videos"],
         "catalog_pages": catalog_stats["last_page"],
         **stats,
-        "preferences_version": storage.preferences_version,
+        "preferences_version": projection["preferences_version"],
     }
 
 @app.get("/api/stats")
@@ -2721,7 +2739,7 @@ def _git_head_fingerprint() -> str:
 
 
 @app.get("/api/diagnostics")
-async def get_diagnostics():
+def get_diagnostics():
     """Redacted operational diagnostics; credentials, cookies and remote URLs are excluded."""
     from catalog_service import catalog_service
     from deep_archivebate import deep_archivebate_service
@@ -2760,8 +2778,8 @@ async def get_diagnostics():
 
 
 @app.get("/api/diagnostics/export")
-async def export_diagnostics():
-    return await get_diagnostics()
+def export_diagnostics():
+    return get_diagnostics()
 
 
 def _lock_is_held(lock: threading.Lock) -> bool:
@@ -2783,15 +2801,17 @@ async def get_jobs():
         deep = await asyncio.to_thread(deep_archivebate_service.status)
     except Exception as exc:
         deep = {"running": False, "status": "unavailable", "error": type(exc).__name__}
-    sync_status = "running" if _lock_is_held(_account_sync_lock) else "idle"
+    with _account_sync_state_lock:
+        sync_job = copy.deepcopy(_account_sync_state)
+    sync_status = "running" if _lock_is_held(_account_sync_lock) else sync_job["status"]
     quick_status = str(quick.get("status") or "idle")
     deep_status = "running" if deep.get("running") else str(deep.get("status") or "idle")
     active = sync_status == "running" or quick_status in {"queued", "running", "cancelling"} or deep_status == "running"
-    failed = quick_status == "failed" or bool(deep.get("last_error")) or deep_status == "unavailable"
+    failed = sync_status == "failed" or quick_status == "failed" or bool(deep.get("last_error")) or deep_status == "unavailable"
     return {
         "status": "failed" if failed else ("running" if active else "idle"),
         "jobs": {
-            "account_sync": {"status": sync_status},
+            "account_sync": {**sync_job, "status": sync_status},
             "quick_scan": quick,
             "deep_archivebate": deep,
         },
@@ -2800,21 +2820,31 @@ async def get_jobs():
 
 
 @app.get("/api/account/export")
-async def export_account_snapshot():
+def export_account_snapshot():
     return storage.export_snapshot()
 
 
 @app.post("/api/account/restore/preview")
-async def preview_account_restore(snapshot: dict = Body(...)):
+def preview_account_restore(snapshot: dict = Body(...)):
     try:
         restored = storage.validate_snapshot(snapshot)
+        current = storage.export_snapshot()["data"]
+        differences = {}
+        for field in ("favorites", "history", "following", "blocked_models"):
+            identity = lambda value: _video_key_string(value) or str(value.get("id")) if isinstance(value, dict) else str(value).casefold()
+            old = {identity(v) for v in current.get(field, [])}
+            new = {identity(v) for v in restored.get(field, [])}
+            differences[field] = {"removed": len(old - new), "added": len(new - old), "before": len(old), "after": len(new)}
         return {
             "success": True,
             "schema_version": restored.get("schema_version"),
             "favorites": len(restored.get("favorites", [])),
             "history": len(restored.get("history", [])),
             "following": len(restored.get("following", [])),
-            "destructive": False,
+            "blocked_models": len(restored.get("blocked_models", [])),
+            "differences": differences,
+            "destructive": True,
+            "replaces_local_store": True,
         }
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -2827,7 +2857,7 @@ async def restore_account_snapshot(snapshot: dict = Body(...)):
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     invalidate_feed_cache()
-    return {**result, "destructive": False, "store_health": _public_store_health()}
+    return {**result, "destructive": True, "store_health": await asyncio.to_thread(_public_store_health)}
 
 if __name__ == "__main__":
     import uvicorn

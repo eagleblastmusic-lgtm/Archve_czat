@@ -78,7 +78,9 @@ vm.runInContext(fs.readFileSync('static/search-results.js', 'utf8'), context);
 (async () => {
   await context.ArchivebateSearchResults.performSearch('fixture', 1);
   assert.equal(state.catalogRevision, 7);
-  assert.deepEqual(state.videos, localItems);
+  assert.equal(state.videos[0].id, localItems[0].id);
+  assert.equal(state.videos[0]._mediaScope, 'local_catalog');
+  assert.match(calls.find(([kind]) => kind === 'api')[1], /author_filter=all/);
   assert.equal(calls.filter(([kind]) => kind === 'api').length, 1);
   assert.equal(calls.filter(([kind]) => kind === 'render').length, 1);
   assert.match(dom.videoCount.innerText, /wyników lokalnych/);

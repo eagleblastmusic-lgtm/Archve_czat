@@ -31,6 +31,10 @@ jobs:
         run: python -c "import sqlite3,sys; print(f'Python {sys.version.split()[0]} / SQLite {sqlite3.sqlite_version}')"
       - name: Compile Python
         run: python -m compileall -q .
+      - name: Locked native dependency closure
+        run: python audit/regression_dependency_lock.py
+      - name: Committed user projection and local scope
+        run: python audit/regression_user_projection.py
       - name: V4.2 local security regression
         run: python audit/regression_security_v42.py
       - name: V4.2 full hardening regression
@@ -153,6 +157,10 @@ jobs:
           if ($realHits.Count -gt 0) { $realHits | Write-Error; exit 1 }
       - name: Compile Python
         run: python -m compileall -q .
+      - name: Locked native dependency closure
+        run: python audit/regression_dependency_lock.py
+      - name: Committed user projection and local scope
+        run: python audit/regression_user_projection.py
       - name: V4.2 local security regression
         run: python audit/regression_security_v42.py
       - name: V4.2 full hardening regression
@@ -218,6 +226,10 @@ jobs:
         run: python -c "import sqlite3,sys; print(f'Python {sys.version.split()[0]} / SQLite {sqlite3.sqlite_version}')"
       - name: Compile Python
         run: python -m compileall -q .
+      - name: Locked native dependency closure
+        run: python audit/regression_dependency_lock.py
+      - name: Committed user projection and local scope
+        run: python audit/regression_user_projection.py
       - name: V4.2 local security regression
         run: python audit/regression_security_v42.py
       - name: V4.2 full hardening regression
@@ -250,3 +262,30 @@ jobs:
         run: node audit/regression_package_d_frontend.cjs
       - name: Unit tests
         run: python -m unittest -v test_suite.py
+
+  browser-acceptance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install runtime and browser test dependencies
+        run: |
+          python -m pip install -r requirements.lock.txt -r audit/requirements-browser.txt
+          python -m pip check
+          python -m playwright install --with-deps chromium
+      - name: Neutral browser acceptance
+        env:
+          ARCHIVEBATE_AUDIT_ISOLATED: "1"
+        run: python audit/regression_timeline_browser.py
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: neutral-browser-evidence
+          path: |
+            timeline_browser_result.json
+            timeline_failed_*.png
+            audit_ui_*.png

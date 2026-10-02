@@ -186,11 +186,11 @@
 
   async function reconcileLocalFavorite(video, key, buttonEl, previousState, error) {
     try {
-      const snapshot = await global.ArchivebateAPI.getJSON('/api/account/favorites?page=1&per_page=1000', { timeoutMs: 5000 });
-      const videos = Array.isArray(snapshot?.videos) ? snapshot.videos : [];
-      const isFav = videos.some(item => videoKey(item) === key);
+      const snapshot = await global.ArchivebateAPI.getJSON(`/api/account/favorites/state?source=${encodeURIComponent(video.source)}&provider_id=${encodeURIComponent(video.provider_id)}`, { timeoutMs: 5000 });
+      if (typeof snapshot?.is_favorite !== 'boolean') throw new Error('Nie udało się potwierdzić zapisu ulubionego.');
+      const isFav = snapshot.is_favorite;
       const intendedState = !previousState;
-      applyFavoriteState(video, key, buttonEl, isFav, Number(snapshot?.total));
+      applyFavoriteState(video, key, buttonEl, isFav, Number(snapshot?.total_favorites));
 
       if (isFav !== previousState) {
         global.ArchivebateVideoViews?.preferencesChanged?.(snapshot?.preferences_version);
@@ -209,7 +209,7 @@
       return isFav;
     } catch (_) {
       applyFavoriteState(video, key, buttonEl, previousState);
-      showToast?.(error?.message || 'Błąd aktualizacji ulubionych', 'error');
+      showToast?.('Nie udało się ustalić, czy zapisano zmianę ulubionego. Odśwież stan i spróbuj ponownie.', 'warning');
       return previousState;
     }
   }
@@ -261,6 +261,13 @@
     }
   }
 
+  function outcomeMessage(data) {
+    if (data.remote_state === 'unknown') return { message: 'Zmiana zapisana lokalnie. Synchronizacja z kontem zdalnym nie została potwierdzona.', type: 'warning' };
+    if (data.remote_state === 'failed' || data.sync_state === 'remote_failed') return { message: 'Zmiana zapisana lokalnie. Synchronizacja z kontem zdalnym nie powiodła się.', type: 'warning' };
+    if (data.remote_state === 'local_only' || data.sync_state === 'local_only') return { message: `${data.is_favorite ? 'Dodano' : 'Usunięto'} lokalnie.`, type: 'info' };
+    return { message: data.is_favorite ? 'Dodano do ulubionych ❤️' : 'Usunięto z ulubionych', type: data.is_favorite ? 'success' : 'info' };
+  }
+
   async function toggleVideo(video, buttonEl = null) {
     const mutationVideo = canonicalVideo(video, buttonEl);
     const key = mutationVideo ? videoKey(mutationVideo) : null;
@@ -287,7 +294,7 @@
       : false;
 
     try {
-      const data = await global.ArchivebateAPI.postJSON('/api/account/favorites/toggle', mutationVideo);
+      const data = await global.ArchivebateAPI.postJSON('/api/account/favorites/toggle', { ...mutationVideo, desired: optimisticIsFav });
       if (!data || typeof data.is_favorite !== 'boolean' || data.local_committed !== true) {
         throw new Error('invalid mutation response');
       }
@@ -304,13 +311,8 @@
       if (isFav) removeExcludedFavoriteFromCurrentView(mutationVideo, key);
       if (isFav || optimisticallyRemoved) refreshExcludedFavoriteView();
 
-      if (data.remote_state === 'failed' || data.remote_state === 'unknown' || data.sync_state === 'remote_failed') {
-        showToast?.('Zmiana zapisana lokalnie, ale synchronizacja z kontem zdalnym nie powiodła się.', 'warning');
-      } else if (data.sync_state === 'local_only') {
-        showToast?.((isFav ? 'Dodano' : 'Usunięto') + ' lokalnie (tryb anonimowy).', 'info');
-      } else {
-        showToast?.(isFav ? 'Dodano do ulubionych ❤️' : 'Usunięto z ulubionych', isFav ? 'success' : 'info');
-      }
+      const outcome = outcomeMessage(data);
+      showToast?.(outcome.message, outcome.type);
       return isFav;
     } catch (e) {
       const isFav = await reconcileLocalFavorite(video, key, buttonEl, previousIsFav, e);
@@ -348,6 +350,7 @@
     isFavoriteAuthor,
     updateAllAuthorNameColors,
     toggleVideo,
+    outcomeMessage,
     updateModalButton
   };
 })(typeof window !== 'undefined' ? window : globalThis);

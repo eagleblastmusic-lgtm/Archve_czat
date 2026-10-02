@@ -52,15 +52,20 @@ with patch.object(requests.Session,'request',side_effect=AssertionError('Externa
         assert manifest['times'][0]!=round(requested[0],3) and manifest['times'][3]!=round(requested[3],3)
         assert len(set(manifest['times']))<8
         assert story.get_status('fixture',10)['status']=='ready'
-    calls=[]
+    calls=[]; published={}; entered=threading.Event(); release=threading.Event()
     def build(ident,duration,url,quality):
-        calls.append((ident,quality));time.sleep(.03);return {'quality':quality}
-    with patch.object(story,'_cached_variant',return_value=None),patch.object(story,'_build_variant',side_effect=build):
+        calls.append((ident,quality));entered.set();assert release.wait(5)
+        published[(ident,quality)]={'quality':quality};return published[(ident,quality)]
+    with patch.object(story,'_cached_variant',side_effect=lambda ident,duration,quality:published.get((ident,quality))),patch.object(story,'_build_variant',side_effect=build):
         story.start('no-demand-fixture',10,'local')
         story._jobs.join()
         assert calls == [], calls
         story.demand('concurrent-fixture','test-consumer')
         with ThreadPoolExecutor(10) as pool:list(pool.map(lambda _:story.start('concurrent-fixture',10,'local'),range(10)))
+        assert entered.wait(5)
+        release.set()
+        story._jobs.join()
+        story.start('concurrent-fixture',10,'local')
         story._jobs.join()
         assert calls==[('concurrent-fixture','quick')],calls
         assert story.runtime_stats()['auto_full_upgrade'] is False

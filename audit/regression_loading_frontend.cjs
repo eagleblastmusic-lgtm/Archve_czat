@@ -459,5 +459,72 @@ const load=(c,file)=>vm.runInContext(fs.readFileSync('static/'+file,'utf8'),c);
   const forgedStreamMissing={id:'unverified-file',availability:'unavailable',availability_reason:'stream_file_not_found',retryable:false,checked_at:Date.now()/1000};
   assert.equal(detailsAPI.detailsAreUnavailable(forgedStreamMissing),false,'stream removal requires independent server probes');
   assert.equal(detailsAPI.detailsAreUnavailable({...forgedStreamMissing,stream_missing_confirmations:2}),true);
-  console.log('PASS: loading, cancellation, profile cache ordering, native stream-removal proof, quarantine, first-frame and retry contracts');
+  const missingStream={...unavailable('server-confirmed-file',Date.now()/1000),availability_reason:'stream_file_not_found',stream_missing_confirmations:2};
+  let redundantProbes=0;
+  prefCtx.ArchivebateAPI.postJSON=async()=>{redundantProbes++;throw new Error('provider unreachable after proof');};
+  await prefCtx.ArchivebateVideoPrefetch.confirmUnavailableVideo('server-confirmed-file',missingStream);
+  assert.equal(redundantProbes,0,'two server stream confirmations are sufficient even if further provider requests fail');
+  assert(prefCtx.ArchivebateVideoPrefetch.isKnownUnavailableVideo('server-confirmed-file'));
+  prefCtx.ArchivebateVideoPrefetch.setVideoDetails('server-confirmed-file',{availability:'available',direct_url:'https://fixture.invalid/dead.mp4'});
+  assert(prefCtx.ArchivebateVideoPrefetch.isKnownUnavailableVideo('server-confirmed-file'),'a late resolved dead URL cannot restore a removed tile');
+  assert.equal(prefCtx.ArchivebateVideoGrid.filterKnownUnavailableVideos([{id:'server-confirmed-file',source:'archivebate'}]).length,0);
+  load(prefCtx,'video-prefetch.js');
+  assert(prefCtx.ArchivebateVideoPrefetch.isKnownUnavailableVideo('server-confirmed-file'),'server-confirmed file removal survives reload');
+  const lateDetails=detailsAPI.prefetchVideoDetails('late-server-confirmed-file');
+  const lateRequest=detailRequests[detailRequests.length-1];
+  await detailsAPI.confirmUnavailableVideo('late-server-confirmed-file',{...missingStream,id:'late-server-confirmed-file'});
+  lateRequest.resolve({id:'late-server-confirmed-file',availability:'available',direct_url:'https://fixture.invalid/dead.mp4'});
+  assert.equal((await lateDetails).availability,'unavailable','a details request started before removal must return the stronger cached proof');
+  assert(detailsAPI.isKnownUnavailableVideo('late-server-confirmed-file'),'late prefetch completion cannot undo server removal evidence');
+  let failureProbes=0;
+  prefCtx.ArchivebateAPI.postJSON=async(url,body,options)=>{
+    failureProbes++;
+    assert.equal(url,'/api/video/availability?id=failed-player&force=true');
+    assert(options.timeoutMs>=20000);
+    return {...missingStream,id:'failed-player'};
+  };
+  await prefCtx.ArchivebateVideoPrefetch.checkPlaybackFailure({id:'failed-player',source:'archivebate'});
+  assert.equal(failureProbes,1);
+  assert(prefCtx.ArchivebateVideoPrefetch.isKnownUnavailableVideo('failed-player'),'media failure must consume stream removal proof even when metadata previously supplied a URL');
+  prefCtx.ArchivebateAPI.postJSON=async()=>({id:'temporary-error',availability:'unknown',availability_reason:'probe_error',retryable:true});
+  await prefCtx.ArchivebateVideoPrefetch.checkPlaybackFailure('temporary-error');
+  assert(!prefCtx.ArchivebateVideoPrefetch.isKnownUnavailableVideo('temporary-error'),'a transient playback failure is not evidence of deletion');
+  const failedController=new AbortController();
+  prefCtx.ArchivebateAPI.postJSON=async()=>{failedController.abort();return {...missingStream,id:'cancelled-player'};};
+  await prefCtx.ArchivebateVideoPrefetch.checkPlaybackFailure('cancelled-player',failedController.signal);
+  assert(!prefCtx.ArchivebateVideoPrefetch.isKnownUnavailableVideo('cancelled-player'),'switching player cancels publication of a late probe');
+  // A timed-out mutation reconciles one stable identity, even beyond the
+  // first 1000 favorites. An unavailable reconciliation remains uncertain.
+  const favoriteState={videos:[],favoritesCount:1000,favoriteAuthors:new Set(),preferencesVersion:7};
+  const favoriteDOM={navFavCount:element(),statFavCount:element()};
+  const favoriteContext=env(favoriteState,favoriteDOM);
+  const messages=[],identityRequests=[];
+  favoriteContext.document.querySelector=()=>null;
+  favoriteContext.document.head=element();
+  favoriteContext.document.createElement=()=>({...element(),dataset:{}});
+  favoriteContext.ArchivebateAPI={postJSON:async()=>{throw new Error('timeout');},getJSON:async url=>{
+    identityRequests.push(url);return {is_favorite:true,total_favorites:1001,preferences_version:8};
+  }};
+  load(favoriteContext,'favorites.js');
+  favoriteContext.ArchivebateFavorites.init({showToast:(message,type)=>messages.push({message,type})});
+  const button=element();
+  const oldest={source:'archivebate',id:'oldest',username:'Model',is_favorite:false};
+  assert.equal(await favoriteContext.ArchivebateFavorites.toggleVideo(oldest,button),true);
+  assert.equal(identityRequests[0],'/api/account/favorites/state?source=archivebate&provider_id=oldest');
+  assert.equal(favoriteState.favoritesCount,1001);
+  assert.equal(button['aria-pressed'],'true');
+  favoriteContext.ArchivebateAPI.getJSON=async()=>{throw new Error('read failed');};
+  const unknown={source:'camwhores',id:'cw_unknown',is_favorite:false};
+  assert.equal(await favoriteContext.ArchivebateFavorites.toggleVideo(unknown),false);
+  assert.equal(messages.at(-1).type,'warning');
+  assert(messages.at(-1).message.includes('Nie udało się ustalić'));
+
+  // A status response from before restore cannot lower the projection or
+  // replace its confirmed counters while a later status is in flight.
+  load(favoriteContext,'account.js');
+  favoriteState.preferencesVersion=20;
+  favoriteContext.ArchivebateAccount.updateUserStatus({preferences_version:8,favorites_count:1});
+  assert.equal(favoriteState.preferencesVersion,20);
+  assert.equal(favoriteState.favoritesCount,1001);
+  console.log('PASS: loading, cancellation, profile ordering, removal proof, identity reconciliation, stale status, quarantine, first-frame and retry contracts');
 })().catch(e=>{console.error(e);process.exitCode=1;});

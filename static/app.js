@@ -534,10 +534,10 @@ function showSkeletons() {
 }
 
 // TOAST
-function showToast(message, type = 'info', existingToast = null, actions = []) {
+function showToast(message, type = 'info', existingToast = null, actions = [], options = {}) {
   const g = typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : globalThis);
   const t = g.ArchivebateToast || (typeof require === 'function' ? (require('./static/toast.js') || g.ArchivebateToast) : null);
-  return t && typeof t.show === 'function' ? t.show(message, type, existingToast, actions) : undefined;
+  return t && typeof t.show === 'function' ? t.show(message, type, existingToast, actions, options) : undefined;
 }
 
 // Modal Player Controls Adapter

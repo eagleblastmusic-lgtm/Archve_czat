@@ -250,11 +250,7 @@
     homePagePrefetchControllers.clear();
     homePagePrefetchInflight.clear();
     if (!cancelActiveView) return;
-    state.viewController?.abort?.();
-    state.activeSearchSource?.close?.();
-    state.activeSearchSource = null;
-    state.viewGeneration = (state.viewGeneration || 0) + 1;
-    state.isLoading = false;
+    beginViewRequest();
     setFeedRefreshingIndicator(false);
   }
 
@@ -313,6 +309,9 @@
   }
 
   function beginViewRequest() {
+    for (const controller of homePagePrefetchControllers.values()) controller.abort();
+    homePagePrefetchControllers.clear();
+    homePagePrefetchInflight.clear();
     global.ArchivebateVideoPrefetch?.cancelAvailabilityChecks?.();
     state.gridController?.abort();
     if (typeof global.lazyThumbObserver !== 'undefined') global.lazyThumbObserver?.disconnect?.();
@@ -698,7 +697,12 @@
             if (batch.type === 'source_error' && dom.videoCount) dom.videoCount.innerText += ' • źródło chwilowo niedostępne; odśwież widok';
           }
         };
-        stream.onerror = () => { clearTimeout(streamWatchdog); stream.close(); showFeedError({ preserveVisible: true }); };
+        stream.onerror = () => {
+          clearTimeout(streamWatchdog);
+          stream.close();
+          if (generation !== state.viewGeneration) return;
+          showFeedError({ preserveVisible: true });
+        };
       }
     } catch (e) {
       if (generation !== state.viewGeneration || e?.code === 'cancelled') return;

@@ -100,6 +100,7 @@
       // Account Panel View
       accountPanelView: getEl('accountPanelView'),
       panelEmail: getEl('panelEmail'),
+      accountStatusBadge: getEl('accountStatusBadge'),
       panelLastSync: getEl('panelLastSync'),
       panelSyncBtn: getEl('panelSyncBtn'),
       panelClearHistoryBtn: getEl('panelClearHistoryBtn'),
