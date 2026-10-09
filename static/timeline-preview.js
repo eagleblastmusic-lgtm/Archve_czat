@@ -130,7 +130,7 @@
       const candidates = [];
       for (const [k, e] of this.cache.entries()) {
         if (k === protectedKey || k === this.activeVideoKey) continue;
-        if (e.fetching || (e.listeners && e.listeners.size > 0)) continue;
+        if (e.fetching || (e.subscribers && e.subscribers.size > 0) || (e.listeners && e.listeners.size > 0)) continue;
         candidates.push({ key: k, entry: e, time: e.lastAccessed || 0 });
       }
       candidates.sort((a, b) => a.time - b.time);
@@ -259,6 +259,7 @@
       const key = canonicalKey(videoKey, source);
       const entry = this.getOrCreateEntry(key, source);
       entry.subscribers.set(String(subscriberId), onUpdate);
+      this.activeVideoKey = key;
       // Dispatch ready state asynchronously to prevent synchronous recursion
       if (entry.manifest && entry.sheets && entry.sheets.size > 0) {
         Promise.resolve().then(() => {
@@ -275,10 +276,20 @@
       const entry = this.cache.get(key);
       if (entry && entry.subscribers) {
         entry.subscribers.delete(String(subscriberId));
+        if (this.activeVideoKey === key && entry.subscribers.size === 0) {
+          this.activeVideoKey = null;
+        }
         if (entry.subscribers.size === 0 && (!entry.listeners || entry.listeners.size === 0)) {
           this.stopPolling(videoKey, source);
         }
       }
+    }
+
+    hasSubscribers(videoKey, source) {
+      if (!videoKey) return false;
+      const key = canonicalKey(videoKey, source);
+      const entry = this.cache.get(key);
+      return !!(entry && ((entry.subscribers && entry.subscribers.size > 0) || (entry.listeners && entry.listeners.size > 0)));
     }
 
     notifySubscribers(entry, manifest) {

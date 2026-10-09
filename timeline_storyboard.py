@@ -190,16 +190,21 @@ def get_preview_frame_path(key: VideoKey, index: int) -> Path:
     return get_cache_dir_for_key(key) / "preview" / f"frame_{int(index)}.jpg"
 
 
-def record_lease(video_id: str, duration: float = LEASE_DURATION_SECONDS, source: Optional[str] = None) -> None:
+def record_lease(video_id: str, duration: float = LEASE_DURATION_SECONDS, source: Optional[str] = None, clear_cancel: bool = True) -> None:
     key = resolve_video_key(video_id, source=source)
     key_str = key.as_string()
-    with _lock:
-        _live_leases[key_str] = time.monotonic() + max(1.0, float(duration))
     try:
         import player_qos_runtime as qos
-        qos.clear_cancel_state(key.provider_id)
+        if qos.is_hard_cancelled(key.provider_id):
+            if not clear_cancel:
+                return  # Do not resurrect or renew lease on passive/stale request for hard-cancelled video
+            qos.clear_cancel_state(key.provider_id)
+        elif clear_cancel:
+            qos.clear_cancel_state(key.provider_id)
     except Exception:
         pass
+    with _lock:
+        _live_leases[key_str] = time.monotonic() + max(1.0, float(duration))
 
 
 def has_live_lease(video_id: str, source: Optional[str] = None) -> bool:
@@ -262,6 +267,7 @@ def _default_extract_frame(
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "2",
+            "-protocol_whitelist", "http,https,tcp,tls",
         ]
     cmd += [
         "-i", source_url,
@@ -319,6 +325,16 @@ def _default_extract_frame(
         return False
     finally:
         if proc is not None:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        pass
             try:
                 import player_qos_runtime as qos
                 qos.unregister_v2_process(p_key)
@@ -488,7 +504,7 @@ class ProgressiveStoryboardService:
         embed_url: Optional[str] = None,
     ) -> dict:
         key = resolve_video_key(video_id, source=source)
-        record_lease(key.as_string())
+        record_lease(key.as_string(), clear_cancel=True)
         manifest = self.get_manifest(
             video_id,
             duration,
@@ -644,9 +660,9 @@ class ProgressiveStoryboardService:
                         return _worker_stop.is_set() or not has_live_lease(key.as_string(), source=key.source)
                     budget = qos.wait_for_ffmpeg_budget("v2_prev", 1, key.provider_id, cancel_check)
                 except Exception:
-                    budget = False
+                    budget = None
 
-                if budget is None and not _worker_stop.is_set():
+                if budget is None:
                     break
 
                 try:
@@ -733,9 +749,9 @@ class ProgressiveStoryboardService:
                         return _worker_stop.is_set() or not has_live_lease(key.as_string(), source=key.source)
                     budget = qos.wait_for_ffmpeg_budget("v2", 1, key.provider_id, cancel_check)
                 except Exception:
-                    budget = False
+                    budget = None
 
-                if budget is None and not _worker_stop.is_set():
+                if budget is None:
                     return s_idx, pts, None
 
                 try:

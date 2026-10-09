@@ -354,6 +354,12 @@
     state.activePlaybackSession?.abort('switched_video');
     state.previewSeeker?.destroy();
 
+    const prevVideoId = state.currentVideoId || state.currentVideoDetails?.id;
+    if (g.ArchivebateTimelinePreview && prevVideoId && String(prevVideoId) !== String(video?.id)) {
+      const prevSource = state.currentVideoDetails?.source || (String(prevVideoId).startsWith('cw_') ? 'camwhores' : 'archivebate');
+      g.ArchivebateTimelinePreview.manager.unsubscribe(prevVideoId, 'modal', prevSource);
+    }
+
     const sessionController = state.playerController = new AbortController();
 
     // Inicjalizacja sesji pomiarowej otwarcia wideo (Pakiet C, punkt 1)
@@ -383,6 +389,7 @@
     state.timelineSpriteAbort = null;
     state.timelineSpriteBoard = null;
     state.currentStoryboardKey = video?.id ? `video:${video.id}` : null;
+    state.currentVideoId = video?.id ? String(video.id) : null;
     state.currentVideoDetails = { ...video };
 
     const groupedList = video?.grouped_videos || video?._groupedVideos;
@@ -970,6 +977,7 @@
       const source = (state.currentVideoDetails?.source || (String(state.currentVideoId).startsWith('cw_') ? 'camwhores' : 'archivebate'));
       g.ArchivebateTimelinePreview.manager.unsubscribe(state.currentVideoId, 'modal', source);
     }
+    state.currentVideoId = null;
     if (dom.videoModal) dom.videoModal.classList.remove('active');
     if (dom.videoModal) dom.videoModal.setAttribute('aria-hidden', 'true');
     if (dom.videoModal && modalKeyHandler) {

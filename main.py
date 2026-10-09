@@ -2561,7 +2561,7 @@ def storyboard_v2_manifest(
     """Manifest v2 dla progresywnego storyboardu w siatce 10x10."""
     from timeline_storyboard import progressive_storyboard_service, record_lease
     clean_id = _resolve_clean_video_id(id)
-    record_lease(clean_id, duration=120.0, source=source)
+    record_lease(clean_id, duration=120.0, source=source, clear_cancel=(since_rev == 0))
     if wait_ms > 0:
         return progressive_storyboard_service.wait_manifest(
             clean_id,

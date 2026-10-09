@@ -149,6 +149,9 @@
   function hardCancel(video, reason) {
     const videoId = lastVideoIds.get(video) || resolveVideoId(video);
     if (!videoId) return;
+    if (globalThis.ArchivebateTimelinePreview?.manager?.hasSubscribers?.(videoId)) {
+      return;
+    }
     postJSON(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}&reason=${encodeURIComponent(reason)}`, {});
   }
 

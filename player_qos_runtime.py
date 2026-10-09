@@ -281,6 +281,11 @@ def hard_cancel(video_id: Optional[str] = None, reason: str = "client") -> int:
     if video_id:
         with _lock:
             _hard_cancel_flags.add(_key(video_id))
+        try:
+            import timeline_storyboard
+            timeline_storyboard.remove_lease(video_id)
+        except Exception:
+            pass
     return _mark_processes_preempted(video_id=video_id, hard=True)
 
 
@@ -345,7 +350,10 @@ def _install_scheduler_qos(quick_module=None) -> None:
                                 video_id=None, kind="generic", segment_index=None, priority=0):
         def combined_cancel():
             return _hard_cancel_requested(video_id) or (cancel_check is not None and cancel_check())
-        budget = _wait_for_ffmpeg_budget(kind, int(priority), video_id, combined_cancel)
+        try:
+            budget = _wait_for_ffmpeg_budget(kind, int(priority), video_id, combined_cancel)
+        except Exception:
+            budget = None
         if budget is None:
             empty = "" if text else b""
             return -15, empty, True

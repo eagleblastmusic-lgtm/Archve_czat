@@ -95,6 +95,10 @@ jobs:
         run: node audit/regression_audit_repair_frontend.cjs
       - name: V2 timeline P0 recursion and polling regression
         run: node audit/reproduce_p0_recursion_and_polling.cjs
+      - name: V2 timeline P1 remediation backend regression
+        run: python audit/regression_final_p1_remediation.py
+      - name: V2 timeline P1 remediation frontend regression
+        run: node audit/regression_final_p1_frontend.cjs
       - name: Catalog partial frontend regression
         run: node audit/regression_catalog_partial_frontend.cjs
       - name: Feed regression
@@ -213,6 +217,10 @@ jobs:
         run: node audit/regression_audit_repair_frontend.cjs
       - name: V2 timeline P0 recursion and polling regression
         run: node audit/reproduce_p0_recursion_and_polling.cjs
+      - name: V2 timeline P1 remediation backend regression
+        run: python audit/regression_final_p1_remediation.py
+      - name: V2 timeline P1 remediation frontend regression
+        run: node audit/regression_final_p1_frontend.cjs
       - name: Pagination frontend regression
         run: node audit/regression_package_b_frontend.cjs
       - name: Catalog projection frontend regression
@@ -290,6 +298,10 @@ jobs:
         run: node audit/regression_audit_repair_frontend.cjs
       - name: V2 timeline P0 recursion and polling regression
         run: node audit/reproduce_p0_recursion_and_polling.cjs
+      - name: V2 timeline P1 remediation backend regression
+        run: python audit/regression_final_p1_remediation.py
+      - name: V2 timeline P1 remediation frontend regression
+        run: node audit/regression_final_p1_frontend.cjs
       - name: Unit tests
         run: python -m unittest -v test_suite.py
 
