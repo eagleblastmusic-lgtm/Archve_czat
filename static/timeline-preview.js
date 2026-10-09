@@ -90,6 +90,7 @@
       this.maxCachedEntries = 12;
       this.activeVideoKey = null;
       this.activeInstances = new Set();
+      this.consumerId = 'tab_' + Math.random().toString(36).slice(2, 9) + '_' + Date.now().toString(36);
     }
 
     getOrCreateEntry(videoKey, source) {
@@ -281,8 +282,25 @@
         }
         if (entry.subscribers.size === 0 && (!entry.listeners || entry.listeners.size === 0)) {
           this.stopPolling(videoKey, source);
+          this.releaseLease(videoKey, source);
         }
       }
+    }
+
+    releaseLease(videoKey, source) {
+      if (!videoKey) return;
+      const parts = String(videoKey).split(':');
+      const videoId = parts.length >= 3 ? parts.slice(2).join(':') : parts[parts.length - 1];
+      const token = getMutationToken();
+      const headers = {
+        'Content-Type': 'application/json',
+        ...(token ? { 'X-Archivebate-Mutation-Token': token } : {}),
+      };
+      fetch(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}&consumer_id=${encodeURIComponent(this.consumerId)}&source=${encodeURIComponent(source || '')}&reason=unsubscribe`, {
+        method: 'POST',
+        headers,
+        keepalive: true,
+      }).catch(() => {});
     }
 
     hasSubscribers(videoKey, source) {
@@ -354,7 +372,7 @@
         try {
           const token = getMutationToken();
           const buildHeaders = token ? { 'X-Archivebate-Mutation-Token': token } : {};
-          fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}`, {
+          fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}&consumer_id=${encodeURIComponent(this.consumerId)}`, {
             method: 'POST',
             headers: buildHeaders,
             signal: controller.signal,
@@ -363,8 +381,15 @@
           let loopIter = 0;
           while (!controller.signal.aborted && entry.generation === targetGeneration) {
             loopIter++;
+            if (loopIter % 4 === 0 && (!entry.manifest || !entry.manifest.complete)) {
+              fetch(`/api/storyboard/v2/lease/renew?id=${encodeURIComponent(videoId)}&consumer_id=${encodeURIComponent(this.consumerId)}&source=${encodeURIComponent(source || '')}`, {
+                method: 'POST',
+                headers: buildHeaders,
+                signal: controller.signal,
+              }).catch(() => {});
+            }
             if (loopIter % 8 === 0 && (!entry.manifest || !entry.manifest.complete)) {
-              fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}`, {
+              fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}&consumer_id=${encodeURIComponent(this.consumerId)}`, {
                 method: 'POST',
                 headers: buildHeaders,
                 signal: controller.signal,

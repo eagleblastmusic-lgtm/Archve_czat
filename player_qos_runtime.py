@@ -586,10 +586,30 @@ def install(app, main_module) -> None:
         return {"ok": True, "preempted": int(count), "qos": snapshot()}
 
     @app.post("/api/runtime/v452/storyboard/cancel")
-    def v452_storyboard_cancel(id: Optional[str] = Query(None), reason: str = Query("lifecycle")):
+    def v452_storyboard_cancel(
+        id: Optional[str] = Query(None),
+        reason: str = Query("lifecycle"),
+        consumer_id: Optional[str] = Query(None),
+    ):
         clean_id = _clean_video_id(main_module, id) if id else ""
+        if consumer_id and clean_id:
+            try:
+                import timeline_storyboard as ts
+                was_present, remaining = ts.release_lease(clean_id, consumer_id=consumer_id, reason=f"browser:{str(reason)[:64]}")
+                if remaining > 0:
+                    return {"ok": True, "cancelled": 0, "video_id": clean_id, "remaining_consumers": remaining}
+                count = hard_cancel(clean_id or None, reason=f"browser:{str(reason)[:64]}")
+                return {"ok": True, "cancelled": int(count), "video_id": clean_id, "remaining_consumers": 0}
+            except Exception:
+                pass
+
+        try:
+            import timeline_storyboard as ts
+            ts.remove_lease(clean_id)
+        except Exception:
+            pass
         count = hard_cancel(clean_id or None, reason=f"browser:{str(reason)[:64]}")
-        return {"ok": True, "cancelled": int(count), "video_id": clean_id}
+        return {"ok": True, "cancelled": int(count), "video_id": clean_id, "remaining_consumers": 0}
 
     @app.get("/api/runtime/v452/qos")
     def v452_qos_snapshot():

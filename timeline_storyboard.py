@@ -54,12 +54,22 @@ V2_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 def is_safe_ffmpeg_input_url(url: Optional[str]) -> bool:
     """Validate that input URL for FFmpeg is safe against SSRF, internal network scanning,
     file:// access, loopback bypass, and header/protocol smuggling.
+
+    Direct unproxied remote URLs are rejected because FFmpeg automatically follows HTTP
+    redirects and resolves DNS without peer IP validation, which exposes private networks
+    to SSRF and DNS rebinding. All remote streams must be routed through /api/video/stream.
     """
     if not url or not isinstance(url, str):
         return False
     clean = url.strip()
     if "\r" in clean or "\n" in clean or "\0" in clean:
         return False
+    try:
+        p = Path(clean)
+        if p.is_file() and p.exists() and not clean.startswith("file:"):
+            return True
+    except Exception:
+        pass
     try:
         parsed = urlparse(clean)
         if parsed.scheme not in ("http", "https"):
@@ -78,8 +88,7 @@ def is_safe_ffmpeg_input_url(url: Optional[str]) -> bool:
                 return False
             clean_path = parsed.path.rstrip("/")
             return clean_path == "/api/video/stream"
-        from cache_store import is_safe_remote_url
-        return is_safe_remote_url(clean, fresh=True)
+        return False
     except Exception:
         return False
 
@@ -89,8 +98,183 @@ _active_builds: Dict[str, dict] = {}
 _jobs_queue: Queue = Queue(maxsize=128)
 _worker_thread: Optional[threading.Thread] = None
 _worker_stop = threading.Event()
-_live_leases: Dict[str, float] = {}  # key -> expires_monotonic
 LEASE_DURATION_SECONDS = 120.0
+
+
+class ConsumerLeaseManager:
+    """Thread-safe, multi-consumer lease manager with per-consumer tracking,
+    session epochs, natural expiration, and automatic pruning.
+    """
+    def __init__(self, default_duration: float = LEASE_DURATION_SECONDS, max_tracked_keys: int = 1000):
+        self._lock = threading.RLock()
+        # key_str -> {consumer_id: expires_monotonic}
+        self._leases: Dict[str, Dict[str, float]] = {}
+        # key_str -> epoch counter
+        self._epochs: Dict[str, int] = {}
+        self.default_duration = max(5.0, float(default_duration))
+        self.max_tracked_keys = max_tracked_keys
+        self._last_prune = time.monotonic()
+
+    def _prune_expired_locked(self, now: float) -> None:
+        if now - self._last_prune < 5.0 and len(self._leases) < self.max_tracked_keys:
+            return
+        self._last_prune = now
+        expired_keys = []
+        for key_str, consumers in list(self._leases.items()):
+            active = {cid: exp for cid, exp in consumers.items() if exp > now}
+            if active:
+                self._leases[key_str] = active
+            else:
+                expired_keys.append(key_str)
+        for k in expired_keys:
+            self._leases.pop(k, None)
+            self._epochs.pop(k, None)
+
+        if len(self._leases) > self.max_tracked_keys:
+            sorted_keys = sorted(
+                self._leases.keys(),
+                key=lambda k: max(self._leases[k].values()) if self._leases[k] else 0.0
+            )
+            for k in sorted_keys[: len(self._leases) - self.max_tracked_keys]:
+                self._leases.pop(k, None)
+                self._epochs.pop(k, None)
+
+    def acquire(
+        self,
+        key: VideoKey,
+        consumer_id: Optional[str] = None,
+        duration: Optional[float] = None,
+    ) -> Tuple[bool, int, int, str]:
+        now = time.monotonic()
+        cid = str(consumer_id or "").strip()
+        if not cid:
+            import secrets
+            cid = f"c_{secrets.token_hex(6)}_{int(now * 1000)}"
+
+        dur = max(0.05, float(duration if duration is not None else self.default_duration))
+        expires = now + dur
+        key_str = key.as_string()
+
+        with self._lock:
+            self._prune_expired_locked(now)
+            if key_str not in self._leases:
+                self._leases[key_str] = {}
+                self._epochs[key_str] = self._epochs.get(key_str, 0) + 1
+            self._leases[key_str][cid] = expires
+            epoch = self._epochs[key_str]
+            active_count = sum(1 for exp in self._leases[key_str].values() if exp > now)
+
+        try:
+            import player_qos_runtime as qos
+            qos.clear_cancel_state(key.provider_id)
+        except Exception:
+            pass
+
+        return True, epoch, active_count, cid
+
+    def renew(
+        self,
+        key: VideoKey,
+        consumer_id: str,
+        duration: Optional[float] = None,
+    ) -> Tuple[bool, int]:
+        now = time.monotonic()
+        cid = str(consumer_id or "").strip()
+        if not cid:
+            return False, 0
+        dur = max(0.05, float(duration if duration is not None else self.default_duration))
+        key_str = key.as_string()
+
+        with self._lock:
+            consumers = self._leases.get(key_str)
+            if not consumers or cid not in consumers:
+                return False, 0
+            consumers[cid] = now + dur
+            active_count = sum(1 for exp in consumers.values() if exp > now)
+            return True, active_count
+
+    def release(
+        self,
+        key: VideoKey,
+        consumer_id: Optional[str] = None,
+        reason: str = "client_release",
+    ) -> Tuple[bool, int]:
+        now = time.monotonic()
+        key_str = key.as_string()
+        cid = str(consumer_id or "").strip() if consumer_id else None
+
+        with self._lock:
+            consumers = self._leases.get(key_str)
+            if consumers is None:
+                return False, 0
+
+            was_present = False
+            if cid is None:
+                was_present = bool(consumers)
+                self._leases.pop(key_str, None)
+                remaining = 0
+            else:
+                was_present = (consumers.pop(cid, None) is not None)
+                active = {c: exp for c, exp in consumers.items() if exp > now}
+                if active:
+                    self._leases[key_str] = active
+                    remaining = len(active)
+                else:
+                    self._leases.pop(key_str, None)
+                    remaining = 0
+
+            if remaining == 0:
+                try:
+                    import player_qos_runtime as qos
+                    qos.hard_cancel(key.provider_id, reason=reason)
+                except Exception:
+                    pass
+
+            return was_present, remaining
+
+    def has_live_lease(self, key: VideoKey) -> bool:
+        now = time.monotonic()
+        key_str = key.as_string()
+        with self._lock:
+            consumers = self._leases.get(key_str)
+            if not consumers:
+                return False
+            return any(exp > now for exp in consumers.values())
+
+    def get_active_consumers_count(self, key: VideoKey) -> int:
+        now = time.monotonic()
+        key_str = key.as_string()
+        with self._lock:
+            consumers = self._leases.get(key_str)
+            if not consumers:
+                return 0
+            return sum(1 for exp in consumers.values() if exp > now)
+
+    def diagnostic_snapshot(self, key: Optional[VideoKey] = None) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            if key is not None:
+                key_str = key.as_string()
+                consumers = self._leases.get(key_str, {})
+                active = {cid: round(max(0.0, exp - now), 2) for cid, exp in consumers.items() if exp > now}
+                return {
+                    "key": key_str,
+                    "active_consumers_count": len(active),
+                    "epoch": self._epochs.get(key_str, 0),
+                    "consumers": list(active.keys()),
+                }
+            result = {}
+            for k, consumers in list(self._leases.items()):
+                active_count = sum(1 for exp in consumers.values() if exp > now)
+                if active_count > 0:
+                    result[k] = {
+                        "active_consumers": active_count,
+                        "epoch": self._epochs.get(k, 0),
+                    }
+            return result
+
+
+lease_manager = ConsumerLeaseManager()
 
 
 def compute_bisection_order(num_slots: int) -> List[int]:
@@ -190,34 +374,62 @@ def get_preview_frame_path(key: VideoKey, index: int) -> Path:
     return get_cache_dir_for_key(key) / "preview" / f"frame_{int(index)}.jpg"
 
 
-def record_lease(video_id: str, duration: float = LEASE_DURATION_SECONDS, source: Optional[str] = None, clear_cancel: bool = True) -> None:
+def acquire_lease(
+    video_id: str,
+    consumer_id: Optional[str] = None,
+    duration: float = LEASE_DURATION_SECONDS,
+    source: Optional[str] = None,
+) -> Tuple[bool, int, int, str]:
     key = resolve_video_key(video_id, source=source)
-    key_str = key.as_string()
+    return lease_manager.acquire(key, consumer_id=consumer_id, duration=duration)
+
+
+def renew_lease(
+    video_id: str,
+    consumer_id: str,
+    duration: float = LEASE_DURATION_SECONDS,
+    source: Optional[str] = None,
+) -> Tuple[bool, int]:
+    key = resolve_video_key(video_id, source=source)
+    return lease_manager.renew(key, consumer_id=consumer_id, duration=duration)
+
+
+def release_lease(
+    video_id: str,
+    consumer_id: Optional[str] = None,
+    source: Optional[str] = None,
+    reason: str = "client_release",
+) -> Tuple[bool, int]:
+    key = resolve_video_key(video_id, source=source)
+    return lease_manager.release(key, consumer_id=consumer_id, reason=reason)
+
+
+def record_lease(
+    video_id: str,
+    duration: float = LEASE_DURATION_SECONDS,
+    source: Optional[str] = None,
+    clear_cancel: bool = True,
+    consumer_id: Optional[str] = None,
+) -> None:
+    key = resolve_video_key(video_id, source=source)
     try:
         import player_qos_runtime as qos
         if qos.is_hard_cancelled(key.provider_id):
             if not clear_cancel:
                 return  # Do not resurrect or renew lease on passive/stale request for hard-cancelled video
-            qos.clear_cancel_state(key.provider_id)
-        elif clear_cancel:
-            qos.clear_cancel_state(key.provider_id)
     except Exception:
         pass
-    with _lock:
-        _live_leases[key_str] = time.monotonic() + max(1.0, float(duration))
+    lease_manager.acquire(key, consumer_id=consumer_id or "legacy_default", duration=duration)
 
 
 def has_live_lease(video_id: str, source: Optional[str] = None) -> bool:
-    key_str = resolve_video_key(video_id, source=source).as_string()
-    with _lock:
-        expiry = _live_leases.get(key_str, 0.0)
-        return expiry > time.monotonic()
+    key = resolve_video_key(video_id, source=source)
+    return lease_manager.has_live_lease(key)
 
 
 def remove_lease(video_id: str, source: Optional[str] = None) -> None:
-    key_str = resolve_video_key(video_id, source=source).as_string()
-    with _lock:
-        _live_leases.pop(key_str, None)
+    key = resolve_video_key(video_id, source=source)
+    lease_manager.release(key, consumer_id=None)
 
 
 def _default_extract_frame(
@@ -502,9 +714,10 @@ class ProgressiveStoryboardService:
         native_count: Optional[int] = None,
         direct_url: Optional[str] = None,
         embed_url: Optional[str] = None,
+        consumer_id: Optional[str] = None,
     ) -> dict:
         key = resolve_video_key(video_id, source=source)
-        record_lease(key.as_string(), clear_cancel=True)
+        acquire_lease(key.as_string(), consumer_id=consumer_id, duration=LEASE_DURATION_SECONDS, source=source)
         manifest = self.get_manifest(
             video_id,
             duration,

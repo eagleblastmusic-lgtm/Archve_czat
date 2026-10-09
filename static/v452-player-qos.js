@@ -152,7 +152,9 @@
     if (globalThis.ArchivebateTimelinePreview?.manager?.hasSubscribers?.(videoId)) {
       return;
     }
-    postJSON(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}&reason=${encodeURIComponent(reason)}`, {});
+    const consumerId = globalThis.ArchivebateTimelinePreview?.manager?.consumerId || '';
+    const consumerParam = consumerId ? `&consumer_id=${encodeURIComponent(consumerId)}` : '';
+    postJSON(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}${consumerParam}&reason=${encodeURIComponent(reason)}`, {});
   }
 
   function onEvent(event) {
