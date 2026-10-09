@@ -77,7 +77,9 @@
 
   class TimelinePreviewManager {
     constructor() {
-      this.cache = new Map(); // videoKey -> { manifest, sheets: Map(idx -> HTMLImageElement), listeners: Set }
+      this.cache = new Map(); // videoKey -> { manifest, sheets: Map, sheetUrls: Map, sheetRevs: Map, activeRev, generation, fetching, controller, listeners: Set, lastAccessed }
+      this.maxCachedEntries = 12;
+      this.activeVideoKey = null;
       this.activeInstances = new Set();
     }
 
@@ -88,15 +90,45 @@
           manifest: null,
           sheets: new Map(),
           sheetUrls: new Map(),
+          sheetRevs: new Map(),
+          activeRev: 0,
+          generation: 0,
           fetching: false,
           controller: null,
           listeners: new Set(),
+          lastAccessed: Date.now(),
         });
+        this.evictLru(key);
       }
       const entry = this.cache.get(key);
       if (!entry.sheetUrls) entry.sheetUrls = new Map();
+      if (!entry.sheetRevs) entry.sheetRevs = new Map();
       if (!entry.listeners) entry.listeners = new Set();
+      entry.lastAccessed = Date.now();
       return entry;
+    }
+
+    evictLru(protectedKey) {
+      if (this.cache.size <= this.maxCachedEntries) return;
+      const candidates = [];
+      for (const [k, e] of this.cache.entries()) {
+        if (k === protectedKey || k === this.activeVideoKey) continue;
+        if (e.fetching || (e.listeners && e.listeners.size > 0)) continue;
+        candidates.push({ key: k, entry: e, time: e.lastAccessed || 0 });
+      }
+      candidates.sort((a, b) => a.time - b.time);
+      while (this.cache.size > this.maxCachedEntries && candidates.length > 0) {
+        const victim = candidates.shift();
+        if (victim && victim.entry) {
+          if (victim.entry.controller) {
+            try { victim.entry.controller.abort(); } catch (_) {}
+          }
+          if (victim.entry.sheets) victim.entry.sheets.clear();
+          if (victim.entry.sheetUrls) victim.entry.sheetUrls.clear();
+          if (victim.entry.sheetRevs) victim.entry.sheetRevs.clear();
+          this.cache.delete(victim.key);
+        }
+      }
     }
 
     hasEntry(videoKey, source) {
@@ -108,11 +140,12 @@
     stopPolling(videoKey, source) {
       const key = canonicalKey(videoKey, source);
       const entry = this.cache.get(key);
-      if (entry && entry.controller) {
-        try { entry.controller.abort(); } catch (_) {}
-        entry.controller = null;
-      }
       if (entry) {
+        entry.generation = (entry.generation || 0) + 1;
+        if (entry.controller) {
+          try { entry.controller.abort(); } catch (_) {}
+          entry.controller = null;
+        }
         entry.fetching = false;
         if (entry.listeners) entry.listeners.clear();
       }
@@ -126,7 +159,7 @@
         if (direct.manifest && Array.isArray(direct.manifest.frames) && direct.manifest.frames.length > 0 && direct.sheets.size > 0) {
           return true;
         }
-        if (direct.manifest?.native?.kind === 'prefix') {
+        if (direct.manifest?.native?.kind === 'prefix' || (direct.manifest?.native?.frames && direct.manifest.native.frames.length > 0)) {
           return true;
         }
       }
@@ -136,7 +169,7 @@
           if (entry.manifest && Array.isArray(entry.manifest.frames) && entry.manifest.frames.length > 0 && entry.sheets.size > 0) {
             return true;
           }
-          if (entry.manifest?.native?.kind === 'prefix') {
+          if (entry.manifest?.native?.kind === 'prefix' || (entry.manifest?.native?.frames && entry.manifest.native.frames.length > 0)) {
             return true;
           }
         }
@@ -144,23 +177,64 @@
       return false;
     }
 
-    preloadSheet(sheetUrl) {
+    preloadSheet(sheetUrl, targetRev, sheetIndex, targetGeneration, entry) {
       return new Promise((resolve) => {
         if (typeof Image === 'undefined') {
           resolve(null);
           return;
         }
         const img = new Image();
+        const finish = (loaded) => {
+          if (!loaded) {
+            resolve(null);
+            return;
+          }
+          // Race-condition guard: check generation, active controller, and revision monotonicity
+          if (entry) {
+            if (entry.generation !== targetGeneration) {
+              resolve(null);
+              return;
+            }
+            if (entry.controller && entry.controller.signal.aborted) {
+              resolve(null);
+              return;
+            }
+            const currentSheetRev = entry.sheetRevs ? (entry.sheetRevs.get(sheetIndex) || 0) : 0;
+            if (targetRev !== undefined && targetRev < currentSheetRev) {
+              // Obsolete older revision finished decoding after newer revision; reject to prevent rollback
+              resolve(null);
+              return;
+            }
+            if (entry.sheets && entry.sheetUrls) {
+              entry.sheets.set(sheetIndex, loaded);
+              entry.sheetUrls.set(sheetIndex, sheetUrl);
+              if (entry.sheetRevs) entry.sheetRevs.set(sheetIndex, targetRev || 0);
+            }
+          }
+          resolve(loaded);
+        };
+
         img.onload = () => {
           if (img.decode) {
-            img.decode().then(() => resolve(img)).catch(() => resolve(img));
+            img.decode().then(() => finish(img)).catch(() => finish(img));
           } else {
-            resolve(img);
+            finish(img);
           }
         };
         img.onerror = () => resolve(null);
         img.src = sheetUrl;
       });
+    }
+
+    notifyListeners(entry, manifest) {
+      if (!entry || !entry.listeners || entry.listeners.size === 0) return;
+      for (const listener of Array.from(entry.listeners)) {
+        try {
+          listener(manifest);
+        } catch (err) {
+          console.error('[TimelinePreview] listener error:', err);
+        }
+      }
     }
 
     async pollManifest(videoKey, videoId, duration, source, onUpdate) {
@@ -170,19 +244,21 @@
 
       const key = canonicalKey(videoKey || videoId, source);
       const entry = this.getOrCreateEntry(key);
+      entry.lastAccessed = Date.now();
+
       if (onUpdate && typeof onUpdate === 'function') {
-        entry.listener = onUpdate;
+        entry.listeners.add(onUpdate);
+        // Immediate notification if manifest with ready sheets is already in cache
+        if (entry.manifest && entry.sheets && entry.sheets.size > 0) {
+          try { onUpdate(entry.manifest); } catch (_) {}
+        }
       }
+
       if (entry.fetching) return;
       entry.fetching = true;
       const controller = new AbortController();
       entry.controller = controller;
-
-      const notifyAll = (m) => {
-        if (typeof entry.listener === 'function') {
-          try { entry.listener(m); } catch (_) {}
-        }
-      };
+      const targetGeneration = entry.generation || 0;
 
       let sinceRev = entry.manifest ? (entry.manifest.rev || 0) : 0;
       let failureCount = 0;
@@ -198,7 +274,7 @@
         }).catch(() => {});
 
         let loopIter = 0;
-        while (!controller.signal.aborted) {
+        while (!controller.signal.aborted && entry.generation === targetGeneration) {
           loopIter++;
           if (loopIter % 8 === 0 && (!entry.manifest || !entry.manifest.complete)) {
             fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}`, {
@@ -220,42 +296,47 @@
             }
             failureCount = 0;
             const manifest = await resp.json();
-            if (manifest && manifest.version === 11) {
-              entry.manifest = manifest;
-              sinceRev = manifest.rev || sinceRev;
+            if (manifest && manifest.version === 11 && entry.generation === targetGeneration) {
+              const manifestRev = Number(manifest.rev || 0);
+              if (manifestRev >= (entry.activeRev || 0)) {
+                entry.manifest = manifest;
+                entry.activeRev = manifestRev;
+                sinceRev = manifestRev || sinceRev;
 
-              // Preload new sheets or updated revisions
-              if (Array.isArray(manifest.sheets)) {
-                for (const s of manifest.sheets) {
-                  if (s && s.url) {
-                    const currentUrl = entry.sheetUrls.get(s.index);
-                    if (currentUrl !== s.url) {
-                      this.preloadSheet(s.url).then(loadedImg => {
-                        if (loadedImg) {
-                          entry.sheets.set(s.index, loadedImg);
-                          entry.sheetUrls.set(s.index, s.url);
-                          notifyAll(entry.manifest);
-                        }
-                      });
+                // Preload new sheets or updated revisions without race conditions
+                if (Array.isArray(manifest.sheets)) {
+                  for (const s of manifest.sheets) {
+                    if (s && s.url) {
+                      const currentUrl = entry.sheetUrls.get(s.index);
+                      const currentRev = entry.sheetRevs.get(s.index) || 0;
+                      if (currentUrl !== s.url || manifestRev > currentRev) {
+                        this.preloadSheet(s.url, manifestRev, s.index, targetGeneration, entry).then(loadedImg => {
+                          if (loadedImg && entry.generation === targetGeneration) {
+                            this.notifyListeners(entry, entry.manifest);
+                          }
+                        });
+                      }
                     }
                   }
                 }
-              }
 
-              notifyAll(manifest);
+                this.notifyListeners(entry, manifest);
+              }
               if (manifest.complete) break;
             }
           } catch (err) {
-            if (controller.signal.aborted) break;
+            if (controller.signal.aborted || entry.generation !== targetGeneration) break;
             failureCount++;
             if (failureCount > 5) break;
             await new Promise(r => setTimeout(r, 1000));
           }
         }
       } finally {
-        entry.fetching = false;
-        if (entry.controller === controller) {
-          entry.controller = null;
+        if (entry.generation === targetGeneration) {
+          entry.fetching = false;
+          if (entry.controller === controller) {
+            entry.controller = null;
+          }
         }
       }
     }
@@ -347,7 +428,7 @@
         }
       }
 
-      // 2. Layer 0: Camwhores native prefix (15 images)
+      // 2. Layer 0: Native CDN prefix (Camwhores) or preview video frames (Archivebate)
       const prefix = nativePrefix || (manifest?.native?.kind === 'prefix' ? manifest.native.prefix : null);
       if (prefix) {
         const count = nativeCount || manifest?.native?.count || 15;
@@ -372,6 +453,30 @@
         return true;
       }
 
+      if (manifest?.native?.frames && Array.isArray(manifest.native.frames) && manifest.native.frames.length > 0) {
+        const nFrames = manifest.native.frames;
+        const frameIdx = Math.min(nFrames.length - 1, Math.max(0, Math.round(pos * (nFrames.length - 1))));
+        const frameEntry = nFrames[frameIdx];
+        const src = Array.isArray(frameEntry) ? frameEntry[1] : frameEntry;
+        if (src) {
+          if (imgEl) {
+            if (imgEl.src !== src) imgEl.src = src;
+            imgEl.style.display = 'block';
+          }
+          if (spriteEl) spriteEl.style.display = 'none';
+          if (timeTextEl) timeTextEl.innerText = formatTime(targetTime);
+          if (statusEl) {
+            if (statusText && statusText.includes('bufor')) {
+              statusEl.textContent = statusText;
+            } else {
+              statusEl.textContent = 'Podgląd przybliżony';
+            }
+            statusEl.style.display = 'block';
+          }
+          return true;
+        }
+      }
+
       return false;
     }
 
@@ -393,51 +498,58 @@
 
       let rafId = 0;
       let lastClientX = 0;
+      let isHovering = false;
+
+      const triggerRepaint = () => {
+        if (!isHovering || !timeline) return;
+        const rect = timeline.getBoundingClientRect();
+        if (!rect.width) return;
+
+        const rawX = lastClientX - rect.left;
+        const pos = Math.max(0, Math.min(1, rawX / rect.width));
+        const duration = getDuration ? getDuration() : 0;
+        if (duration <= 0) return;
+        const targetTime = pos * duration;
+
+        if (tooltip) {
+          const tooltipX = rect.width <= 168 ? rect.width / 2 : Math.max(84, Math.min(rect.width - 84, rawX));
+          tooltip.style.setProperty('--timeline-preview-x', `${tooltipX}px`);
+          tooltip.style.display = 'flex';
+        }
+
+        const videoId = getVideoId ? getVideoId() : '';
+        const source = getSource ? getSource() : (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate');
+        const videoKey = `${source}:id:${videoId}`;
+
+        this.render({
+          videoKey,
+          videoId,
+          targetTime,
+          duration,
+          pos,
+          spriteEl,
+          imgEl,
+          timeTextEl,
+          statusEl,
+          nativePrefix: getNativePrefix ? getNativePrefix() : null,
+          nativeCount: getNativeCount ? getNativeCount() : null,
+          poster: getPoster ? getPoster() : null,
+        });
+      };
 
       const onPointerMove = (e) => {
         lastClientX = e.clientX;
+        isHovering = true;
         if (rafId) return;
 
         rafId = requestAnimationFrame(() => {
           rafId = 0;
-          if (!timeline) return;
-          const rect = timeline.getBoundingClientRect();
-          if (!rect.width) return;
-
-          const rawX = lastClientX - rect.left;
-          const pos = Math.max(0, Math.min(1, rawX / rect.width));
-          const duration = getDuration ? getDuration() : 0;
-          if (duration <= 0) return;
-          const targetTime = pos * duration;
-
-          if (tooltip) {
-            const tooltipX = rect.width <= 168 ? rect.width / 2 : Math.max(84, Math.min(rect.width - 84, rawX));
-            tooltip.style.setProperty('--timeline-preview-x', `${tooltipX}px`);
-            tooltip.style.display = 'flex';
-          }
-
-          const videoId = getVideoId ? getVideoId() : '';
-          const source = getSource ? getSource() : (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate');
-          const videoKey = `${source}:id:${videoId}`;
-
-          this.render({
-            videoKey,
-            videoId,
-            targetTime,
-            duration,
-            pos,
-            spriteEl,
-            imgEl,
-            timeTextEl,
-            statusEl,
-            nativePrefix: getNativePrefix ? getNativePrefix() : null,
-            nativeCount: getNativeCount ? getNativeCount() : null,
-            poster: getPoster ? getPoster() : null,
-          });
+          triggerRepaint();
         });
       };
 
       const onPointerLeave = () => {
+        isHovering = false;
         if (rafId) {
           cancelAnimationFrame(rafId);
           rafId = 0;
@@ -450,17 +562,22 @@
         timeline.addEventListener('pointerleave', onPointerLeave, { passive: true });
       }
 
-      // Prewarm manifest on attach
+      // Prewarm manifest on attach with automatic repaint subscription
       const videoId = getVideoId ? getVideoId() : '';
       const duration = getDuration ? getDuration() : 0;
       const source = getSource ? getSource() : (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate');
       if (videoId && duration > 0) {
         const videoKey = `${source}:id:${videoId}`;
-        this.pollManifest(videoKey, videoId, duration, source);
+        this.pollManifest(videoKey, videoId, duration, source, () => {
+          if (isHovering) {
+            triggerRepaint();
+          }
+        });
       }
 
       return {
         dispose: () => {
+          isHovering = false;
           if (timeline) {
             timeline.removeEventListener('pointermove', onPointerMove);
             timeline.removeEventListener('pointerleave', onPointerLeave);
@@ -469,10 +586,10 @@
             cancelAnimationFrame(rafId);
             rafId = 0;
           }
-          const videoId = getVideoId ? getVideoId() : '';
-          const source = getSource ? getSource() : (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate');
-          if (videoId) {
-            this.stopPolling(videoId, source);
+          const vid = getVideoId ? getVideoId() : '';
+          const src = getSource ? getSource() : (vid.startsWith('cw_') ? 'camwhores' : 'archivebate');
+          if (vid) {
+            this.stopPolling(vid, src);
           }
         },
       };

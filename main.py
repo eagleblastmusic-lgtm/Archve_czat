@@ -2633,13 +2633,56 @@ def storyboard_v2_sheet(
     from timeline_storyboard import resolve_video_key, get_sheet_path
     clean_id = _resolve_clean_video_id(id)
     key = resolve_video_key(clean_id, source=source)
-    path = get_sheet_path(key, sheet)
+
+    rev_int = None
+    if v is not None:
+        try:
+            rev_int = int(v)
+        except (ValueError, TypeError):
+            rev_int = None
+
+    path = None
+    if rev_int is not None and rev_int > 0:
+        rev_path = get_sheet_path(key, sheet, rev=rev_int)
+        if rev_path.exists():
+            path = rev_path
+    if not path or not path.exists():
+        path = get_sheet_path(key, sheet)
+
     if not path or not path.exists():
         raise HTTPException(status_code=404, detail="Arkusz storyboardu v2 nie jest jeszcze gotowy")
+
+    # Gdy żądana jest konkretna wersja v, plik rewizji jest niezmienny (immutable).
+    # Dla odwołań bez wersji stosujemy walidację cache.
+    cache_control = (
+        "public, max-age=31536000, immutable"
+        if (rev_int is not None and path.name.endswith(f"_r{rev_int}.jpg"))
+        else "no-cache, must-revalidate"
+    )
     return FileResponse(
         str(path),
         media_type="image/jpeg",
-        headers={"Cache-Control": "public, max-age=31536000, immutable", "Access-Control-Allow-Origin": "*"},
+        headers={"Cache-Control": cache_control},
+    )
+
+
+@app.get("/api/storyboard/v2/preview")
+def storyboard_v2_preview(
+    id: str = Query(..., min_length=1),
+    idx: int = Query(0, ge=0),
+    source: Optional[str] = Query(None),
+):
+    """Zwraca klatkę wyekstrahowaną z lekkiego preview video (Layer 0)."""
+    from timeline_storyboard import resolve_video_key, get_preview_frame_path
+    clean_id = _resolve_clean_video_id(id)
+    key = resolve_video_key(clean_id, source=source)
+    path = get_preview_frame_path(key, idx)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Klatka preview nie istnieje")
+    return FileResponse(
+        str(path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 

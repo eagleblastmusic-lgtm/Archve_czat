@@ -216,7 +216,11 @@
       if (g.ArchivebateTimelinePreview && activeVideoId && totalDur > 0) {
         const source = (state.currentVideoDetails?.source || (activeVideoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
         const videoKey = `${source}:id:${activeVideoId}`;
-        g.ArchivebateTimelinePreview.manager.pollManifest(videoKey, activeVideoId, totalDur, source);
+        g.ArchivebateTimelinePreview.manager.pollManifest(videoKey, activeVideoId, totalDur, source, () => {
+          if (dom.modalTimelineTooltip?.style.display !== 'none' && modalPreviewClientX > 0) {
+            renderTimelinePreview(modalPreviewClientX);
+          }
+        });
       }
     });
 
@@ -302,13 +306,11 @@
         if (g.ArchivebateTimelinePreview && activeVideoId && totalDur > 0) {
           const source = (state.currentVideoDetails?.source || (activeVideoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
           const videoKey = `${source}:id:${activeVideoId}`;
-          if (!g.ArchivebateTimelinePreview.manager.hasEntry(videoKey, source)) {
-            g.ArchivebateTimelinePreview.manager.pollManifest(videoKey, activeVideoId, totalDur, source, () => {
-              if (dom.modalTimelineTooltip?.style.display !== 'none') {
-                renderTimelinePreview(modalPreviewClientX);
-              }
-            });
-          }
+          g.ArchivebateTimelinePreview.manager.pollManifest(videoKey, activeVideoId, totalDur, source, () => {
+            if (dom.modalTimelineTooltip?.style.display !== 'none' && modalPreviewClientX > 0) {
+              renderTimelinePreview(modalPreviewClientX);
+            }
+          });
           const renderedV2 = g.ArchivebateTimelinePreview.render({
             videoKey,
             videoId: activeVideoId,

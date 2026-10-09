@@ -640,7 +640,11 @@
       if (window.ArchivebateTimelinePreview && videoId && player.duration > 0) {
         const source = (currentDetails?.source || (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
         const videoKey = `${source}:id:${videoId}`;
-        window.ArchivebateTimelinePreview.manager.pollManifest(videoKey, videoId, player.duration, source);
+        window.ArchivebateTimelinePreview.manager.pollManifest(videoKey, videoId, player.duration, source, () => {
+          if (timelineTooltip && timelineTooltip.style.display !== 'none' && previewClientX > 0) {
+            renderWatchTimelinePreview(previewClientX);
+          }
+        });
       }
     });
 
@@ -726,13 +730,11 @@
       if (window.ArchivebateTimelinePreview && videoId && duration > 0) {
         const source = (currentDetails?.source || (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
         const videoKey = `${source}:id:${videoId}`;
-        if (!window.ArchivebateTimelinePreview.manager.hasEntry(videoKey, source)) {
-          window.ArchivebateTimelinePreview.manager.pollManifest(videoKey, videoId, duration, source, () => {
-            if (timelineTooltip.style.display !== 'none') {
-              renderWatchTimelinePreview(previewClientX);
-            }
-          });
-        }
+        window.ArchivebateTimelinePreview.manager.pollManifest(videoKey, videoId, duration, source, () => {
+          if (timelineTooltip && timelineTooltip.style.display !== 'none' && previewClientX > 0) {
+            renderWatchTimelinePreview(previewClientX);
+          }
+        });
         const renderedV2 = window.ArchivebateTimelinePreview.render({
           videoKey,
           videoId,

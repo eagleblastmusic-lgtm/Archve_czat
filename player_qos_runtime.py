@@ -57,6 +57,8 @@ _qos_preemptions = 0
 _hard_cancel_count = 0
 _hard_cancel_flags: set[str] = set()
 _soft_cancel_until: Dict[str, float] = {}
+_v2_active_processes: Dict[str, dict] = {}
+_v2_active_lock = threading.Lock()
 
 
 def _key(video_id: Optional[str]) -> str:
@@ -168,7 +170,7 @@ def _clear_cancel_state(video_id: str) -> None:
 
 
 def _mark_processes_preempted(*, video_id: Optional[str] = None, hard: bool = False) -> int:
-    """Mark + terminate matching storyboard subprocesses, including QUICK."""
+    """Mark + terminate matching storyboard subprocesses, including QUICK and V2."""
     global _qos_preemptions, _hard_cancel_count
     video_key = _key(video_id) if video_id else None
     victims = []
@@ -186,6 +188,16 @@ def _mark_processes_preempted(*, video_id: Optional[str] = None, hard: bool = Fa
             victims.append(proc)
         if victims and hasattr(_storyboard, "_preempted_count"):
             _storyboard._preempted_count += len(victims)
+    with _v2_active_lock:
+        for process_key, info in list(_v2_active_processes.items()):
+            current_key = str(info.get("video_key") or "")
+            if video_key is not None and current_key != video_key:
+                continue
+            proc = info.get("proc")
+            if proc is None or proc.poll() is not None:
+                continue
+            keys.add(current_key)
+            victims.append(proc)
     now = time.monotonic()
     with _lock:
         for key in keys:
@@ -205,6 +217,40 @@ def _mark_processes_preempted(*, video_id: Optional[str] = None, hard: bool = Fa
             else:
                 _qos_preemptions += len(victims)
     return len(victims)
+
+
+def register_v2_process(process_key: str, proc: Any, video_id: Optional[str]) -> None:
+    """Register an active V2 FFmpeg subprocess so QoS can preempt it."""
+    with _v2_active_lock:
+        _v2_active_processes[str(process_key)] = {
+            "proc": proc,
+            "video_key": _key(video_id),
+            "started_at": time.monotonic(),
+        }
+
+
+def unregister_v2_process(process_key: str) -> None:
+    """Unregister a completed or terminated V2 FFmpeg subprocess."""
+    with _v2_active_lock:
+        _v2_active_processes.pop(str(process_key), None)
+
+
+def wait_for_ffmpeg_budget(kind: str, priority: int, video_id: Optional[str], cancel_check=None):
+    """Acquire FFmpeg slot conforming to QoS limits (2 global, 1 active playback)."""
+    return _wait_for_ffmpeg_budget(kind, priority, video_id, cancel_check)
+
+
+def release_ffmpeg_budget(playback_serial) -> None:
+    """Release acquired FFmpeg slot budget."""
+    _release_ffmpeg_budget(playback_serial)
+
+
+def is_hard_cancelled(video_id: Optional[str]) -> bool:
+    return _hard_cancel_requested(video_id)
+
+
+def is_soft_cancelled(video_id: Optional[str]) -> bool:
+    return _soft_cancel_requested(video_id)
 
 
 def protect_playback(reason: str = "playback_qos") -> int:

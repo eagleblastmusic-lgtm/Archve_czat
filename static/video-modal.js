@@ -966,6 +966,10 @@
     state.storyboardBuildController = null;
     state.localStoryboard = null;
     state.currentStoryboardKey = null;
+    if (g.ArchivebateTimelinePreview && state.currentVideoId) {
+      const source = (state.currentVideoDetails?.source || (String(state.currentVideoId).startsWith('cw_') ? 'camwhores' : 'archivebate'));
+      g.ArchivebateTimelinePreview.stopPolling(state.currentVideoId, source);
+    }
     if (dom.videoModal) dom.videoModal.classList.remove('active');
     if (dom.videoModal) dom.videoModal.setAttribute('aria-hidden', 'true');
     if (dom.videoModal && modalKeyHandler) {
