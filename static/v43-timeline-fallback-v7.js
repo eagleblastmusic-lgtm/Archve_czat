@@ -417,7 +417,9 @@
 
     function showPosterFallback(state) {
       if (previewVideo) previewVideo.style.display = 'none';
-      storyboard.clearFrame?.(sprite);
+      if (!globalThis.ArchivebateTimelinePreview || !sprite?.style?.display || sprite.style.display === 'none') {
+        storyboard.clearFrame?.(sprite);
+      }
       const poster = posterSource(state);
       if (poster && previewImg) {
         try {
@@ -426,13 +428,26 @@
         } catch (_) {
           if (previewImg.src !== poster) previewImg.src = poster;
         }
-        previewImg.style.display = 'block';
+        if (!globalThis.ArchivebateTimelinePreview || !sprite?.style?.display || sprite.style.display === 'none') {
+          previewImg.style.display = 'block';
+        }
       } else if (previewImg?.src) {
-        previewImg.style.display = 'block';
+        if (!globalThis.ArchivebateTimelinePreview || !sprite?.style?.display || sprite.style.display === 'none') {
+          previewImg.style.display = 'block';
+        }
       }
       if (status) {
-        status.textContent = storyboard.previewStatusText?.(latestVideoId, latestDuration, latestTargetTime) || 'Przygotowywanie podglądu…';
-        status.style.display = 'block';
+        const statusText = storyboard.previewStatusText?.(latestVideoId, latestDuration, latestTargetTime);
+        if (statusText && statusText.includes('bufor')) {
+          status.textContent = statusText;
+          status.style.display = 'block';
+        } else if (globalThis.ArchivebateTimelinePreview) {
+          status.textContent = '';
+          status.style.display = 'none';
+        } else {
+          status.textContent = statusText || 'Przygotowywanie podglądu…';
+          status.style.display = 'block';
+        }
       }
       metrics.posterFallbacks += 1;
     }
@@ -575,6 +590,29 @@
         metrics.coarseCacheHits += 1;
         state.timelineSpriteBoard = board;
         if (showCoarse(board, targetTime, duration)) return;
+      }
+
+      if (globalThis.ArchivebateTimelinePreview && videoId && duration > 0) {
+        const source = (state?.currentVideoDetails?.source || (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
+        const videoKey = `${source}:id:${videoId}`;
+        const timeText = document.getElementById('modalTimelineTimeText');
+        const renderedV2 = globalThis.ArchivebateTimelinePreview.render({
+          videoKey,
+          videoId,
+          targetTime,
+          duration,
+          pos,
+          spriteEl: sprite,
+          imgEl: previewImg,
+          timeTextEl: timeText,
+          statusEl: status,
+          poster: posterSource(state),
+        });
+        if (renderedV2) {
+          if (previewVideo) previewVideo.style.display = 'none';
+          metrics.frames += 1;
+          return;
+        }
       }
 
       ensureInteractiveCoarse(videoId, duration);

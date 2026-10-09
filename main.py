@@ -346,7 +346,21 @@ async def local_security_gate(request: Request, call_next):
         if request.headers.get("x-archivebate-mutation-token") != LOCAL_MUTATION_TOKEN:
             return JSONResponse({"success": False, "error": "mutation_token_required"}, status_code=403)
 
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        cause = getattr(exc, "__cause__", None)
+        cause_name = type(cause).__name__ if cause else ""
+        exc_name = type(exc).__name__
+        if (
+            "No response returned" in str(exc)
+            or "EndOfStream" in exc_name
+            or "EndOfStream" in cause_name
+            or isinstance(exc, (ConnectionResetError, BrokenPipeError))
+        ):
+            response = Response(status_code=204)
+        else:
+            raise
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("X-Frame-Options", "DENY")
@@ -2343,9 +2357,15 @@ def stream_video_proxy(
             req.close()
             raise HTTPException(status_code=502, detail=f"Zdalny serwer wideo zwrócił HTTP {code}")
 
+        accept_ranges = req.headers.get("Accept-Ranges")
+        if not accept_ranges or accept_ranges == "none":
+            if req.status_code == 206 or "Content-Range" in req.headers:
+                accept_ranges = "bytes"
+            else:
+                accept_ranges = "none"
         response_headers = {
             "Content-Type": req.headers.get("Content-Type", "video/mp4"),
-            "Accept-Ranges": req.headers.get("Accept-Ranges", "none"),
+            "Accept-Ranges": accept_ranges,
             "Cache-Control": "public, max-age=86400, stale-while-revalidate=86400",
             "X-Content-Type-Options": "nosniff",
             "Server-Timing": f"upstream_connect;dur={connect_dur_ms}"
@@ -2528,6 +2548,100 @@ def storyboard_segment_image(
         media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
     )
+
+
+@app.get("/api/storyboard/v2")
+def storyboard_v2_manifest(
+    id: str = Query(..., min_length=1),
+    duration: float = Query(..., gt=0, le=43200),
+    since_rev: int = Query(0, ge=0),
+    wait_ms: int = Query(0, ge=0, le=5000),
+    source: Optional[str] = Query(None),
+):
+    """Manifest v2 dla progresywnego storyboardu w siatce 10x10."""
+    from timeline_storyboard import progressive_storyboard_service, record_lease
+    clean_id = _resolve_clean_video_id(id)
+    record_lease(clean_id, duration=120.0, source=source)
+    if wait_ms > 0:
+        return progressive_storyboard_service.wait_manifest(
+            clean_id,
+            duration,
+            since_rev=since_rev,
+            timeout=wait_ms / 1000.0,
+            source=source,
+        )
+    return progressive_storyboard_service.get_manifest(
+        clean_id,
+        duration,
+        source=source,
+    )
+
+
+@app.post("/api/storyboard/v2/build")
+def storyboard_v2_build(
+    id: str = Query(..., min_length=1),
+    duration: float = Query(..., gt=0, le=43200),
+    source: Optional[str] = Query(None),
+    request: Request = None,
+):
+    """Uruchamia lub wznawia generowanie arkuszy 10x10 v2 z bisekcją van der Corputa."""
+    from timeline_storyboard import progressive_storyboard_service
+    clean_id = _resolve_clean_video_id(id)
+    details_id = f"cw_{clean_id}" if (source == "camwhores" and not clean_id.startswith("cw_")) else clean_id
+    details = _fetch_details_singleflight(details_id) or {}
+    direct = details.get("direct_url") or ""
+    embed = details.get("embed_url") or ""
+    preview = details.get("preview_video") or ""
+    poster = details.get("thumbnail") or details.get("poster") or ""
+    if not preview and poster and ".jpg" in poster and not poster.endswith("/logo.png") and not clean_id.startswith("cw_"):
+        preview = poster.replace(".jpg", ".mp4")
+    native_prefix = details.get("timeline_prefix")
+    native_count = details.get("timeline_count")
+
+    base = str(request.base_url if request else "http://127.0.0.1:8000/").rstrip("/")
+    if direct:
+        source_url = (
+            f"{base}/api/video/stream?id={requests.utils.quote(clean_id)}"
+            f"&url={requests.utils.quote(direct, safe='')}"
+            f"&embed={requests.utils.quote(embed, safe='')}"
+            f"&owner=storyboard&priority=low&reason=storyboard"
+        )
+    else:
+        source_url = f"{base}/api/video/stream?id={requests.utils.quote(clean_id)}&owner=storyboard&priority=low&reason=storyboard"
+
+    return progressive_storyboard_service.request_build(
+        clean_id,
+        duration,
+        source_url=source_url,
+        source=source,
+        preview_url=preview or None,
+        native_prefix=native_prefix,
+        native_count=native_count,
+        direct_url=direct or None,
+        embed_url=embed or None,
+    )
+
+
+@app.get("/api/storyboard/v2/sheet")
+def storyboard_v2_sheet(
+    id: str = Query(..., min_length=1),
+    sheet: int = Query(0, ge=0),
+    v: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+):
+    """Zwraca arkusz JPEG (1600x900) dla danej rewizji."""
+    from timeline_storyboard import resolve_video_key, get_sheet_path
+    clean_id = _resolve_clean_video_id(id)
+    key = resolve_video_key(clean_id, source=source)
+    path = get_sheet_path(key, sheet)
+    if not path or not path.exists():
+        raise HTTPException(status_code=404, detail="Arkusz storyboardu v2 nie jest jeszcze gotowy")
+    return FileResponse(
+        str(path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=31536000, immutable", "Access-Control-Allow-Origin": "*"},
+    )
+
 
 @app.post("/api/scan/start")
 async def start_quick_scan():

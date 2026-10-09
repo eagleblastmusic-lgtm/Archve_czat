@@ -210,6 +210,16 @@
       }
     });
 
+    vid.addEventListener('loadedmetadata', () => {
+      const activeVideoId = String(state.currentVideoId || state.currentVideoDetails?.id || '');
+      const totalDur = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : (parseDurationToSeconds(state.currentVideoDetails?.duration) || 0);
+      if (g.ArchivebateTimelinePreview && activeVideoId && totalDur > 0) {
+        const source = (state.currentVideoDetails?.source || (activeVideoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
+        const videoKey = `${source}:id:${activeVideoId}`;
+        g.ArchivebateTimelinePreview.manager.pollManifest(videoKey, activeVideoId, totalDur, source);
+      }
+    });
+
     // TIMELINE HOVER FRAME PREVIEW — compositor/GPU path, max 1 update per ekran frame.
     let updateTimelinePreview = () => {};
     let modalPreviewRaf = 0;
@@ -234,37 +244,51 @@
           if (dom.modalTimelineTimeText.innerText !== text) dom.modalTimelineTimeText.innerText = text;
         }
 
-        // 2. Archivebate gęsty segment: dokładna sekunda (błąd <= 1s, 0ms, 0 zapytań strumienia)
-        const segment = g.ArchivebateYouTubeStoryboard?.getSegmentFromCache?.(state.currentVideoId, totalDur, targetTime);
+        const activeVideoId = String(state.currentVideoId || state.currentVideoDetails?.id || '');
+        let bufferWarning = '';
+        if (g.ArchivebateYouTubeStoryboard?.playbackAllowsStoryboard && !g.ArchivebateYouTubeStoryboard.playbackAllowsStoryboard(activeVideoId)) {
+          bufferWarning = 'Podgląd czeka na bufor filmu. Wstrzymaj film, aby go przygotować.';
+        }
+
+        // 1. Archivebate gęsty segment z pamięci podręcznej: dokładna sekunda (0ms, 0 zapytań)
+        const segment = g.ArchivebateYouTubeStoryboard?.getSegmentFromCache?.(activeVideoId, totalDur, targetTime);
         if (segment && dom.modalTimelineSprite && g.ArchivebateYouTubeStoryboard) {
           if (dom.modalTimelinePreviewImg) dom.modalTimelinePreviewImg.style.display = 'none';
           if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
-          if (dom.modalTimelinePreviewStatus) dom.modalTimelinePreviewStatus.style.display = 'none';
+          if (dom.modalTimelinePreviewStatus) {
+            if (bufferWarning) {
+              dom.modalTimelinePreviewStatus.textContent = bufferWarning;
+              dom.modalTimelinePreviewStatus.style.display = 'block';
+            } else {
+              dom.modalTimelinePreviewStatus.style.display = 'none';
+            }
+          }
           const result = g.ArchivebateYouTubeStoryboard.applyFrame(dom.modalTimelineSprite, segment, targetTime, { targetTime, duration: totalDur });
           if (result?.isExact === false) {
             if (dom.modalTimelineTimeText) dom.modalTimelineTimeText.innerText = `${formatPlayerTime(targetTime)} • klatka ${formatPlayerTime(result.frameTime)}`;
-            if (dom.modalTimelinePreviewStatus) {
-              dom.modalTimelinePreviewStatus.textContent = 'Najbliższa dostępna klatka';
-              dom.modalTimelinePreviewStatus.style.display = 'block';
-            }
           }
           return;
         }
 
-        // Zgłoszenie zapotrzebowania na gęsty segment w tle
-        if (g.ArchivebateYouTubeStoryboard && state.currentVideoId && totalDur > 0) {
+        // Zgłoszenie zapotrzebowania na dokładny segment w tle
+        if (g.ArchivebateYouTubeStoryboard && activeVideoId && totalDur > 0) {
           g.ArchivebateYouTubeStoryboard.requestSegment({
-            videoId: state.currentVideoId,
+            videoId: activeVideoId,
             duration: totalDur,
             targetTime,
             signal: state.timelineHoverController?.signal,
             onStatus: phase => {
               if (dom.modalTimelineTooltip?.style.display === 'none' || !dom.modalTimelinePreviewStatus) return;
               const status = dom.modalTimelinePreviewStatus;
-              status.textContent = phase === 'waiting-buffer'
-                ? 'Podgląd czeka na bufor filmu. Wstrzymaj film, aby go przygotować.'
-                : g.ArchivebateYouTubeStoryboard.previewStatusText(state.currentVideoId, totalDur, targetTime);
-              status.style.display = phase === 'ready' ? 'none' : 'block';
+              if (phase === 'waiting-buffer' || bufferWarning) {
+                status.textContent = 'Podgląd czeka na bufor filmu. Wstrzymaj film, aby go przygotować.';
+                status.style.display = 'block';
+              } else if (!g.ArchivebateTimelinePreview) {
+                status.textContent = g.ArchivebateYouTubeStoryboard.previewStatusText(activeVideoId, totalDur, targetTime);
+                status.style.display = phase === 'ready' ? 'none' : 'block';
+              } else {
+                status.style.display = 'none';
+              }
             },
             onReady: () => {
               if (dom.modalTimelineTooltip?.style.display !== 'none') {
@@ -272,6 +296,38 @@
               }
             }
           });
+        }
+
+        // 2. YouTube-style V2 Progressive Sprite Sheet (Layer 0 minute frames & Layer 1 bisection sheets)
+        if (g.ArchivebateTimelinePreview && activeVideoId && totalDur > 0) {
+          const source = (state.currentVideoDetails?.source || (activeVideoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
+          const videoKey = `${source}:id:${activeVideoId}`;
+          if (!g.ArchivebateTimelinePreview.manager.hasEntry(videoKey, source)) {
+            g.ArchivebateTimelinePreview.manager.pollManifest(videoKey, activeVideoId, totalDur, source, () => {
+              if (dom.modalTimelineTooltip?.style.display !== 'none') {
+                renderTimelinePreview(modalPreviewClientX);
+              }
+            });
+          }
+          const renderedV2 = g.ArchivebateTimelinePreview.render({
+            videoKey,
+            videoId: activeVideoId,
+            targetTime,
+            duration: totalDur,
+            pos,
+            spriteEl: dom.modalTimelineSprite,
+            imgEl: dom.modalTimelinePreviewImg,
+            timeTextEl: dom.modalTimelineTimeText,
+            statusEl: dom.modalTimelinePreviewStatus,
+            statusText: bufferWarning,
+            nativePrefix: state.currentTimelinePrefix,
+            nativeCount: state.currentTimelineCount,
+            poster: state.currentVideoDetails?.thumbnail || state.currentVideoDetails?.poster,
+          });
+          if (renderedV2) {
+            if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
+            return;
+          }
         }
 
         // Native CDN thumbnails are coarse; they must not bypass exact seconds.
@@ -285,8 +341,12 @@
           }
           if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
           if (dom.modalTimelinePreviewStatus) {
-            dom.modalTimelinePreviewStatus.textContent = g.ArchivebateYouTubeStoryboard?.previewStatusText?.(state.currentVideoId, totalDur, targetTime) || 'Przygotowywanie podglądu…';
-            dom.modalTimelinePreviewStatus.style.display = 'block';
+            if (bufferWarning) {
+              dom.modalTimelinePreviewStatus.textContent = bufferWarning;
+              dom.modalTimelinePreviewStatus.style.display = 'block';
+            } else {
+              dom.modalTimelinePreviewStatus.style.display = 'none';
+            }
           }
           if (dom.modalTimelineTimeText) dom.modalTimelineTimeText.innerText = `${formatPlayerTime(targetTime)} • podgląd przybliżony`;
           if (dom.modalTimelineSprite && g.ArchivebateYouTubeStoryboard) g.ArchivebateYouTubeStoryboard.clearFrame(dom.modalTimelineSprite);
@@ -298,8 +358,12 @@
           if (dom.modalTimelinePreviewImg) dom.modalTimelinePreviewImg.style.display = 'none';
           if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
           if (dom.modalTimelinePreviewStatus) {
-            dom.modalTimelinePreviewStatus.innerText = g.ArchivebateYouTubeStoryboard?.previewStatusText?.(state.currentVideoId, totalDur, targetTime) || 'Przygotowywanie dokładnego podglądu…';
-            dom.modalTimelinePreviewStatus.style.display = 'block';
+            if (bufferWarning) {
+              dom.modalTimelinePreviewStatus.textContent = bufferWarning;
+              dom.modalTimelinePreviewStatus.style.display = 'block';
+            } else {
+              dom.modalTimelinePreviewStatus.style.display = 'none';
+            }
           }
           const res = g.ArchivebateYouTubeStoryboard.applyFrame(dom.modalTimelineSprite, state.timelineSpriteBoard, targetTime, { targetTime, duration: totalDur });
           if (dom.modalTimelineTimeText && res?.frameTime !== undefined) {
@@ -312,8 +376,12 @@
         if (dom.modalTimelineSprite && g.ArchivebateYouTubeStoryboard) g.ArchivebateYouTubeStoryboard.clearFrame(dom.modalTimelineSprite);
         if (dom.modalTimelinePreviewVideo) dom.modalTimelinePreviewVideo.style.display = 'none';
         if (dom.modalTimelinePreviewStatus) {
-          dom.modalTimelinePreviewStatus.innerText = g.ArchivebateYouTubeStoryboard?.previewStatusText?.(state.currentVideoId, totalDur, targetTime) || 'Przygotowywanie podglądu…';
-          dom.modalTimelinePreviewStatus.style.display = 'block';
+          if (bufferWarning) {
+            dom.modalTimelinePreviewStatus.textContent = bufferWarning;
+            dom.modalTimelinePreviewStatus.style.display = 'block';
+          } else {
+            dom.modalTimelinePreviewStatus.style.display = 'none';
+          }
         }
         const posterSrc = (state.currentVideoDetails?.thumbnail || state.currentVideoDetails?.poster || '').replace('.mp4', '.jpg');
         if (posterSrc && dom.modalTimelinePreviewImg) {

@@ -565,7 +565,11 @@
     if (phase === 'waiting-buffer') return 'Podgląd czeka na bufor filmu. Wstrzymaj film, aby go przygotować.';
     if (phase === 'error') return 'Nie udało się pobrać podglądu. Najedź ponownie, aby spróbować.';
     const preparation = videoPreparations.get(videoId);
-    if (preparation) return `Przygotowywanie podglądów filmu: ${Math.round(100 * preparation.ready / preparation.total)}%…`;
+    if (preparation) {
+      if (globalThis.ArchivebateTimelinePreview) return '';
+      if (preparation.ready === 0) return 'Przygotowywanie klatek podglądu…';
+      return `Przygotowywanie podglądów filmu: ${Math.round(100 * preparation.ready / preparation.total)}%…`;
+    }
     return 'Przygotowywanie podglądu…';
   }
 

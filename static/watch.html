@@ -636,6 +636,14 @@
       }
     });
 
+    player.addEventListener('loadedmetadata', () => {
+      if (window.ArchivebateTimelinePreview && videoId && player.duration > 0) {
+        const source = (currentDetails?.source || (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
+        const videoKey = `${source}:id:${videoId}`;
+        window.ArchivebateTimelinePreview.manager.pollManifest(videoKey, videoId, player.duration, source);
+      }
+    });
+
     // TIMELINE HOVER — max jedna aktualizacja na klatkę ekranu; sprite przesuwany po GPU.
     let previewRaf = 0;
     let previewClientX = 0;
@@ -663,22 +671,31 @@
       if (timelineTimeText.innerText !== timeText) timelineTimeText.innerText = timeText;
 
       // 1. Archivebate gęsty segment: dokładna sekunda (błąd <= 1s, 0ms, 0 zapytań strumienia)
+      let bufferWarning = '';
+      if (window.ArchivebateYouTubeStoryboard?.playbackAllowsStoryboard && !window.ArchivebateYouTubeStoryboard.playbackAllowsStoryboard(videoId)) {
+        bufferWarning = 'Podgląd czeka na bufor filmu. Wstrzymaj film, aby go przygotować.';
+      }
+
+      // 1. Archivebate gęsty segment z pamięci podręcznej: dokładna sekunda (0ms, 0 zapytań)
       const segment = window.ArchivebateYouTubeStoryboard?.getSegmentFromCache?.(videoId, duration, targetTime);
       if (segment && timelineSprite && window.ArchivebateYouTubeStoryboard) {
         timelinePreviewImg.style.display = 'none';
         previewVideo.style.display = 'none';
-        timelinePreviewStatus.style.display = 'none';
+        if (bufferWarning) {
+          timelinePreviewStatus.textContent = bufferWarning;
+          timelinePreviewStatus.style.display = 'block';
+        } else {
+          timelinePreviewStatus.style.display = 'none';
+        }
         timelineTimeText.innerText = formatTime(targetTime);
         const result = window.ArchivebateYouTubeStoryboard.applyFrame(timelineSprite, segment, targetTime, { targetTime, duration });
         if (result?.isExact === false) {
           timelineTimeText.innerText = `${formatTime(targetTime)} • klatka ${formatTime(result.frameTime)}`;
-          timelinePreviewStatus.textContent = 'Najbliższa dostępna klatka';
-          timelinePreviewStatus.style.display = 'block';
         }
         return;
       }
 
-      // Zgłoszenie zapotrzebowania na gęsty segment w tle
+      // Zgłoszenie zapotrzebowania na dokładny segment w tle
       if (window.ArchivebateYouTubeStoryboard && videoId && duration > 0) {
         window.ArchivebateYouTubeStoryboard.requestSegment({
           videoId,
@@ -687,8 +704,15 @@
           signal: timelineHoverController?.signal,
           onStatus: phase => {
             if (timelineTooltip.style.display === 'none') return;
-            timelinePreviewStatus.textContent = ArchivebateYouTubeStoryboard.previewStatusText(videoId, duration, targetTime);
-            timelinePreviewStatus.style.display = phase === 'ready' ? 'none' : 'block';
+            if (phase === 'waiting-buffer' || bufferWarning) {
+              timelinePreviewStatus.textContent = 'Podgląd czeka na bufor filmu. Wstrzymaj film, aby go przygotować.';
+              timelinePreviewStatus.style.display = 'block';
+            } else if (!window.ArchivebateTimelinePreview) {
+              timelinePreviewStatus.textContent = ArchivebateYouTubeStoryboard.previewStatusText(videoId, duration, targetTime);
+              timelinePreviewStatus.style.display = phase === 'ready' ? 'none' : 'block';
+            } else {
+              timelinePreviewStatus.style.display = 'none';
+            }
           },
           onReady: () => {
             if (timelineTooltip.style.display !== 'none') {
@@ -698,14 +722,50 @@
         });
       }
 
+      // 2. YouTube-style V2 Progressive Sprite Sheet (Layer 0 minute frames & Layer 1 bisection sheets)
+      if (window.ArchivebateTimelinePreview && videoId && duration > 0) {
+        const source = (currentDetails?.source || (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
+        const videoKey = `${source}:id:${videoId}`;
+        if (!window.ArchivebateTimelinePreview.manager.hasEntry(videoKey, source)) {
+          window.ArchivebateTimelinePreview.manager.pollManifest(videoKey, videoId, duration, source, () => {
+            if (timelineTooltip.style.display !== 'none') {
+              renderWatchTimelinePreview(previewClientX);
+            }
+          });
+        }
+        const renderedV2 = window.ArchivebateTimelinePreview.render({
+          videoKey,
+          videoId,
+          targetTime,
+          duration,
+          pos,
+          spriteEl: timelineSprite,
+          imgEl: timelinePreviewImg,
+          timeTextEl: timelineTimeText,
+          statusEl: timelinePreviewStatus,
+          statusText: bufferWarning,
+          nativePrefix: timelinePrefix,
+          nativeCount: timelineCount,
+          poster: currentDetails?.thumbnail || currentDetails?.poster,
+        });
+        if (renderedV2) {
+          previewVideo.style.display = 'none';
+          return;
+        }
+      }
+
       if (timelinePrefix) {
         const idx = Math.min(timelineCount, Math.max(1, Math.round(pos * (timelineCount - 1)) + 1));
         const src = `${timelinePrefix}${idx}.jpg`;
         if (timelinePreviewImg.src !== new URL(src, location.href).href) timelinePreviewImg.src = src;
         timelinePreviewImg.style.display = 'block';
         if (timelineSprite && window.ArchivebateYouTubeStoryboard) ArchivebateYouTubeStoryboard.clearFrame(timelineSprite);
-        timelinePreviewStatus.textContent = ArchivebateYouTubeStoryboard.previewStatusText(videoId, duration, targetTime);
-        timelinePreviewStatus.style.display = 'block';
+        if (bufferWarning) {
+          timelinePreviewStatus.textContent = bufferWarning;
+          timelinePreviewStatus.style.display = 'block';
+        } else {
+          timelinePreviewStatus.style.display = 'none';
+        }
         timelineTimeText.innerText = `${formatTime(targetTime)} • podgląd przybliżony`;
         previewVideo.style.display = 'none';
         return;
@@ -718,14 +778,22 @@
         timelineTimeText.innerText = `${formatTime(targetTime)}${frameTimeStr}`;
         timelinePreviewImg.style.display = 'none';
         previewVideo.style.display = 'none';
-        timelinePreviewStatus.innerText = ArchivebateYouTubeStoryboard.previewStatusText(videoId, duration, targetTime);
-        timelinePreviewStatus.style.display = 'block';
+        if (bufferWarning) {
+          timelinePreviewStatus.textContent = bufferWarning;
+          timelinePreviewStatus.style.display = 'block';
+        } else {
+          timelinePreviewStatus.style.display = 'none';
+        }
         return;
       }
 
       if (timelineSprite && window.ArchivebateYouTubeStoryboard) ArchivebateYouTubeStoryboard.clearFrame(timelineSprite);
-      timelinePreviewStatus.textContent = ArchivebateYouTubeStoryboard.previewStatusText(videoId, duration, targetTime);
-      timelinePreviewStatus.style.display = 'block';
+      if (bufferWarning) {
+        timelinePreviewStatus.textContent = bufferWarning;
+        timelinePreviewStatus.style.display = 'block';
+      } else {
+        timelinePreviewStatus.style.display = 'none';
+      }
 
       if (previewVideo && previewVideo.src) {
         timelinePreviewImg.style.display = 'none';

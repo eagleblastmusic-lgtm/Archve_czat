@@ -85,6 +85,10 @@ jobs:
         run: node audit/regression_storyboard_cross_tab.cjs
       - name: Storyboard package-D frontend regression
         run: node audit/regression_package_d_frontend.cjs
+      - name: V2 progressive storyboard regression
+        run: python audit/regression_timeline_storyboard_v2.py
+      - name: V2 timeline preview frontend regression
+        run: node audit/regression_timeline_preview.cjs
       - name: Catalog partial frontend regression
         run: node audit/regression_catalog_partial_frontend.cjs
       - name: Feed regression
@@ -193,6 +197,10 @@ jobs:
         run: node audit/regression_v43_modal_identity.cjs
       - name: Storyboard package-D frontend regression
         run: node audit/regression_package_d_frontend.cjs
+      - name: V2 progressive storyboard regression
+        run: python audit/regression_timeline_storyboard_v2.py
+      - name: V2 timeline preview frontend regression
+        run: node audit/regression_timeline_preview.cjs
       - name: Pagination frontend regression
         run: node audit/regression_package_b_frontend.cjs
       - name: Catalog projection frontend regression
@@ -260,6 +268,10 @@ jobs:
         run: node audit/regression_v43_modal_identity.cjs
       - name: Storyboard package-D frontend regression
         run: node audit/regression_package_d_frontend.cjs
+      - name: V2 progressive storyboard regression
+        run: python audit/regression_timeline_storyboard_v2.py
+      - name: V2 timeline preview frontend regression
+        run: node audit/regression_timeline_preview.cjs
       - name: Unit tests
         run: python -m unittest -v test_suite.py
 

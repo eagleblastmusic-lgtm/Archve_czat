@@ -127,9 +127,13 @@ _root.mkdir(parents=True, exist_ok=True)
 _counter = itertools.count()
 
 def _new_path(prefix="tmp", suffix=""):
-    path = _root / f"{prefix}{os.getpid()}_{next(_counter)}{suffix}"
-    path.mkdir(parents=True, exist_ok=False)
-    return path
+    while True:
+        path = _root / f"{prefix}{os.getpid()}_{next(_counter)}{suffix}"
+        try:
+            path.mkdir(parents=True, exist_ok=False)
+            return path
+        except FileExistsError:
+            continue
 
 def _mkdtemp(suffix="", prefix="tmp", dir=None):
     del dir
@@ -209,6 +213,7 @@ def main():
         environment.update({
             "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
             "ARCHIVEBATE_AUDIT_ISOLATED": "1",
+            "PYTHONUNBUFFERED": "1",
         })
         isolated_tmp = isolated / "tmp"
         isolated_tmp.mkdir(parents=True, exist_ok=True)

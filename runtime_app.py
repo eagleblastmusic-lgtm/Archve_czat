@@ -37,6 +37,7 @@ _V452_QOS_SCRIPT = '<script src="/static/v452-player-qos.js?v=452"></script>'
 _V452_NEXT_PREFETCH_SCRIPT = '<script src="/static/v452-next-video-prefetch.js?v=452"></script>'
 _LAZY_THUMB_RESILIENCE_SCRIPT = '<script src="/static/lazy-thumbnail-resilience.js?v=1"></script>'
 _V43_TIMELINE_SCRIPT = '<script src="/static/v43-timeline-fallback-v7.js?v=452"></script>'
+_TIMELINE_PREVIEW_SCRIPT = '<script src="/static/timeline-preview.js?v=1"></script>'
 _original_versioned_html = _main._versioned_html
 
 
@@ -69,6 +70,8 @@ def _v43_versioned_html(path):
             scripts.append(_LAZY_THUMB_RESILIENCE_SCRIPT)
         if _V43_TIMELINE_SCRIPT not in body:
             scripts.append(_V43_TIMELINE_SCRIPT)
+        if _TIMELINE_PREVIEW_SCRIPT not in body:
+            scripts.append(_TIMELINE_PREVIEW_SCRIPT)
         if scripts and "</body>" in body:
             body = body.replace("</body>", "  " + "\n  ".join(scripts) + "\n</body>", 1)
         response.body = body.encode("utf-8")
@@ -108,6 +111,7 @@ def v43_runtime_marker():
         "timeline_coordinator_version": 452,
         "timeline_mode": "local-first-player-qos-v452",
         "timeline_scheduler": "single-idle-exact-v452",
+        "timeline_storyboard": "v2-progressive",
         "quick_scheduler_revision": 11,
         "quick_durable_build": True,
         "storyboard_priority_mode": "player-qos-arbiter-v452",
@@ -155,7 +159,22 @@ def v43_quick_storyboard_stats():
 
 @app.middleware("http")
 async def v43_runtime_middleware(request, call_next):
-    response = await call_next(request)
+    from fastapi import Response
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        cause = getattr(exc, "__cause__", None)
+        cause_name = type(cause).__name__ if cause else ""
+        exc_name = type(exc).__name__
+        if (
+            "No response returned" in str(exc)
+            or "EndOfStream" in exc_name
+            or "EndOfStream" in cause_name
+            or isinstance(exc, (ConnectionResetError, BrokenPipeError))
+        ):
+            response = Response(status_code=204)
+        else:
+            raise
     response.headers["X-Archivebate-Runtime"] = RUNTIME_ID
     csp = response.headers.get("Content-Security-Policy")
     if csp and "script-src 'self'" in csp and _FA_EVENT_HASH not in csp:
