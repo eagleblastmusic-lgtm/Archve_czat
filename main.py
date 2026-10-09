@@ -2646,7 +2646,9 @@ def storyboard_v2_sheet(
         rev_path = get_sheet_path(key, sheet, rev=rev_int)
         if rev_path.exists():
             path = rev_path
-    if not path or not path.exists():
+        else:
+            raise HTTPException(status_code=404, detail="Żądana rewizja arkusza storyboardu v2 nie istnieje")
+    else:
         path = get_sheet_path(key, sheet)
 
     if not path or not path.exists():

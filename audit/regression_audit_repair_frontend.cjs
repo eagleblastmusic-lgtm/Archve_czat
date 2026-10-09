@@ -88,7 +88,7 @@ async function testP1_05_race_condition_reversed_decode() {
   console.log('PASS: P1-05 sheet decode race-condition immunity with reversed arrival');
 }
 
-function testP1_06_multi_listeners_and_immediate_notify() {
+async function testP1_06_multi_listeners_and_immediate_notify() {
   const manager = TimelinePreview.manager;
   const key = 'archivebate:id:multi_listener_test';
   const entry = manager.getOrCreateEntry(key);
@@ -113,15 +113,16 @@ function testP1_06_multi_listeners_and_immediate_notify() {
   assert.strictEqual(notifyACount, 1);
   assert.strictEqual(notifyBCount, 1);
 
-  // 3. Register listenerC when sheet already loaded -> immediate notification
+  // 3. Register listenerC when sheet already loaded -> notification for ready cache
   entry.manifest = { rev: 1, frames: [[0, 0, 0]] };
   entry.sheets.set(0, { src: '/sheet_0.jpg' });
 
-  // Calling pollManifest with a callback when entry has cached sheets triggers callback immediately
+  // Calling pollManifest with a callback when entry has cached sheets triggers callback
   manager.pollManifest(key, 'multi_listener_test', 60.0, 'archivebate', listenerC);
-  assert.strictEqual(notifyCCount, 1, 'Listener C must be invoked immediately for pre-existing ready sheets');
+  await Promise.resolve();
+  assert.strictEqual(notifyCCount, 1, 'Listener C must be invoked for pre-existing ready sheets');
 
-  console.log('PASS: P1-06 multi-listener registration & immediate notification on ready cache');
+  console.log('PASS: P1-06 multi-listener registration & notification on ready cache');
 }
 
 function testP2_03_lru_cache_eviction() {
@@ -208,7 +209,7 @@ function testP1_04_layer0_native_frames() {
 
 async function runAll() {
   await testP1_05_race_condition_reversed_decode();
-  testP1_06_multi_listeners_and_immediate_notify();
+  await testP1_06_multi_listeners_and_immediate_notify();
   testP2_03_lru_cache_eviction();
   testP1_04_layer0_native_frames();
   console.log('\nALL FRONTEND AUDIT REPAIR TESTS PASSED SUCCESSFULLY!');

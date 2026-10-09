@@ -33,10 +33,11 @@ from cache_store import (
     read_json_cache,
     safe_cache_key,
 )
+from urllib.parse import urlparse
 from video_identity import VideoKey
 
 # Architecture constants
-STORYBOARD_V2_VERSION = 11
+STORYBOARD_V2_VERSION = 12
 FRAME_WIDTH = 160
 FRAME_HEIGHT = 90
 COLUMNS_PER_SHEET = 10
@@ -48,6 +49,39 @@ MILESTONES = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 80, 100)
 
 V2_CACHE_DIR = Path(STORYBOARD_CACHE_DIR) / "v2"
 V2_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def is_safe_ffmpeg_input_url(url: Optional[str]) -> bool:
+    """Validate that input URL for FFmpeg is safe against SSRF, internal network scanning,
+    file:// access, loopback bypass, and header/protocol smuggling.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    clean = url.strip()
+    if "\r" in clean or "\n" in clean or "\0" in clean:
+        return False
+    try:
+        parsed = urlparse(clean)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+        if host in ("127.0.0.1", "localhost"):
+            # Only trusted local video stream endpoint on local server port is permitted on loopback
+            try:
+                server_port = int(os.getenv("PORT", "8000"))
+            except Exception:
+                server_port = 8000
+            url_port = parsed.port or (80 if parsed.scheme == "http" else 443)
+            if url_port != server_port:
+                return False
+            clean_path = parsed.path.rstrip("/")
+            return clean_path == "/api/video/stream"
+        from cache_store import is_safe_remote_url
+        return is_safe_remote_url(clean, fresh=True)
+    except Exception:
+        return False
 
 _lock = threading.RLock()
 _state_condition = threading.Condition(_lock)
@@ -157,9 +191,15 @@ def get_preview_frame_path(key: VideoKey, index: int) -> Path:
 
 
 def record_lease(video_id: str, duration: float = LEASE_DURATION_SECONDS, source: Optional[str] = None) -> None:
-    key_str = resolve_video_key(video_id, source=source).as_string()
+    key = resolve_video_key(video_id, source=source)
+    key_str = key.as_string()
     with _lock:
         _live_leases[key_str] = time.monotonic() + max(1.0, float(duration))
+    try:
+        import player_qos_runtime as qos
+        qos.clear_cancel_state(key.provider_id)
+    except Exception:
+        pass
 
 
 def has_live_lease(video_id: str, source: Optional[str] = None) -> bool:
@@ -187,6 +227,9 @@ def _default_extract_frame(
     video_id: Optional[str] = None,
 ) -> bool:
     """Extract a single frame to out_path using imageio-ffmpeg with QoS process lifecycle."""
+    if not is_safe_ffmpeg_input_url(source_url):
+        return False
+
     try:
         ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
@@ -199,8 +242,14 @@ def _default_extract_frame(
         "-nostdin",
     ]
     if headers:
-        header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-        cmd += ["-headers", header_str]
+        clean_headers = {
+            str(k).strip(): str(v).strip()
+            for k, v in headers.items()
+            if "\r" not in str(k) and "\n" not in str(k) and "\r" not in str(v) and "\n" not in str(v)
+        }
+        if clean_headers:
+            header_str = "".join(f"{k}: {v}\r\n" for k, v in clean_headers.items())
+            cmd += ["-headers", header_str]
 
     cmd += ["-ss", f"{target_time:.3f}"]
     if fast:
@@ -240,10 +289,18 @@ def _default_extract_frame(
         try:
             _, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             return False
 
         if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 350:
@@ -314,8 +371,24 @@ class ProgressiveStoryboardService:
         key = resolve_video_key(video_id, source=source)
         manifest_path = get_manifest_path(key)
         data, _ = read_json_cache(manifest_path)
-        if isinstance(data, dict) and data.get("version") == STORYBOARD_V2_VERSION:
-            return data
+        if isinstance(data, dict):
+            if data.get("version") == STORYBOARD_V2_VERSION:
+                return data
+            elif data.get("version") == 11:
+                clean_duration = max(1.0, float(duration or data.get("duration") or 0.0))
+                is_safe_migration = (
+                    clean_duration <= 6000.0
+                    and len(data.get("frames", [])) >= 10
+                    and data.get("complete") is True
+                )
+                if is_safe_migration:
+                    data["version"] = STORYBOARD_V2_VERSION
+                    atomic_write_json(manifest_path, data)
+                    return data
+                data["version"] = STORYBOARD_V2_VERSION
+                data["complete"] = False
+                atomic_write_json(manifest_path, data)
+                return data
 
         # Generate provisional initial Layer 0 manifest
         clean_duration = max(1.0, float(duration or 0.0))
@@ -337,11 +410,19 @@ class ProgressiveStoryboardService:
             preview_frames = []
             if preview_dir.exists():
                 existing_p_files = sorted(preview_dir.glob("frame_*.jpg"))
-                p_count = len(existing_p_files)
-                for i in range(p_count):
+                parsed_entries = []
+                for p_file in existing_p_files:
+                    try:
+                        num = int(p_file.stem.split("_")[1])
+                        parsed_entries.append((num, p_file))
+                    except Exception:
+                        continue
+                parsed_entries.sort(key=lambda x: x[0])
+                p_count = len(parsed_entries)
+                for rank, (act_idx, p_file) in enumerate(parsed_entries):
                     preview_frames.append([
-                        round(i * (clean_duration / max(1, p_count)), 3),
-                        f"/api/storyboard/v2/preview?id={key.provider_id}&idx={i}&source={key.source}",
+                        round(rank * (clean_duration / max(1, p_count)), 3),
+                        f"/api/storyboard/v2/preview?id={key.provider_id}&idx={act_idx}&source={key.source}",
                     ])
             native_info = {
                 "kind": "preview_video",
@@ -480,13 +561,22 @@ class ProgressiveStoryboardService:
         direct_url: Optional[str] = job.get("direct_url")
         embed_url: Optional[str] = job.get("embed_url")
 
+        if preview_url and not is_safe_ffmpeg_input_url(preview_url):
+            preview_url = None
+        if direct_url and not is_safe_ffmpeg_input_url(direct_url):
+            direct_url = None
+        if source_url and not is_safe_ffmpeg_input_url(source_url):
+            source_url = None
+
+        if not direct_url and not source_url:
+            return
+
         direct_headers = None
         if direct_url and (direct_url.startswith("http://") or direct_url.startswith("https://")):
             ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
             referer = "https://www.camwhores.tv/" if (key.source == "camwhores" or "cw_" in key.provider_id) else (embed_url or "https://mixdrop.ag/")
             direct_headers = {"Referer": referer, "User-Agent": ua}
 
-        record_lease(key.as_string(), duration=LEASE_DURATION_SECONDS, source=key.source)
         manifest = self.get_manifest(
             key.provider_id,
             duration,
@@ -536,43 +626,66 @@ class ProgressiveStoryboardService:
         if preview_url and not preview_frames_exist and not _worker_stop.is_set():
             preview_dir = cache_dir / "preview"
             preview_dir.mkdir(parents=True, exist_ok=True)
-            extracted_preview = []
+            extracted_preview: List[Tuple[int, Path]] = []
             target_preview_count = 8
             for p_idx in range(target_preview_count):
-                if _worker_stop.is_set():
+                if _worker_stop.is_set() or not has_live_lease(key.as_string(), source=key.source):
                     break
                 p_out = preview_dir / f"frame_{p_idx}.jpg"
                 if p_out.exists() and p_out.stat().st_size > 350:
-                    extracted_preview.append(p_out)
+                    extracted_preview.append((p_idx, p_out))
                     continue
-                p_pts = round(0.3 + p_idx * 0.5, 2)
-                p_key = f"v2_prev_{key.provider_id}_{p_idx}"
+
+                # Acquire QoS budget for preview extraction
+                budget = None
                 try:
-                    ok = _frame_extractor(
-                        preview_url,
-                        p_pts,
-                        p_out,
-                        timeout=5.0,
-                        fast=True,
-                        process_key=p_key,
-                        video_id=key.provider_id,
-                    )
-                except TypeError:
+                    import player_qos_runtime as qos
+                    def cancel_check():
+                        return _worker_stop.is_set() or not has_live_lease(key.as_string(), source=key.source)
+                    budget = qos.wait_for_ffmpeg_budget("v2_prev", 1, key.provider_id, cancel_check)
+                except Exception:
+                    budget = False
+
+                if budget is None and not _worker_stop.is_set():
+                    break
+
+                try:
+                    p_pts = round(0.3 + p_idx * 0.5, 2)
+                    p_key = f"v2_prev_{key.provider_id}_{p_idx}"
                     try:
-                        ok = _frame_extractor(preview_url, p_pts, p_out, timeout=5.0, fast=True)
+                        ok = _frame_extractor(
+                            preview_url,
+                            p_pts,
+                            p_out,
+                            timeout=5.0,
+                            fast=True,
+                            process_key=p_key,
+                            video_id=key.provider_id,
+                        )
                     except TypeError:
-                        ok = _frame_extractor(preview_url, p_pts, p_out)
-                if ok and p_out.exists() and p_out.stat().st_size > 350:
-                    extracted_preview.append(p_out)
+                        try:
+                            ok = _frame_extractor(preview_url, p_pts, p_out, timeout=5.0, fast=True)
+                        except TypeError:
+                            ok = _frame_extractor(preview_url, p_pts, p_out)
+                    if ok and p_out.exists() and p_out.stat().st_size > 350:
+                        extracted_preview.append((p_idx, p_out))
+                finally:
+                    if budget is not None:
+                        try:
+                            import player_qos_runtime as qos
+                            qos.release_ffmpeg_budget(budget)
+                        except Exception:
+                            pass
 
             if extracted_preview and not _worker_stop.is_set():
+                extracted_preview.sort(key=lambda x: x[0])
                 p_count = len(extracted_preview)
                 native_frames = [
                     [
-                        round(idx * (duration / max(1, p_count)), 3),
-                        f"/api/storyboard/v2/preview?id={key.provider_id}&idx={idx}&source={key.source}",
+                        round(rank * (duration / max(1, p_count)), 3),
+                        f"/api/storyboard/v2/preview?id={key.provider_id}&idx={act_idx}&source={key.source}",
                     ]
-                    for idx in range(p_count)
+                    for rank, (act_idx, p_out) in enumerate(extracted_preview)
                 ]
                 manifest["native"] = {
                     "kind": "preview_video",
@@ -706,7 +819,6 @@ class ProgressiveStoryboardService:
 
                 if batch_added > 0:
                     current_rev += 1
-                    record_lease(key.as_string(), duration=LEASE_DURATION_SECONDS)
                     self._publish_manifest(
                         key=key,
                         manifest_path=manifest_path,

@@ -640,11 +640,12 @@
       if (window.ArchivebateTimelinePreview && videoId && player.duration > 0) {
         const source = (currentDetails?.source || (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
         const videoKey = `${source}:id:${videoId}`;
-        window.ArchivebateTimelinePreview.manager.pollManifest(videoKey, videoId, player.duration, source, () => {
+        window.ArchivebateTimelinePreview.manager.subscribe(videoKey, 'watch', () => {
           if (timelineTooltip && timelineTooltip.style.display !== 'none' && previewClientX > 0) {
             renderWatchTimelinePreview(previewClientX);
           }
-        });
+        }, source);
+        window.ArchivebateTimelinePreview.manager.ensureStoryboard(videoKey, videoId, player.duration, source);
       }
     });
 
@@ -730,11 +731,6 @@
       if (window.ArchivebateTimelinePreview && videoId && duration > 0) {
         const source = (currentDetails?.source || (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
         const videoKey = `${source}:id:${videoId}`;
-        window.ArchivebateTimelinePreview.manager.pollManifest(videoKey, videoId, duration, source, () => {
-          if (timelineTooltip && timelineTooltip.style.display !== 'none' && previewClientX > 0) {
-            renderWatchTimelinePreview(previewClientX);
-          }
-        });
         const renderedV2 = window.ArchivebateTimelinePreview.render({
           videoKey,
           videoId,
@@ -1410,7 +1406,14 @@
       }
     }
 
-    window.addEventListener('pagehide',()=>{watchController?.abort();watchSeeker?.destroy();});
+    window.addEventListener('pagehide', () => {
+      watchController?.abort();
+      watchSeeker?.destroy();
+      if (window.ArchivebateTimelinePreview && videoId) {
+        const source = (currentDetails?.source || (String(videoId).startsWith('cw_') ? 'camwhores' : 'archivebate'));
+        window.ArchivebateTimelinePreview.manager.unsubscribe(videoId, 'watch', source);
+      }
+    });
 
     function updateFavState(isFav) {
       favBtn.setAttribute('aria-pressed', String(isFav));

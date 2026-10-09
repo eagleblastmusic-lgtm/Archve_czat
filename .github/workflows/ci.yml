@@ -89,6 +89,12 @@ jobs:
         run: python audit/regression_timeline_storyboard_v2.py
       - name: V2 timeline preview frontend regression
         run: node audit/regression_timeline_preview.cjs
+      - name: V2 timeline audit repair backend regression
+        run: python audit/regression_audit_repair_p1_p2.py
+      - name: V2 timeline audit repair frontend regression
+        run: node audit/regression_audit_repair_frontend.cjs
+      - name: V2 timeline P0 recursion and polling regression
+        run: node audit/reproduce_p0_recursion_and_polling.cjs
       - name: Catalog partial frontend regression
         run: node audit/regression_catalog_partial_frontend.cjs
       - name: Feed regression
@@ -201,6 +207,12 @@ jobs:
         run: python audit/regression_timeline_storyboard_v2.py
       - name: V2 timeline preview frontend regression
         run: node audit/regression_timeline_preview.cjs
+      - name: V2 timeline audit repair backend regression
+        run: python audit/regression_audit_repair_p1_p2.py
+      - name: V2 timeline audit repair frontend regression
+        run: node audit/regression_audit_repair_frontend.cjs
+      - name: V2 timeline P0 recursion and polling regression
+        run: node audit/reproduce_p0_recursion_and_polling.cjs
       - name: Pagination frontend regression
         run: node audit/regression_package_b_frontend.cjs
       - name: Catalog projection frontend regression
@@ -272,6 +284,12 @@ jobs:
         run: python audit/regression_timeline_storyboard_v2.py
       - name: V2 timeline preview frontend regression
         run: node audit/regression_timeline_preview.cjs
+      - name: V2 timeline audit repair backend regression
+        run: python audit/regression_audit_repair_p1_p2.py
+      - name: V2 timeline audit repair frontend regression
+        run: node audit/regression_audit_repair_frontend.cjs
+      - name: V2 timeline P0 recursion and polling regression
+        run: node audit/reproduce_p0_recursion_and_polling.cjs
       - name: Unit tests
         run: python -m unittest -v test_suite.py
 
@@ -292,6 +310,8 @@ jobs:
         env:
           ARCHIVEBATE_AUDIT_ISOLATED: "1"
         run: python audit/regression_timeline_browser.py
+      - name: Timeline E2E lifecycle acceptance
+        run: python audit/regression_timeline_e2e_lifecycle.py
       - name: Upload browser evidence
         if: always()
         uses: actions/upload-artifact@v4

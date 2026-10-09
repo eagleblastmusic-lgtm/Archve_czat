@@ -75,9 +75,18 @@
     return meta ? meta.getAttribute('content') || '' : '';
   }
 
+  const LIFECYCLE = {
+    UNINITIALIZED: 'UNINITIALIZED',
+    LOADING: 'LOADING',
+    PARTIAL: 'PARTIAL',
+    COMPLETE: 'COMPLETE',
+    ERROR: 'ERROR',
+    CANCELLED: 'CANCELLED',
+  };
+
   class TimelinePreviewManager {
     constructor() {
-      this.cache = new Map(); // videoKey -> { manifest, sheets: Map, sheetUrls: Map, sheetRevs: Map, activeRev, generation, fetching, controller, listeners: Set, lastAccessed }
+      this.cache = new Map(); // videoKey -> { manifest, sheets: Map, sheetUrls: Map, sheetRevs: Map, activeRev, generation, fetching, fetchPromise, controller, subscribers: Map, listeners: Set, lastAccessed, lifecycle }
       this.maxCachedEntries = 12;
       this.activeVideoKey = null;
       this.activeInstances = new Set();
@@ -87,6 +96,7 @@
       const key = canonicalKey(videoKey, source);
       if (!this.cache.has(key)) {
         this.cache.set(key, {
+          lifecycle: LIFECYCLE.UNINITIALIZED,
           manifest: null,
           sheets: new Map(),
           sheetUrls: new Map(),
@@ -94,8 +104,13 @@
           activeRev: 0,
           generation: 0,
           fetching: false,
+          fetchPromise: null,
           controller: null,
-          listeners: new Set(),
+          subscribers: new Map(), // subscriberId -> onUpdate callback
+          listeners: new Set(),   // backwards compat
+          rafScheduled: 0,
+          retryCount: 0,
+          lastErrorTime: 0,
           lastAccessed: Date.now(),
         });
         this.evictLru(key);
@@ -103,7 +118,9 @@
       const entry = this.cache.get(key);
       if (!entry.sheetUrls) entry.sheetUrls = new Map();
       if (!entry.sheetRevs) entry.sheetRevs = new Map();
+      if (!entry.subscribers) entry.subscribers = new Map();
       if (!entry.listeners) entry.listeners = new Set();
+      if (!entry.lifecycle) entry.lifecycle = LIFECYCLE.UNINITIALIZED;
       entry.lastAccessed = Date.now();
       return entry;
     }
@@ -147,6 +164,17 @@
           entry.controller = null;
         }
         entry.fetching = false;
+        entry.fetchPromise = null;
+        entry.lifecycle = LIFECYCLE.CANCELLED;
+        if (entry.rafScheduled) {
+          if (typeof cancelAnimationFrame === 'function') {
+            cancelAnimationFrame(entry.rafScheduled);
+          } else {
+            clearTimeout(entry.rafScheduled);
+          }
+          entry.rafScheduled = 0;
+        }
+        if (entry.subscribers) entry.subscribers.clear();
         if (entry.listeners) entry.listeners.clear();
       }
     }
@@ -226,119 +254,198 @@
       });
     }
 
-    notifyListeners(entry, manifest) {
-      if (!entry || !entry.listeners || entry.listeners.size === 0) return;
-      for (const listener of Array.from(entry.listeners)) {
-        try {
-          listener(manifest);
-        } catch (err) {
-          console.error('[TimelinePreview] listener error:', err);
+    subscribe(videoKey, subscriberId, onUpdate, source) {
+      if (!videoKey || !subscriberId || typeof onUpdate !== 'function') return;
+      const key = canonicalKey(videoKey, source);
+      const entry = this.getOrCreateEntry(key, source);
+      entry.subscribers.set(String(subscriberId), onUpdate);
+      // Dispatch ready state asynchronously to prevent synchronous recursion
+      if (entry.manifest && entry.sheets && entry.sheets.size > 0) {
+        Promise.resolve().then(() => {
+          if (entry.subscribers.has(String(subscriberId))) {
+            try { onUpdate(entry.manifest); } catch (_) {}
+          }
+        });
+      }
+    }
+
+    unsubscribe(videoKey, subscriberId, source) {
+      if (!videoKey || !subscriberId) return;
+      const key = canonicalKey(videoKey, source);
+      const entry = this.cache.get(key);
+      if (entry && entry.subscribers) {
+        entry.subscribers.delete(String(subscriberId));
+        if (entry.subscribers.size === 0 && (!entry.listeners || entry.listeners.size === 0)) {
+          this.stopPolling(videoKey, source);
         }
       }
     }
 
-    async pollManifest(videoKey, videoId, duration, source, onUpdate) {
-      if (typeof document !== 'undefined' && document.hidden) return;
+    notifySubscribers(entry, manifest) {
+      if (!entry) return;
+      const subs = Array.from(entry.subscribers?.values() || []);
+      const legacy = Array.from(entry.listeners || []);
+      const allCallbacks = subs.concat(legacy);
+      if (allCallbacks.length === 0) return;
+
+      for (const cb of allCallbacks) {
+        try {
+          cb(manifest);
+        } catch (err) {
+          console.error('[TimelinePreview] subscriber error:', err);
+        }
+      }
+    }
+
+    notifyListeners(entry, manifest) {
+      this.notifySubscribers(entry, manifest);
+    }
+
+    async ensureStoryboard(videoKey, videoId, duration, source) {
+      if (typeof document !== 'undefined' && document.hidden) return null;
       duration = Number(duration) || 0;
-      if ((!videoKey && !videoId) || duration <= 0) return;
+      if ((!videoKey && !videoId) || duration <= 0) return null;
 
       const key = canonicalKey(videoKey || videoId, source);
-      const entry = this.getOrCreateEntry(key);
+      const entry = this.getOrCreateEntry(key, source);
       entry.lastAccessed = Date.now();
 
-      if (onUpdate && typeof onUpdate === 'function') {
-        entry.listeners.add(onUpdate);
-        // Immediate notification if manifest with ready sheets is already in cache
-        if (entry.manifest && entry.sheets && entry.sheets.size > 0) {
-          try { onUpdate(entry.manifest); } catch (_) {}
+      // Short-circuit: already complete (0 network calls)
+      if (entry.lifecycle === LIFECYCLE.COMPLETE || (entry.manifest && entry.manifest.complete)) {
+        entry.lifecycle = LIFECYCLE.COMPLETE;
+        return entry.manifest;
+      }
+
+      // Single-flight deduplication: return existing promise if already loading
+      if (entry.fetching && entry.fetchPromise) {
+        return entry.fetchPromise;
+      }
+
+      // Exponential backoff check on error
+      if (entry.lifecycle === LIFECYCLE.ERROR) {
+        const now = Date.now();
+        const minWait = Math.min(30000, 2000 * Math.pow(2, entry.retryCount || 0));
+        if (now - (entry.lastErrorTime || 0) < minWait) {
+          return entry.manifest;
         }
       }
 
-      if (entry.fetching) return;
       entry.fetching = true;
+      entry.lifecycle = LIFECYCLE.LOADING;
       const controller = new AbortController();
       entry.controller = controller;
       const targetGeneration = entry.generation || 0;
 
-      let sinceRev = entry.manifest ? (entry.manifest.rev || 0) : 0;
-      let failureCount = 0;
+      entry.fetchPromise = (async () => {
+        let sinceRev = entry.manifest ? (entry.manifest.rev || 0) : 0;
+        let failureCount = 0;
 
-      try {
-        // Trigger background build if needed
-        const token = getMutationToken();
-        const buildHeaders = token ? { 'X-Archivebate-Mutation-Token': token } : {};
-        fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}`, {
-          method: 'POST',
-          headers: buildHeaders,
-          signal: controller.signal,
-        }).catch(() => {});
+        try {
+          const token = getMutationToken();
+          const buildHeaders = token ? { 'X-Archivebate-Mutation-Token': token } : {};
+          fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}`, {
+            method: 'POST',
+            headers: buildHeaders,
+            signal: controller.signal,
+          }).catch(() => {});
 
-        let loopIter = 0;
-        while (!controller.signal.aborted && entry.generation === targetGeneration) {
-          loopIter++;
-          if (loopIter % 8 === 0 && (!entry.manifest || !entry.manifest.complete)) {
-            fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}`, {
-              method: 'POST',
-              headers: buildHeaders,
-              signal: controller.signal,
-            }).catch(() => {});
-          }
-          const waitMs = sinceRev > 0 ? 1500 : 0;
-          const url = `/api/storyboard/v2?id=${encodeURIComponent(videoId)}&duration=${duration}&since_rev=${sinceRev}&wait_ms=${waitMs}&source=${encodeURIComponent(source || '')}`;
-          
-          try {
-            const resp = await fetch(url, { signal: controller.signal });
-            if (!resp.ok) {
-              failureCount++;
-              if (failureCount > 5) break;
-              await new Promise(r => setTimeout(r, 1000));
-              continue;
+          let loopIter = 0;
+          while (!controller.signal.aborted && entry.generation === targetGeneration) {
+            loopIter++;
+            if (loopIter % 8 === 0 && (!entry.manifest || !entry.manifest.complete)) {
+              fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}`, {
+                method: 'POST',
+                headers: buildHeaders,
+                signal: controller.signal,
+              }).catch(() => {});
             }
-            failureCount = 0;
-            const manifest = await resp.json();
-            if (manifest && manifest.version === 11 && entry.generation === targetGeneration) {
-              const manifestRev = Number(manifest.rev || 0);
-              if (manifestRev >= (entry.activeRev || 0)) {
-                entry.manifest = manifest;
-                entry.activeRev = manifestRev;
-                sinceRev = manifestRev || sinceRev;
+            const waitMs = sinceRev > 0 ? 1500 : 0;
+            const url = `/api/storyboard/v2?id=${encodeURIComponent(videoId)}&duration=${duration}&since_rev=${sinceRev}&wait_ms=${waitMs}&source=${encodeURIComponent(source || '')}`;
 
-                // Preload new sheets or updated revisions without race conditions
-                if (Array.isArray(manifest.sheets)) {
-                  for (const s of manifest.sheets) {
-                    if (s && s.url) {
-                      const currentUrl = entry.sheetUrls.get(s.index);
-                      const currentRev = entry.sheetRevs.get(s.index) || 0;
-                      if (currentUrl !== s.url || manifestRev > currentRev) {
-                        this.preloadSheet(s.url, manifestRev, s.index, targetGeneration, entry).then(loadedImg => {
-                          if (loadedImg && entry.generation === targetGeneration) {
-                            this.notifyListeners(entry, entry.manifest);
-                          }
-                        });
+            try {
+              const resp = await fetch(url, { signal: controller.signal });
+              if (!resp.ok) {
+                failureCount++;
+                if (failureCount > 5) {
+                  entry.lifecycle = LIFECYCLE.ERROR;
+                  entry.lastErrorTime = Date.now();
+                  entry.retryCount = (entry.retryCount || 0) + 1;
+                  break;
+                }
+                await new Promise(r => setTimeout(r, 1000));
+                continue;
+              }
+              failureCount = 0;
+              entry.retryCount = 0;
+              const manifest = await resp.json();
+              if (manifest && (manifest.version === 11 || manifest.version === 12) && entry.generation === targetGeneration) {
+                const manifestRev = Number(manifest.rev || 0);
+                if (manifestRev >= (entry.activeRev || 0)) {
+                  entry.manifest = manifest;
+                  entry.activeRev = manifestRev;
+                  sinceRev = manifestRev || sinceRev;
+                  entry.lifecycle = manifest.complete ? LIFECYCLE.COMPLETE : LIFECYCLE.PARTIAL;
+
+                  // Preload new sheets or updated revisions without race conditions
+                  if (Array.isArray(manifest.sheets)) {
+                    for (const s of manifest.sheets) {
+                      if (s && s.url) {
+                        const currentUrl = entry.sheetUrls.get(s.index);
+                        const currentRev = entry.sheetRevs.get(s.index) || 0;
+                        if (currentUrl !== s.url || manifestRev > currentRev) {
+                          this.preloadSheet(s.url, manifestRev, s.index, targetGeneration, entry).then(loadedImg => {
+                            if (loadedImg && entry.generation === targetGeneration) {
+                              this.notifySubscribers(entry, entry.manifest);
+                            }
+                          });
+                        }
                       }
                     }
                   }
-                }
 
-                this.notifyListeners(entry, manifest);
+                  this.notifySubscribers(entry, manifest);
+                }
+                if (manifest.complete) {
+                  entry.lifecycle = LIFECYCLE.COMPLETE;
+                  break;
+                }
               }
-              if (manifest.complete) break;
+            } catch (err) {
+              if (controller.signal.aborted || entry.generation !== targetGeneration) {
+                entry.lifecycle = LIFECYCLE.CANCELLED;
+                break;
+              }
+              failureCount++;
+              if (failureCount > 5) {
+                entry.lifecycle = LIFECYCLE.ERROR;
+                entry.lastErrorTime = Date.now();
+                entry.retryCount = (entry.retryCount || 0) + 1;
+                break;
+              }
+              await new Promise(r => setTimeout(r, 1000));
             }
-          } catch (err) {
-            if (controller.signal.aborted || entry.generation !== targetGeneration) break;
-            failureCount++;
-            if (failureCount > 5) break;
-            await new Promise(r => setTimeout(r, 1000));
+          }
+        } finally {
+          if (entry.generation === targetGeneration) {
+            entry.fetching = false;
+            entry.fetchPromise = null;
+            if (entry.controller === controller) {
+              entry.controller = null;
+            }
           }
         }
-      } finally {
-        if (entry.generation === targetGeneration) {
-          entry.fetching = false;
-          if (entry.controller === controller) {
-            entry.controller = null;
-          }
-        }
+        return entry.manifest;
+      })();
+
+      return entry.fetchPromise;
+    }
+
+    async pollManifest(videoKey, videoId, duration, source, onUpdate) {
+      if (onUpdate && typeof onUpdate === 'function') {
+        const subId = 'legacy_' + canonicalKey(videoKey || videoId, source);
+        this.subscribe(videoKey || videoId, subId, onUpdate, source);
       }
+      return this.ensureStoryboard(videoKey, videoId, duration, source);
     }
 
     render(options) {
@@ -603,6 +710,8 @@
     render: (opts) => manager.render(opts),
     attach: (cfg) => manager.attach(cfg),
     hasFrames: (vid, src) => manager.hasFrames(vid, src),
+    subscribe: (key, subId, cb, src) => manager.subscribe(key, subId, cb, src),
+    unsubscribe: (key, subId, src) => manager.unsubscribe(key, subId, src),
     stopPolling: (key, src) => manager.stopPolling(key, src),
     binarySearchNearest,
   };

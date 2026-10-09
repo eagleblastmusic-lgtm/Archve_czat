@@ -968,7 +968,7 @@
     state.currentStoryboardKey = null;
     if (g.ArchivebateTimelinePreview && state.currentVideoId) {
       const source = (state.currentVideoDetails?.source || (String(state.currentVideoId).startsWith('cw_') ? 'camwhores' : 'archivebate'));
-      g.ArchivebateTimelinePreview.stopPolling(state.currentVideoId, source);
+      g.ArchivebateTimelinePreview.manager.unsubscribe(state.currentVideoId, 'modal', source);
     }
     if (dom.videoModal) dom.videoModal.classList.remove('active');
     if (dom.videoModal) dom.videoModal.setAttribute('aria-hidden', 'true');

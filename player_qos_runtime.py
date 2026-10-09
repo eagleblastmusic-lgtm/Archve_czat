@@ -7,6 +7,7 @@ boundaries so primary playback always outranks storyboard generation.
 
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -206,10 +207,22 @@ def _mark_processes_preempted(*, video_id: Optional[str] = None, hard: bool = Fa
             else:
                 _soft_cancel_until[key] = now + SOFT_CANCEL_SECONDS
     for proc in victims:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        if proc is not None and getattr(proc, "poll", None) is not None and proc.poll() is None:
+            try:
+                if hasattr(proc, "terminate"):
+                    proc.terminate()
+                if hasattr(proc, "wait"):
+                    try:
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        if hasattr(proc, "kill"):
+                            try:
+                                proc.kill()
+                                proc.wait(timeout=0.5)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
     if victims:
         with _qos_metrics_lock:
             if hard:
@@ -217,6 +230,11 @@ def _mark_processes_preempted(*, video_id: Optional[str] = None, hard: bool = Fa
             else:
                 _qos_preemptions += len(victims)
     return len(victims)
+
+
+def clear_cancel_state(video_id: str) -> None:
+    """Clear hard/soft cancel state for video_id to allow clean regeneration upon revisit."""
+    _clear_cancel_state(video_id)
 
 
 def register_v2_process(process_key: str, proc: Any, video_id: Optional[str]) -> None:

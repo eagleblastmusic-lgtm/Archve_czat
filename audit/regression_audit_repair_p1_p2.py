@@ -207,7 +207,7 @@ def test_p2_02_p2_05_sheet_revision_and_security():
     job = {
         "key": key,
         "duration": 30.0,
-        "source_url": "http://127.0.0.1/fake_sec.mp4",
+        "source_url": "http://127.0.0.1:8000/api/video/stream?id=test_sec&source=archivebate",
     }
     service._execute_build_job(job)
 
@@ -246,7 +246,7 @@ def test_p1_04_preview_video_layer0():
 
     preview_calls = []
     def mock_preview_extractor(source_url: str, target_time: float, out_path: Path, **kwargs) -> bool:
-        if "preview" in source_url:
+        if "fake_preview" in source_url:
             preview_calls.append((source_url, target_time))
             img = Image.new("RGB", (FRAME_WIDTH, FRAME_HEIGHT), (255, 128, 0))
             img.save(out_path, format="JPEG")
@@ -261,8 +261,8 @@ def test_p1_04_preview_video_layer0():
     job = {
         "key": key,
         "duration": 240.0,
-        "source_url": "http://127.0.0.1/fake_full.mp4",
-        "preview_url": "http://127.0.0.1/fake_preview.mp4",
+        "source_url": "http://127.0.0.1:8000/api/video/stream?id=fake_full&source=archivebate",
+        "preview_url": "http://127.0.0.1:8000/api/video/stream?id=fake_preview&source=archivebate",
     }
     service._execute_build_job(job)
 
