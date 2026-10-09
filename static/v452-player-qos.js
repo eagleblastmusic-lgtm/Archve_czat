@@ -149,12 +149,15 @@
   function hardCancel(video, reason) {
     const videoId = lastVideoIds.get(video) || resolveVideoId(video);
     if (!videoId) return;
-    if (globalThis.ArchivebateTimelinePreview?.manager?.hasSubscribers?.(videoId)) {
+    const source = (String(videoId).startsWith('cw_') ? 'camwhores' : (globalThis.ArchivebateAppContext?.state?.currentVideoDetails?.source || 'archivebate'));
+    if (reason !== 'pagehide' && reason !== 'beforeunload' && globalThis.ArchivebateTimelinePreview?.manager?.hasSubscribers?.(videoId, source)) {
       return;
     }
-    const consumerId = globalThis.ArchivebateTimelinePreview?.manager?.consumerId || '';
+    const mgr = globalThis.ArchivebateTimelinePreview?.manager;
+    const consumerId = mgr?.consumerId || '';
     const consumerParam = consumerId ? `&consumer_id=${encodeURIComponent(consumerId)}` : '';
-    postJSON(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}${consumerParam}&reason=${encodeURIComponent(reason)}`, {});
+    const sourceParam = source ? `&source=${encodeURIComponent(source)}` : '';
+    postJSON(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}${consumerParam}${sourceParam}&reason=${encodeURIComponent(reason)}`, {});
   }
 
   function onEvent(event) {

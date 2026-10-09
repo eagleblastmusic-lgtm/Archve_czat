@@ -2582,6 +2582,7 @@ def storyboard_v2_build(
     duration: float = Query(..., gt=0, le=43200),
     source: Optional[str] = Query(None),
     consumer_id: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
     request: Request = None,
 ):
     """Uruchamia lub wznawia generowanie arkuszy 10x10 v2 z bisekcją van der Corputa."""
@@ -2625,6 +2626,7 @@ def storyboard_v2_build(
         direct_url=direct or None,
         embed_url=embed or None,
         consumer_id=consumer_id,
+        session_id=session_id,
     )
 
 
@@ -2634,11 +2636,18 @@ def storyboard_v2_lease_acquire(
     consumer_id: Optional[str] = Query(None),
     duration: float = Query(30.0, gt=0, le=3600),
     source: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
 ):
     from timeline_storyboard import acquire_lease
     clean_id = _resolve_clean_video_id(id)
-    ok, epoch, count, cid = acquire_lease(clean_id, consumer_id=consumer_id, duration=duration, source=source)
-    return {"ok": ok, "epoch": epoch, "active_consumers": count, "consumer_id": cid}
+    res = acquire_lease(clean_id, consumer_id=consumer_id, duration=duration, source=source, session_id=session_id)
+    return {
+        "ok": res.ok,
+        "epoch": res.epoch,
+        "active_consumers": res.active_count,
+        "consumer_id": res.consumer_id,
+        "session_id": res.session_id,
+    }
 
 
 @app.post("/api/storyboard/v2/lease/renew")
@@ -2647,10 +2656,12 @@ def storyboard_v2_lease_renew(
     consumer_id: str = Query(..., min_length=1),
     duration: float = Query(30.0, gt=0, le=3600),
     source: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+    epoch: Optional[int] = Query(None),
 ):
     from timeline_storyboard import renew_lease
     clean_id = _resolve_clean_video_id(id)
-    ok, count = renew_lease(clean_id, consumer_id=consumer_id, duration=duration, source=source)
+    ok, count = renew_lease(clean_id, consumer_id=consumer_id, duration=duration, source=source, session_id=session_id, epoch=epoch)
     return {"ok": ok, "active_consumers": count}
 
 
@@ -2660,10 +2671,19 @@ def storyboard_v2_lease_release(
     consumer_id: str = Query(..., min_length=1),
     source: Optional[str] = Query(None),
     reason: str = Query("release"),
+    session_id: Optional[str] = Query(None),
+    epoch: Optional[int] = Query(None),
 ):
     from timeline_storyboard import release_lease
     clean_id = _resolve_clean_video_id(id)
-    was_present, remaining = release_lease(clean_id, consumer_id=consumer_id, source=source, reason=reason)
+    was_present, remaining = release_lease(
+        clean_id,
+        consumer_id=consumer_id,
+        source=source,
+        reason=reason,
+        session_id=session_id,
+        epoch=epoch,
+    )
     return {"ok": True, "was_present": was_present, "remaining_consumers": remaining}
 
 

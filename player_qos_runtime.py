@@ -62,13 +62,17 @@ _v2_active_processes: Dict[str, dict] = {}
 _v2_active_lock = threading.Lock()
 
 
-def _key(video_id: Optional[str]) -> str:
+def _key(video_id: Optional[str], source: Optional[str] = None) -> str:
     if not video_id:
         return ""
     try:
-        return str(_storyboard._key(video_id))
+        from timeline_storyboard import resolve_video_key
+        return resolve_video_key(video_id, source=source).as_string()
     except Exception:
-        return str(video_id)
+        try:
+            return str(_storyboard._key(video_id))
+        except Exception:
+            return str(video_id)
 
 
 def _clean_video_id(main_module, value: Optional[str]) -> str:
@@ -144,14 +148,14 @@ def _qos_blocks_new_process(kind: str, priority: int) -> bool:
     return False
 
 
-def _hard_cancel_requested(video_id: Optional[str]) -> bool:
-    key = _key(video_id)
+def _hard_cancel_requested(video_id: Optional[str], source: Optional[str] = None) -> bool:
+    key = _key(video_id, source=source)
     with _lock:
         return bool(key and key in _hard_cancel_flags)
 
 
-def _soft_cancel_requested(video_id: Optional[str]) -> bool:
-    key = _key(video_id)
+def _soft_cancel_requested(video_id: Optional[str], source: Optional[str] = None) -> bool:
+    key = _key(video_id, source=source)
     if not key:
         return False
     now = time.monotonic()
@@ -163,17 +167,17 @@ def _soft_cancel_requested(video_id: Optional[str]) -> bool:
         return until > now
 
 
-def _clear_cancel_state(video_id: str) -> None:
-    key = _key(video_id)
+def _clear_cancel_state(video_id: str, source: Optional[str] = None) -> None:
+    key = _key(video_id, source=source)
     with _lock:
         _hard_cancel_flags.discard(key)
         _soft_cancel_until.pop(key, None)
 
 
-def _mark_processes_preempted(*, video_id: Optional[str] = None, hard: bool = False) -> int:
+def _mark_processes_preempted(*, video_id: Optional[str] = None, source: Optional[str] = None, hard: bool = False) -> int:
     """Mark + terminate matching storyboard subprocesses, including QUICK and V2."""
     global _qos_preemptions, _hard_cancel_count
-    video_key = _key(video_id) if video_id else None
+    video_key = _key(video_id, source=source) if video_id else None
     victims = []
     keys = set()
     with _storyboard._active_process_lock:
@@ -232,17 +236,17 @@ def _mark_processes_preempted(*, video_id: Optional[str] = None, hard: bool = Fa
     return len(victims)
 
 
-def clear_cancel_state(video_id: str) -> None:
+def clear_cancel_state(video_id: str, source: Optional[str] = None) -> None:
     """Clear hard/soft cancel state for video_id to allow clean regeneration upon revisit."""
-    _clear_cancel_state(video_id)
+    _clear_cancel_state(video_id, source=source)
 
 
-def register_v2_process(process_key: str, proc: Any, video_id: Optional[str]) -> None:
+def register_v2_process(process_key: str, proc: Any, video_id: Optional[str], source: Optional[str] = None) -> None:
     """Register an active V2 FFmpeg subprocess so QoS can preempt it."""
     with _v2_active_lock:
         _v2_active_processes[str(process_key)] = {
             "proc": proc,
-            "video_key": _key(video_id),
+            "video_key": _key(video_id, source=source),
             "started_at": time.monotonic(),
         }
 
@@ -263,12 +267,12 @@ def release_ffmpeg_budget(playback_serial) -> None:
     _release_ffmpeg_budget(playback_serial)
 
 
-def is_hard_cancelled(video_id: Optional[str]) -> bool:
-    return _hard_cancel_requested(video_id)
+def is_hard_cancelled(video_id: Optional[str], source: Optional[str] = None) -> bool:
+    return _hard_cancel_requested(video_id, source=source)
 
 
-def is_soft_cancelled(video_id: Optional[str]) -> bool:
-    return _soft_cancel_requested(video_id)
+def is_soft_cancelled(video_id: Optional[str], source: Optional[str] = None) -> bool:
+    return _soft_cancel_requested(video_id, source=source)
 
 
 def protect_playback(reason: str = "playback_qos") -> int:
@@ -276,17 +280,18 @@ def protect_playback(reason: str = "playback_qos") -> int:
     return _mark_processes_preempted(hard=False)
 
 
-def hard_cancel(video_id: Optional[str] = None, reason: str = "client") -> int:
+def hard_cancel(video_id: Optional[str] = None, source: Optional[str] = None, reason: str = "client", clear_lease: bool = True) -> int:
     """Hard lifecycle boundary used for video switch, close and page teardown."""
     if video_id:
         with _lock:
-            _hard_cancel_flags.add(_key(video_id))
-        try:
-            import timeline_storyboard
-            timeline_storyboard.remove_lease(video_id)
-        except Exception:
-            pass
-    return _mark_processes_preempted(video_id=video_id, hard=True)
+            _hard_cancel_flags.add(_key(video_id, source=source))
+        if clear_lease:
+            try:
+                import timeline_storyboard
+                timeline_storyboard.remove_lease(video_id, source=source)
+            except Exception:
+                pass
+    return _mark_processes_preempted(video_id=video_id, source=source, hard=True)
 
 
 def _wait_for_ffmpeg_budget(kind: str, priority: int, video_id: Optional[str], cancel_check=None):
@@ -588,27 +593,43 @@ def install(app, main_module) -> None:
     @app.post("/api/runtime/v452/storyboard/cancel")
     def v452_storyboard_cancel(
         id: Optional[str] = Query(None),
+        source: Optional[str] = Query(None),
         reason: str = Query("lifecycle"),
         consumer_id: Optional[str] = Query(None),
+        session_id: Optional[str] = Query(None),
+        epoch: Optional[int] = Query(None),
     ):
         clean_id = _clean_video_id(main_module, id) if id else ""
         if consumer_id and clean_id:
             try:
                 import timeline_storyboard as ts
-                was_present, remaining = ts.release_lease(clean_id, consumer_id=consumer_id, reason=f"browser:{str(reason)[:64]}")
-                if remaining > 0:
-                    return {"ok": True, "cancelled": 0, "video_id": clean_id, "remaining_consumers": remaining}
-                count = hard_cancel(clean_id or None, reason=f"browser:{str(reason)[:64]}")
-                return {"ok": True, "cancelled": int(count), "video_id": clean_id, "remaining_consumers": 0}
+                was_present, remaining = ts.release_lease(
+                    clean_id,
+                    consumer_id=consumer_id,
+                    session_id=session_id,
+                    epoch=epoch,
+                    source=source,
+                    reason=f"browser:{str(reason)[:64]}",
+                )
+                # Single authoritative cancel: ts.release_lease already executed
+                # hard_cancel atomically if (was_present and remaining == 0).
+                # Do NOT call hard_cancel again here!
+                return {
+                    "ok": True,
+                    "was_present": was_present,
+                    "remaining_consumers": remaining,
+                    "cancelled": 1 if (was_present and remaining == 0) else 0,
+                    "video_id": clean_id,
+                }
             except Exception:
                 pass
 
         try:
             import timeline_storyboard as ts
-            ts.remove_lease(clean_id)
+            ts.remove_lease(clean_id, source=source)
         except Exception:
             pass
-        count = hard_cancel(clean_id or None, reason=f"browser:{str(reason)[:64]}")
+        count = hard_cancel(clean_id or None, source=source, reason=f"browser:{str(reason)[:64]}", clear_lease=False)
         return {"ok": True, "cancelled": int(count), "video_id": clean_id, "remaining_consumers": 0}
 
     @app.get("/api/runtime/v452/qos")
