@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from queue import Queue
+from queue import Empty, Full
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -121,8 +121,17 @@ def test_camwhores_refresh_id():
 
 
 def test_queue_saturation_reports_error():
-    full = Queue(maxsize=1)
-    full.put({"unrelated": "work"})
+    class SaturatedQueue:
+        def put_nowait(self, value):
+            raise Full()
+
+        def get(self, timeout=None):
+            raise Empty()
+
+        def task_done(self):
+            pass
+
+    full = SaturatedQueue()
     key = resolve_video_key("queue_full_regression", source="archivebate")
     with patch.object(ts, "_jobs_queue", full), patch.object(ts, "_active_builds", {}), \
          patch.object(ts.progressive_storyboard_service, "get_manifest",
