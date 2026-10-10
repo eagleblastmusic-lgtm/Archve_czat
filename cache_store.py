@@ -127,7 +127,7 @@ def response_peer_is_global(response) -> bool:
         return False
 
 
-def trim_storyboard_cache_directory(directory: os.PathLike, max_bytes: int, protected_dirs=()) -> dict:
+def trim_storyboard_cache_directory(directory: os.PathLike, max_bytes: int, protected_dirs=(), protected_root_keys=()) -> dict:
     """Bound legacy files + nested V2 video directories by total bytes.
 
     A V2 directory is evicted as a single unit, never one JPEG/manifest at a
@@ -140,6 +140,7 @@ def trim_storyboard_cache_directory(directory: os.PathLike, max_bytes: int, prot
     if not root.is_dir():
         return {"total_bytes": 0, "removed_bytes": 0, "remaining_bytes": 0}
     protected = set(protected_dirs)
+    protected_roots = set(protected_root_keys)
     entries = []
     total = 0
 
@@ -152,7 +153,9 @@ def trim_storyboard_cache_directory(directory: os.PathLike, max_bytes: int, prot
         try:
             stat = path.stat()
             total += stat.st_size
-            if path.suffix != ".meta":
+            if path.suffix != ".meta" and not any(
+                path.name.startswith(root_key + ".") for root_key in protected_roots
+            ):
                 entries.append((stat.st_mtime, stat.st_size, path, False))
         except OSError:
             continue
