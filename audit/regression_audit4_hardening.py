@@ -181,6 +181,31 @@ def test_fair_crawler_visits_two_profiles():
         deep.close()
 
 
+def test_manual_deep_launch_clones_http_session():
+    isolated = object()
+    with patch.object(main.scraper, "clone_for_background", return_value=isolated), \
+         patch.object(deep_archivebate.deep_archivebate_service, "start", return_value=True) as started, \
+         patch.object(deep_archivebate.deep_archivebate_service, "status", return_value={}):
+        response = main.start_deep_archivebate()
+    started.assert_called_once_with(isolated)
+    assert response["started"] is True
+
+
+def test_successful_relogin_rotates_deep_session():
+    isolated = object()
+    with patch.object(main, "get_archivebate_credentials", return_value=("fresh@example.test", "new_password")), \
+         patch.object(main.session, "email", ""), \
+         patch.object(main.session, "password", ""), \
+         patch.object(main.session, "login", return_value=True), \
+         patch.object(main.scraper, "clone_for_background", return_value=isolated), \
+         patch.object(deep_archivebate.deep_archivebate_service, "resume_authenticated",
+                      return_value={"models_resumed": 2, "prefixes_resumed": 1}) as resume, \
+         patch.object(main, "get_status", return_value={"ok": True}):
+        result = asyncio.run(main.relogin())
+    resume.assert_called_once_with(isolated)
+    assert result["success"] and result["deep_recovery"]["models_resumed"] == 2
+
+
 def test_root_quick_file_protected():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -202,6 +227,8 @@ if __name__ == "__main__":
         test_deep_auth_resume_and_separate_scraper,
         test_discovery_errors_retry_after_budget,
         test_fair_crawler_visits_two_profiles,
+        test_manual_deep_launch_clones_http_session,
+        test_successful_relogin_rotates_deep_session,
         test_root_quick_file_protected,
     ]
     for fn in tests:
