@@ -418,6 +418,7 @@
         let sinceRev = entry.manifest ? (entry.manifest.rev || 0) : 0;
         let failureCount = 0;
         let buildFailures = 0;
+        let buildInFlight = false;
         let nextBuildAt = 0;
         let lastProgressAt = Date.now();
         let lastFrameCount = Number(entry.manifest?.frames?.length || 0)
@@ -427,12 +428,15 @@
           const token = getMutationToken();
           const buildHeaders = token ? { 'X-Archivebate-Mutation-Token': token } : {};
           const requestBuild = async () => {
+            if (buildInFlight || controller.signal.aborted || entry.generation !== targetGeneration) return;
+            buildInFlight = true;
             try {
               const response = await fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}&consumer_id=${encodeURIComponent(this.consumerId)}&session_id=${encodeURIComponent(sessionId)}`, {
                 method: 'POST', headers: buildHeaders, signal: controller.signal,
               });
               if (!response.ok) throw new Error('build_http_error');
               const result = await response.json();
+              if (controller.signal.aborted || entry.generation !== targetGeneration) return;
               if (result?.build_status === 'terminal_error') {
                 entry.terminalFailure = true;
                 entry.errorMessage = 'Nie udało się rozpocząć generowania podglądu.';
@@ -442,10 +446,12 @@
                 buildFailures = 0;
               }
             } catch (_) {
-              if (!controller.signal.aborted) {
+              if (!controller.signal.aborted && entry.generation === targetGeneration) {
                 buildFailures += 1;
                 nextBuildAt = Date.now() + Math.min(30000, 2000 * 2 ** Math.min(4, buildFailures));
               }
+            } finally {
+              buildInFlight = false;
             }
           };
           void requestBuild();
