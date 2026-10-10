@@ -3,9 +3,12 @@
 Runs against real production functions in a disposable fixture; no account files
 or real user data are modified.
 """
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from queue import Queue
 from types import SimpleNamespace
 from unittest.mock import patch
