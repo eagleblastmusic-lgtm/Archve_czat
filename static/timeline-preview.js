@@ -535,7 +535,6 @@
               if (sinceRev === 0) {
                 await new Promise(resolve => setTimeout(resolve, 250));
               }
-              }
             } catch (err) {
               if (controller.signal.aborted || entry.generation !== targetGeneration) {
                 entry.lifecycle = LIFECYCLE.CANCELLED;
