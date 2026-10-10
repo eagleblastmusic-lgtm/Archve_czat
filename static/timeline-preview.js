@@ -459,6 +459,7 @@
               entry.errorMessage ||= 'Podgląd niedostępny — generowanie nie zrobiło postępu.';
               entry.lastErrorTime = Date.now();
               entry.retryCount = 5;
+              this.releaseLease(videoKey || videoId, source);
               break;
             }
             loopIter++;
