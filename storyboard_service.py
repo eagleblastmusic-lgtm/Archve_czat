@@ -281,8 +281,17 @@ def _run_cancellable_process(
         text=text,
         errors="replace" if text else None,
     )
+    # Stamp the actual spawned legacy process with the current QoS epoch.
+    # Delayed session-A release must not terminate session-B QUICK work.
+    try:
+        import player_qos_runtime as qos
+        source = "camwhores" if str(video_id or "").startswith("cw_") else "archivebate"
+        qos_generation = qos.get_active_generation(video_id, source=source)
+    except Exception:
+        qos_generation = None
     with _active_process_lock:
         _active_processes[process_key] = {
+            "qos_generation": qos_generation,
             "proc": proc,
             "video_key": _key(video_id or process_key),
             "kind": kind,
