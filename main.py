@@ -2602,13 +2602,13 @@ def storyboard_v2_build(
     base = str(request.base_url if request else "http://127.0.0.1:8000/").rstrip("/")
     if direct:
         source_url = (
-            f"{base}/api/video/stream?id={requests.utils.quote(clean_id)}"
+            f"{base}/api/video/stream?id={requests.utils.quote(details_id)}"
             f"&url={requests.utils.quote(direct, safe='')}"
             f"&embed={requests.utils.quote(embed, safe='')}"
             f"&owner=storyboard&priority=low&reason=storyboard"
         )
     else:
-        source_url = f"{base}/api/video/stream?id={requests.utils.quote(clean_id)}&owner=storyboard&priority=low&reason=storyboard"
+        source_url = f"{base}/api/video/stream?id={requests.utils.quote(details_id)}&owner=storyboard&priority=low&reason=storyboard"
 
     preview_url = (
         f"{base}/api/video/stream?url={requests.utils.quote(preview, safe='')}&owner=storyboard&priority=low&reason=storyboard"
