@@ -254,12 +254,13 @@ class ConsumerLeaseManager:
                 "seq": new_seq,
             }
             active_count = sum(1 for rec in self._leases[key_str].values() if rec.get("expires", 0.0) > now)
-
-        try:
-            import player_qos_runtime as qos
-            qos.clear_cancel_state(key.provider_id, source=key.source, generation=epoch)
-        except Exception:
-            pass
+            # Publish the new generation while the lease lock is held. A stale
+            # release cannot observe the B lease without QoS seeing B's epoch.
+            try:
+                import player_qos_runtime as qos
+                qos.clear_cancel_state(key.provider_id, source=key.source, generation=epoch)
+            except Exception:
+                pass
 
         return AcquireResult(True, epoch, active_count, cid, sid)
 
