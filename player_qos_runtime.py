@@ -214,6 +214,11 @@ def _mark_processes_preempted(
             current_key = str(info.get("video_key") or "")
             if legacy_key is not None and current_key != legacy_key:
                 continue
+            # A legacy QUICK process is tagged at registration with the QoS
+            # epoch. Delayed release(A) must not kill a newer process B.
+            proc_gen = info.get("qos_generation")
+            if generation is not None and (proc_gen is None or int(proc_gen) > int(generation)):
+                continue
             proc = info.get("proc")
             if proc is None or proc.poll() is not None:
                 continue
@@ -698,24 +703,15 @@ def install(app, main_module) -> None:
                     "video_id": clean_id,
                 }
 
-        # If consumer_id was NOT provided:
-        if clean_id:
-            try:
-                import timeline_storyboard as ts
-                if ts.has_live_lease(clean_id, source=source):
-                    # Active consumers exist! Do NOT perform global cancellation!
-                    active_count = ts.get_active_consumers_count(clean_id, source=source)
-                    return {
-                        "ok": True,
-                        "cancelled": 0,
-                        "video_id": clean_id,
-                        "remaining_consumers": active_count,
-                    }
-                ts.remove_lease(clean_id, source=source)
-            except Exception:
-                pass
-        count = hard_cancel(clean_id or None, source=source, reason=f"browser:{str(reason)[:64]}", clear_lease=False)
-        return {"ok": True, "cancelled": int(count), "video_id": clean_id, "remaining_consumers": 0}
+        # No unscoped hard cancel via HTTP. A check-then-delete of leases can
+        # destroy a newly-acquired session between these two operations.
+        # Client releases must be scoped to a consumer and session token.
+        return {
+            "ok": False,
+            "error": "consumer_id_required",
+            "cancelled": 0,
+            "video_id": clean_id,
+        }
 
     @app.get("/api/runtime/v452/qos")
     def v452_qos_snapshot():

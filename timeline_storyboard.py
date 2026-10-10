@@ -147,7 +147,19 @@ class ConsumerLeaseManager:
         self._last_prune = now
         expired_keys = []
         for key_str, consumers in list(self._leases.items()):
-            active = {cid: rec for cid, rec in consumers.items() if rec.get("expires", 0.0) > now}
+            active = {}
+            for cid, rec in consumers.items():
+                if rec.get("expires", 0.0) > now:
+                    active[cid] = rec
+                else:
+                    # Expiration is a retirement, not permission for delayed
+                    # build(A) to resurrect session A after build(B).
+                    old_sid = rec.get("session_id")
+                    if old_sid:
+                        retired = self._retired_sessions.setdefault(key_str, {}).setdefault(cid, [])
+                        if old_sid not in retired:
+                            retired.append(old_sid)
+                            del retired[:-20]
             if active:
                 self._leases[key_str] = active
             else:
@@ -254,12 +266,13 @@ class ConsumerLeaseManager:
                 "seq": new_seq,
             }
             active_count = sum(1 for rec in self._leases[key_str].values() if rec.get("expires", 0.0) > now)
-
-        try:
-            import player_qos_runtime as qos
-            qos.clear_cancel_state(key.provider_id, source=key.source, generation=epoch)
-        except Exception:
-            pass
+            # Publish the new generation while the lease lock is held. A stale
+            # release cannot observe the B lease without QoS seeing B's epoch.
+            try:
+                import player_qos_runtime as qos
+                qos.clear_cancel_state(key.provider_id, source=key.source, generation=epoch)
+            except Exception:
+                pass
 
         return AcquireResult(True, epoch, active_count, cid, sid)
 
@@ -289,6 +302,12 @@ class ConsumerLeaseManager:
             # 1. Reject if already expired - do NOT resurrect expired leases!
             if rec.get("expires", 0.0) <= now:
                 consumers.pop(cid, None)
+                old_sid = rec.get("session_id")
+                if old_sid:
+                    retired = self._retired_sessions.setdefault(key_str, {}).setdefault(cid, [])
+                    if old_sid not in retired:
+                        retired.append(old_sid)
+                        del retired[:-20]
                 if not any(r.get("expires", 0.0) > now for r in consumers.values()):
                     self._leases.pop(key_str, None)
                 return False, 0
@@ -456,8 +475,26 @@ def prune_storyboard_cache_safely(max_bytes: int = 500 * 1024 * 1024) -> dict:
             }
             active_keys.update(_active_builds.keys())
             protected_dirs = {safe_cache_key(key) for key in active_keys}
+            # QUICK and exact previews store versioned JPEG/JSON directly in
+            # storyboard_cache/, outside the V2 directories. Protect their
+            # active or queued work as a complete prefix.
+            import storyboard_service as legacy
+            with legacy._state_lock:
+                quick_keys = set(legacy._leases.keys())
+                quick_keys.update(
+                    str(k).split(":", 1)[0] for k, state in legacy._states.items()
+                    if state.get("status") in ("building", "queued")
+                )
+            with legacy._active_process_lock:
+                quick_keys.update(
+                    str(info.get("video_key")) for info in legacy._active_processes.values()
+                    if info.get("video_key")
+                )
             return trim_storyboard_cache_directory(
-                STORYBOARD_CACHE_DIR, max_bytes=max_bytes, protected_dirs=protected_dirs
+                STORYBOARD_CACHE_DIR,
+                max_bytes=max_bytes,
+                protected_dirs=protected_dirs,
+                protected_root_keys=quick_keys,
             )
 
 

@@ -759,7 +759,8 @@ def get_deep_archivebate_status():
 @app.post("/api/deep-archivebate/start")
 def start_deep_archivebate():
     from deep_archivebate import deep_archivebate_service
-    started = deep_archivebate_service.start(scraper)
+    # Manual launch must own its HTTP cookie/cache pool, like autostart.
+    started = deep_archivebate_service.start(scraper.clone_for_background())
     return {"started": started, **deep_archivebate_service.status()}
 
 
@@ -790,8 +791,19 @@ async def relogin():
     session.email = email
     session.password = password
     success = await asyncio.to_thread(session.login)
+    recovery = None
+    if success:
+        # Do not mutate the old HTTP session while a Deep fetch is in flight.
+        # The Deep worker atomically swaps to a fresh independent pool and
+        # fences responses returned by the previous authentication epoch.
+        from deep_archivebate import deep_archivebate_service
+        recovery = await asyncio.to_thread(
+            deep_archivebate_service.resume_authenticated,
+            scraper.clone_for_background(),
+        )
     # Authentication and synchronization have separate outcomes and phases.
-    return {"success": success, "sync_started": False, "status": await asyncio.to_thread(get_status)}
+    return {"success": success, "sync_started": False, "deep_recovery": recovery,
+            "status": await asyncio.to_thread(get_status)}
 
 # ENDPOINTY PANELU KONTA
 async def _ensure_account_synced():
