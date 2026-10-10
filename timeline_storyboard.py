@@ -918,8 +918,9 @@ class ProgressiveStoryboardService:
         key = resolve_video_key(video_id, source=source)
         res = acquire_lease(key.as_string(), consumer_id=consumer_id, duration=LEASE_DURATION_SECONDS, source=source, session_id=session_id)
         if not res.ok:
-            # Stale build request or capacity limit: return existing manifest without scheduling job or overwriting ownership
-            return self.get_manifest(video_id, duration, source=source)
+            # A stale session or capacity rejection must be visible to the client.
+            return {**self.get_manifest(video_id, duration, source=source),
+                    "build_status": "retryable_error", "error_code": "lease_unavailable"}
         manifest = self.get_manifest(
             video_id,
             duration,
@@ -943,6 +944,7 @@ class ProgressiveStoryboardService:
             "embed_url": embed_url,
         }
 
+        build_status = "queued"
         with _lock:
             key_str = key.as_string()
             if key_str not in _active_builds:
@@ -950,11 +952,15 @@ class ProgressiveStoryboardService:
                     _jobs_queue.put_nowait(job)
                     _active_builds[key_str] = job
                 except Exception:
-                    # Queue full: do NOT register in _active_builds to prevent permanent lockout
-                    pass
+                    # Queue full is retryable and must not be hidden behind HTTP 200.
+                    build_status = "retryable_error"
+            else:
+                build_status = "running"
 
-        self._ensure_worker()
-        return manifest
+        if build_status != "retryable_error":
+            self._ensure_worker()
+        return {**manifest, "build_status": build_status,
+                **({"error_code": "queue_full"} if build_status == "retryable_error" else {})}
 
     def _worker_loop(self) -> None:
         while not _worker_stop.is_set():
