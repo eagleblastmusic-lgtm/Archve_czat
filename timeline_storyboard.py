@@ -147,7 +147,19 @@ class ConsumerLeaseManager:
         self._last_prune = now
         expired_keys = []
         for key_str, consumers in list(self._leases.items()):
-            active = {cid: rec for cid, rec in consumers.items() if rec.get("expires", 0.0) > now}
+            active = {}
+            for cid, rec in consumers.items():
+                if rec.get("expires", 0.0) > now:
+                    active[cid] = rec
+                else:
+                    # Expiration is a retirement, not permission for delayed
+                    # build(A) to resurrect session A after build(B).
+                    old_sid = rec.get("session_id")
+                    if old_sid:
+                        retired = self._retired_sessions.setdefault(key_str, {}).setdefault(cid, [])
+                        if old_sid not in retired:
+                            retired.append(old_sid)
+                            del retired[:-20]
             if active:
                 self._leases[key_str] = active
             else:
@@ -290,6 +302,12 @@ class ConsumerLeaseManager:
             # 1. Reject if already expired - do NOT resurrect expired leases!
             if rec.get("expires", 0.0) <= now:
                 consumers.pop(cid, None)
+                old_sid = rec.get("session_id")
+                if old_sid:
+                    retired = self._retired_sessions.setdefault(key_str, {}).setdefault(cid, [])
+                    if old_sid not in retired:
+                        retired.append(old_sid)
+                        del retired[:-20]
                 if not any(r.get("expires", 0.0) > now for r in consumers.values()):
                     self._leases.pop(key_str, None)
                 return False, 0
