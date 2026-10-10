@@ -43,6 +43,8 @@ class DeepArchivebateService:
         self._stop = threading.Event()
         self._closed = False
         self._scraper = None
+        # Incremented on successful reauthentication, invalidating old requests.
+        self._auth_epoch = 0
         self._last_targets: Tuple[int, ...] = ()
         self._progress: Dict[str, Any] = {
             "running": False,
@@ -280,6 +282,7 @@ class DeepArchivebateService:
                 return False
             prefix = str(row["prefix"])
             status = str(row["status"])
+            epoch = self._auth_epoch
             page = int(row["next_page"] or 1)
             self._progress["current_prefix"] = prefix
 
@@ -298,6 +301,8 @@ class DeepArchivebateService:
             now = time.time()
             with self._lock:
                 conn = self._get_conn()
+                if epoch != self._auth_epoch:
+                    return True  # Discard a stale response from the previous login.
                 self._store_profiles_locked(profiles or [], f"search:{prefix}")
                 depth = int(row["depth"] or len(prefix))
                 if status in ("pending", "retry") and page == 1 and last_page > DISCOVERY_PAGE_SPLIT_THRESHOLD and depth < DISCOVERY_MAX_PREFIX_DEPTH:
@@ -329,15 +334,17 @@ class DeepArchivebateService:
         except Exception as exc:
             with self._lock:
                 conn = self._get_conn()
-                attempts = int(row["attempts"] or 0) + 1
-                terminal = attempts >= 8
+                if epoch != self._auth_epoch:
+                    return True
+                # Exceeding an error budget means a long cooldown, not a
+                # permanently unreachable profile-discovery prefix.
+                attempts = min(8, int(row["attempts"] or 0) + 1)
                 failed_at = time.time()
-                retry_delay = min(300.0, 2.0 ** min(attempts, 8))
-                retry_at = None if terminal else failed_at + retry_delay
+                retry_delay = 3600.0 if attempts >= 8 else min(300.0, 2.0 ** attempts)
                 conn.execute(
                     "UPDATE archivebate_discovery_queue "
-                    "SET status=?, attempts=?, updated_at=?, last_error=?, retry_at=? WHERE prefix=?",
-                    ("error" if terminal else "retry", attempts, failed_at, str(exc), retry_at, prefix),
+                    "SET status='retry', attempts=?, updated_at=?, last_error=?, retry_at=? WHERE prefix=?",
+                    (attempts, failed_at, str(exc), failed_at + retry_delay, prefix),
                 )
                 self._progress["last_error"] = str(exc)
             return True
@@ -661,7 +668,7 @@ class DeepArchivebateService:
                 WHERE crawl_complete = 0
                   AND crawl_state IN ('pending', 'retry')
                   AND (retry_at IS NULL OR retry_at <= ?)
-                ORDER BY priority DESC, pages_scanned DESC, updated_at ASC, model_key ASC
+                ORDER BY priority DESC, updated_at ASC, pages_scanned ASC, model_key ASC
                 LIMIT 1
                 """,
                 (time.time(),),
@@ -671,13 +678,18 @@ class DeepArchivebateService:
             model_key = str(row["model_key"])
             username = str(row["username"])
             page = max(1, int(row["next_page"] or 1))
+            epoch = self._auth_epoch
             self._progress["current_model"] = username
 
         try:
             result = self._profile_batch(scraper, username, page)
+            if epoch != self._auth_epoch:
+                return True
             if not result.ok:
                 error_text = result.error or result.status
                 with self._lock:
+                    if epoch != self._auth_epoch:
+                        return True
                     conn = self._get_conn()
                     failed_at = time.time()
                     retry_count = int(row["retry_count"] or 0) + 1
@@ -688,7 +700,9 @@ class DeepArchivebateService:
                     if terminal_unavailable:
                         crawl_state, crawl_complete, retry_at, end_reason = "unavailable", 1, None, "unavailable"
                     elif auth_blocked:
-                        crawl_state, crawl_complete, retry_at, end_reason = "auth_blocked", 1, None, "auth_blocked"
+                        # Authentication is transient state, not evidence that
+                        # historical pages have been completely indexed.
+                        crawl_state, crawl_complete, retry_at, end_reason = "auth_blocked", 0, None, "auth_blocked"
                     elif quarantined:
                         crawl_state, crawl_complete, retry_at, end_reason = "quarantined", 1, None, "retry_limit"
                     else:
@@ -703,6 +717,8 @@ class DeepArchivebateService:
             batch = result.items
             now = time.time()
             with self._lock:
+                if epoch != self._auth_epoch:
+                    return True
                 conn = self._get_conn()
                 if batch:
                     signature = self._batch_signature(batch)
@@ -757,6 +773,8 @@ class DeepArchivebateService:
             return True
         except Exception as exc:
             with self._lock:
+                if epoch != self._auth_epoch:
+                    return True
                 conn = self._get_conn()
                 failed_at = time.time()
                 retry_count = int(row["retry_count"] or 0) + 1
@@ -840,6 +858,29 @@ class DeepArchivebateService:
             self._thread = threading.Thread(target=self._worker, name="archivebate-deep-crawler", daemon=True)
             self._thread.start()
             return True
+
+    def resume_authenticated(self, isolated_scraper) -> dict:
+        """Swap a fresh independent HTTP session and safely resume auth failures.
+
+        The current worker may finish one in-flight call using its previous
+        session, but its response is fenced by _auth_epoch and is not persisted.
+        """
+        with self._lock:
+            self._auth_epoch += 1
+            self._scraper = isolated_scraper
+            conn = self._get_conn()
+            now = time.time()
+            models = conn.execute(
+                "UPDATE archivebate_models "
+                "SET crawl_state='retry', crawl_complete=0, retry_at=?, "
+                "retry_count=0, end_reason=NULL, last_error=NULL "
+                "WHERE crawl_state='auth_blocked'", (now,)
+            ).rowcount
+            discovery = conn.execute(
+                "UPDATE archivebate_discovery_queue SET status='retry', retry_at=?, "
+                "attempts=0 WHERE status='error'", (now,)
+            ).rowcount
+            return {"models_resumed": models, "prefixes_resumed": discovery}
 
     def stop(self, wait: bool = False) -> None:
         self._stop.set()
