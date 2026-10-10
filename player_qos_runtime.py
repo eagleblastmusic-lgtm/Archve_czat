@@ -268,6 +268,26 @@ def clear_cancel_state(video_id: str, source: Optional[str] = None, generation: 
     _clear_cancel_state(video_id, source=source, generation=generation)
 
 
+def get_active_generation(video_id: Optional[str], source: Optional[str] = None) -> int:
+    """Get authoritative active generation counter for video_id / source."""
+    key = _key(video_id, source=source)
+    if not key:
+        return 0
+    with _lock:
+        return int(_active_generations.get(key, 0))
+
+
+def evict_video_key(video_id: str, source: Optional[str] = None) -> None:
+    """Safely remove video key state when evicted from capacity-bounded lease manager."""
+    key = _key(video_id, source=source)
+    if not key:
+        return
+    with _lock:
+        _hard_cancel_flags.pop(key, None)
+        _soft_cancel_until.pop(key, None)
+        _active_generations.pop(key, None)
+
+
 def register_v2_process(
     process_key: str,
     proc: Any,

@@ -101,12 +101,6 @@ _worker_stop = threading.Event()
 LEASE_DURATION_SECONDS = 120.0
 
 
-class ConsumerLeaseManager:
-    """Thread-safe, multi-consumer lease manager with per-consumer tracking,
-    session epochs, natural expiration, and automatic pruning.
-    """
-    def __init__(self, default_duration: float = LEASE_DURATION_SECONDS, max_tracked_keys: int = 1000):
-        self._lock = threading.RLock()
 class AcquireResult(tuple):
     """Result of lease acquisition, backwards-compatible with 4-tuple while carrying session_id."""
     def __new__(cls, ok: bool, epoch: int, active_count: int, consumer_id: str, session_id: str = ""):
@@ -160,8 +154,25 @@ class ConsumerLeaseManager:
                 expired_keys.append(key_str)
         for k in expired_keys:
             self._leases.pop(k, None)
-            self._epochs.pop(k, None)
-            self._retired_sessions.pop(k, None)
+            # NOTE: Do NOT pop _epochs[k] or _retired_sessions[k] upon lease expiration!
+            # Doing so resets the monotonic epoch counter back to 1, desynchronizing with
+            # player_qos_runtime and breaking future cancellations / session fencing.
+            # Only prune _epochs / _retired_sessions when capacity limit max_tracked_keys is exceeded!
+
+        # Bounded capacity management: prune inactive epochs/retired_sessions when capacity limit is reached
+        if len(self._epochs) >= self.max_tracked_keys:
+            active_set = set(self._leases.keys())
+            removable = [k for k in self._epochs if k not in active_set]
+            excess = max(1, len(self._epochs) - self.max_tracked_keys + 1)
+            to_remove = removable[:excess]
+            for k in to_remove:
+                self._epochs.pop(k, None)
+                self._retired_sessions.pop(k, None)
+                try:
+                    import player_qos_runtime as qos
+                    qos.evict_video_key(k)
+                except Exception:
+                    pass
 
     def acquire(
         self,
@@ -225,7 +236,14 @@ class ConsumerLeaseManager:
 
             has_live = any(r.get("expires", 0.0) > now for r in self._leases[key_str].values())
             if not has_live or (rec is not None and rec.get("session_id") != sid):
-                self._epochs[key_str] = self._epochs.get(key_str, 0) + 1
+                qos_gen = 0
+                try:
+                    import player_qos_runtime as qos
+                    qos_gen = qos.get_active_generation(key.provider_id, source=key.source)
+                except Exception:
+                    pass
+                base_gen = max(self._epochs.get(key_str, 0), qos_gen)
+                self._epochs[key_str] = base_gen + 1
             epoch = self._epochs.setdefault(key_str, 1)
 
             self._leases[key_str][cid] = {
@@ -577,6 +595,11 @@ def has_live_lease(video_id: str, source: Optional[str] = None) -> bool:
     return lease_manager.has_live_lease(key)
 
 
+def get_active_consumers_count(video_id: Any, source: Optional[str] = None) -> int:
+    key = resolve_video_key(video_id, source=source)
+    return lease_manager.get_active_consumers_count(key)
+
+
 def remove_lease(video_id: str, source: Optional[str] = None) -> None:
     key = resolve_video_key(video_id, source=source)
     lease_manager.release(key, consumer_id=None, reason="remove_lease")
@@ -922,7 +945,7 @@ class ProgressiveStoryboardService:
                 if not _worker_stop.is_set():
                     try:
                         import player_qos_runtime as qos
-                        if qos.is_hard_cancelled(job["key"].provider_id):
+                        if qos.is_hard_cancelled(job["key"].provider_id, source=job["key"].source):
                             continue
                     except Exception:
                         pass
@@ -1200,14 +1223,14 @@ class ProgressiveStoryboardService:
                     break
                 try:
                     import player_qos_runtime as qos
-                    if qos.is_hard_cancelled(key.provider_id):
+                    if qos.is_hard_cancelled(key.provider_id, source=key.source):
                         break
                 except Exception:
                     pass
                 if not has_live_lease(key.as_string(), source=key.source):
                     break
 
-                self._wait_for_playback_qos(key.provider_id)
+                self._wait_for_playback_qos(key.provider_id, source=key.source)
 
                 batch = slots_to_do[b_start:b_start + batch_size]
                 batch_added = 0
@@ -1325,7 +1348,7 @@ class ProgressiveStoryboardService:
         with _state_condition:
             _state_condition.notify_all()
 
-    def _wait_for_playback_qos(self, video_id: str) -> None:
+    def _wait_for_playback_qos(self, video_id: str, source: Optional[str] = None) -> None:
         """Cooperate with player QoS: yield gently if playback is actively seeking, stalled or critical."""
         try:
             import player_qos_runtime as qos
@@ -1336,7 +1359,7 @@ class ProgressiveStoryboardService:
                 or snap.get("ready_state", 4) < 2
                 or snap.get("buffered_seconds", 10.0) < 2.0
             ):
-                if waited >= 5.0 or qos.is_hard_cancelled(video_id):
+                if waited >= 5.0 or qos.is_hard_cancelled(video_id, source=source):
                     break
                 time.sleep(0.1)
                 waited += 0.1
