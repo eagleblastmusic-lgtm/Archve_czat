@@ -132,15 +132,15 @@ Zestawienie jobów:
 
 ---
 
-## 8. Wyniki GitHub Actions dla commitu `60ab492`
+## 8. Wyniki GitHub Actions dla commitów `60ab492` i `36c4ec8`
 
-- **Workflow Run:** [Actions Run ID: 38057255817](https://github.com/eagleblastmusic-lgtm/Archve_czat/actions/runs/38057255817)
-- **Pull Request:** [GitHub PR #7](https://github.com/eagleblastmusic-lgtm/Archve_czat/pull/7)
-- **Status ogólny:** **SUCCESS (ALL 4 JOBS PASSED, 100% GREEN)**:
-  - `offline-regression` (ID 114228159094) — **SUCCESS** (1m8s)
-  - `windows-contracts` (ID 114228159220) — **SUCCESS** (1m18s)
-  - `windows-python314` (ID 114228159230) — **SUCCESS** (1m10s)
-  - `browser-acceptance` (ID 114228159307) — **SUCCESS** (1m37s)
+- **Pull Request:** [GitHub PR #7: fix(storyboard): final concurrency hardening, generation-safe cancellation, and lease protection](https://github.com/eagleblastmusic-lgtm/Archve_czat/pull/7)
+- **Workflow Run (Fix Commit `60ab492`):** [Actions Run ID: 38057255817](https://github.com/eagleblastmusic-lgtm/Archve_czat/actions/runs/38057255817) — **SUCCESS (100% GREEN)**
+- **Workflow Run (Final Commit `36c4ec8`):** [Actions Run ID: 38057402814](https://github.com/eagleblastmusic-lgtm/Archve_czat/actions/runs/38057402814) — **SUCCESS (100% GREEN)**:
+  - `windows-python314` (ID 114228587208) — **SUCCESS** (1m18s)
+  - `browser-acceptance` (ID 114228587244) — **SUCCESS** (1m39s)
+  - `windows-contracts` (ID 114228587258) — **SUCCESS** (1m20s)
+  - `offline-regression` (ID 114228587399) — **SUCCESS** (1m12s)
 
 ---
 
