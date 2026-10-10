@@ -288,6 +288,21 @@
       }
     }
 
+    getSessionId(videoKey, source, createIfMissing = false) {
+      if (!videoKey) return null;
+      const key = canonicalKey(videoKey, source);
+      if (createIfMissing) {
+        const entry = this.getOrCreateEntry(key, source);
+        if (!entry.sessionId) {
+          entry.generation = (entry.generation || 0) + 1;
+          entry.sessionId = `${this.consumerId}_s${entry.generation}`;
+        }
+        return entry.sessionId;
+      }
+      const entry = this.cache.get(key);
+      return entry ? entry.sessionId : null;
+    }
+
     releaseLease(videoKey, source) {
       if (!videoKey) return;
       const key = canonicalKey(videoKey, source);
@@ -298,13 +313,14 @@
       }
       const parts = String(videoKey).split(':');
       const videoId = parts.length >= 3 ? parts.slice(2).join(':') : parts[parts.length - 1];
+      const parsedSource = parts.length >= 3 ? parts[0] : (source || (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
       const token = getMutationToken();
       const headers = {
         'Content-Type': 'application/json',
         ...(token ? { 'X-Archivebate-Mutation-Token': token } : {}),
       };
       const sessionParam = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
-      fetch(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}&consumer_id=${encodeURIComponent(this.consumerId)}${sessionParam}&source=${encodeURIComponent(source || '')}&reason=unsubscribe`, {
+      fetch(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}&consumer_id=${encodeURIComponent(this.consumerId)}${sessionParam}&source=${encodeURIComponent(parsedSource || '')}&reason=unsubscribe`, {
         method: 'POST',
         headers,
         keepalive: true,
@@ -775,16 +791,19 @@
     subscribe: (key, subId, cb, src) => manager.subscribe(key, subId, cb, src),
     unsubscribe: (key, subId, src) => manager.unsubscribe(key, subId, src),
     stopPolling: (key, src) => manager.stopPolling(key, src),
+    getSessionId: (key, src) => manager.getSessionId(key, src),
     binarySearchNearest,
   };
 
   if (typeof global !== 'undefined' && global.addEventListener) {
-    global.addEventListener('pagehide', () => {
+    let leasesReleased = false;
+    const handleTeardown = () => {
+      if (leasesReleased) return;
+      leasesReleased = true;
       manager.releaseAllLeases();
-    }, { capture: true });
-    global.addEventListener('beforeunload', () => {
-      manager.releaseAllLeases();
-    }, { capture: true });
+    };
+    global.addEventListener('pagehide', handleTeardown, { capture: true });
+    global.addEventListener('beforeunload', handleTeardown, { capture: true });
   }
 
 })(typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : this));

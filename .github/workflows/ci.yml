@@ -103,6 +103,8 @@ jobs:
         run: python audit/regression_cross_session_lifecycle.py
       - name: Cross-session storyboard frontend regression
         run: node audit/regression_cross_session_frontend.cjs
+      - name: Deterministic cross-session safety regression
+        run: python audit/reproduce_final_session_safety.py
       - name: Catalog partial frontend regression
         run: node audit/regression_catalog_partial_frontend.cjs
       - name: Feed regression
@@ -229,6 +231,8 @@ jobs:
         run: python audit/regression_cross_session_lifecycle.py
       - name: Cross-session storyboard frontend regression
         run: node audit/regression_cross_session_frontend.cjs
+      - name: Deterministic cross-session safety regression
+        run: python audit/reproduce_final_session_safety.py
       - name: Pagination frontend regression
         run: node audit/regression_package_b_frontend.cjs
       - name: Catalog projection frontend regression
@@ -314,6 +318,8 @@ jobs:
         run: python audit/regression_cross_session_lifecycle.py
       - name: Cross-session storyboard frontend regression
         run: node audit/regression_cross_session_frontend.cjs
+      - name: Deterministic cross-session safety regression
+        run: python audit/reproduce_final_session_safety.py
       - name: Unit tests
         run: python -m unittest -v test_suite.py
 

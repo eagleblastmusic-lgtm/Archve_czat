@@ -56,7 +56,8 @@ _qos_metrics_lock = threading.Lock()
 _qos_wait_count = 0
 _qos_preemptions = 0
 _hard_cancel_count = 0
-_hard_cancel_flags: set[str] = set()
+_hard_cancel_flags: Dict[str, int] = {}
+_active_generations: Dict[str, int] = {}
 _soft_cancel_until: Dict[str, float] = {}
 _v2_active_processes: Dict[str, dict] = {}
 _v2_active_lock = threading.Lock()
@@ -148,10 +149,20 @@ def _qos_blocks_new_process(kind: str, priority: int) -> bool:
     return False
 
 
-def _hard_cancel_requested(video_id: Optional[str], source: Optional[str] = None) -> bool:
+def _hard_cancel_requested(video_id: Optional[str], source: Optional[str] = None, generation: Optional[int] = None) -> bool:
     key = _key(video_id, source=source)
+    if not key:
+        return False
     with _lock:
-        return bool(key and key in _hard_cancel_flags)
+        if key not in _hard_cancel_flags:
+            return False
+        cancelled_gen = _hard_cancel_flags.get(key, 0)
+        active_gen = _active_generations.get(key, 0)
+        if active_gen > cancelled_gen:
+            return False
+        if generation is not None and int(generation) > cancelled_gen:
+            return False
+        return True
 
 
 def _soft_cancel_requested(video_id: Optional[str], source: Optional[str] = None) -> bool:
@@ -167,14 +178,26 @@ def _soft_cancel_requested(video_id: Optional[str], source: Optional[str] = None
         return until > now
 
 
-def _clear_cancel_state(video_id: str, source: Optional[str] = None) -> None:
+def _clear_cancel_state(video_id: str, source: Optional[str] = None, generation: Optional[int] = None) -> None:
     key = _key(video_id, source=source)
+    if not key:
+        return
     with _lock:
-        _hard_cancel_flags.discard(key)
+        _hard_cancel_flags.pop(key, None)
         _soft_cancel_until.pop(key, None)
+        if generation is not None:
+            _active_generations[key] = max(_active_generations.get(key, 0), int(generation))
+        else:
+            _active_generations[key] = _active_generations.get(key, 0) + 1
 
 
-def _mark_processes_preempted(*, video_id: Optional[str] = None, source: Optional[str] = None, hard: bool = False) -> int:
+def _mark_processes_preempted(
+    *,
+    video_id: Optional[str] = None,
+    source: Optional[str] = None,
+    hard: bool = False,
+    generation: Optional[int] = None,
+) -> int:
     """Mark + terminate matching storyboard subprocesses, including QUICK and V2."""
     global _qos_preemptions, _hard_cancel_count
     video_key = _key(video_id, source=source) if video_id else None
@@ -198,6 +221,10 @@ def _mark_processes_preempted(*, video_id: Optional[str] = None, source: Optiona
             current_key = str(info.get("video_key") or "")
             if video_key is not None and current_key != video_key:
                 continue
+            proc_gen = info.get("generation")
+            # Fencing check: protect processes from newer generations
+            if generation is not None and proc_gen is not None and int(proc_gen) > int(generation):
+                continue
             proc = info.get("proc")
             if proc is None or proc.poll() is not None:
                 continue
@@ -207,7 +234,7 @@ def _mark_processes_preempted(*, video_id: Optional[str] = None, source: Optiona
     with _lock:
         for key in keys:
             if hard:
-                _hard_cancel_flags.add(key)
+                _hard_cancel_flags[key] = int(generation) if generation is not None else _active_generations.get(key, 0)
             else:
                 _soft_cancel_until[key] = now + SOFT_CANCEL_SECONDS
     for proc in victims:
@@ -236,17 +263,24 @@ def _mark_processes_preempted(*, video_id: Optional[str] = None, source: Optiona
     return len(victims)
 
 
-def clear_cancel_state(video_id: str, source: Optional[str] = None) -> None:
+def clear_cancel_state(video_id: str, source: Optional[str] = None, generation: Optional[int] = None) -> None:
     """Clear hard/soft cancel state for video_id to allow clean regeneration upon revisit."""
-    _clear_cancel_state(video_id, source=source)
+    _clear_cancel_state(video_id, source=source, generation=generation)
 
 
-def register_v2_process(process_key: str, proc: Any, video_id: Optional[str], source: Optional[str] = None) -> None:
+def register_v2_process(
+    process_key: str,
+    proc: Any,
+    video_id: Optional[str],
+    source: Optional[str] = None,
+    generation: Optional[int] = None,
+) -> None:
     """Register an active V2 FFmpeg subprocess so QoS can preempt it."""
     with _v2_active_lock:
         _v2_active_processes[str(process_key)] = {
             "proc": proc,
             "video_key": _key(video_id, source=source),
+            "generation": int(generation) if generation is not None else None,
             "started_at": time.monotonic(),
         }
 
@@ -257,9 +291,9 @@ def unregister_v2_process(process_key: str) -> None:
         _v2_active_processes.pop(str(process_key), None)
 
 
-def wait_for_ffmpeg_budget(kind: str, priority: int, video_id: Optional[str], cancel_check=None):
+def wait_for_ffmpeg_budget(kind: str, priority: int, video_id: Optional[str], cancel_check=None, source: Optional[str] = None):
     """Acquire FFmpeg slot conforming to QoS limits (2 global, 1 active playback)."""
-    return _wait_for_ffmpeg_budget(kind, priority, video_id, cancel_check)
+    return _wait_for_ffmpeg_budget(kind, priority, video_id, cancel_check, source=source)
 
 
 def release_ffmpeg_budget(playback_serial) -> None:
@@ -267,8 +301,8 @@ def release_ffmpeg_budget(playback_serial) -> None:
     _release_ffmpeg_budget(playback_serial)
 
 
-def is_hard_cancelled(video_id: Optional[str], source: Optional[str] = None) -> bool:
-    return _hard_cancel_requested(video_id, source=source)
+def is_hard_cancelled(video_id: Optional[str], source: Optional[str] = None, generation: Optional[int] = None) -> bool:
+    return _hard_cancel_requested(video_id, source=source, generation=generation)
 
 
 def is_soft_cancelled(video_id: Optional[str], source: Optional[str] = None) -> bool:
@@ -280,25 +314,36 @@ def protect_playback(reason: str = "playback_qos") -> int:
     return _mark_processes_preempted(hard=False)
 
 
-def hard_cancel(video_id: Optional[str] = None, source: Optional[str] = None, reason: str = "client", clear_lease: bool = True) -> int:
+def hard_cancel(
+    video_id: Optional[str] = None,
+    source: Optional[str] = None,
+    reason: str = "client",
+    clear_lease: bool = True,
+    generation: Optional[int] = None,
+) -> int:
     """Hard lifecycle boundary used for video switch, close and page teardown."""
     if video_id:
+        key = _key(video_id, source=source)
         with _lock:
-            _hard_cancel_flags.add(_key(video_id, source=source))
+            current_active = _active_generations.get(key, 0)
+            if generation is not None and current_active > int(generation):
+                # Stale cancellation: newer generation has already been acquired!
+                return 0
+            _hard_cancel_flags[key] = int(generation) if generation is not None else current_active
         if clear_lease:
             try:
                 import timeline_storyboard
                 timeline_storyboard.remove_lease(video_id, source=source)
             except Exception:
                 pass
-    return _mark_processes_preempted(video_id=video_id, source=source, hard=True)
+    return _mark_processes_preempted(video_id=video_id, source=source, hard=True, generation=generation)
 
 
-def _wait_for_ffmpeg_budget(kind: str, priority: int, video_id: Optional[str], cancel_check=None):
+def _wait_for_ffmpeg_budget(kind: str, priority: int, video_id: Optional[str], cancel_check=None, source: Optional[str] = None):
     global _qos_wait_count
     waited = False
     while not getattr(_storyboard, "_worker_stop").is_set():
-        if _hard_cancel_requested(video_id) or (cancel_check is not None and cancel_check()):
+        if _hard_cancel_requested(video_id, source=source) or (cancel_check is not None and cancel_check()):
             return None
         if _qos_blocks_new_process(kind, priority):
             if not waited:
@@ -611,9 +656,6 @@ def install(app, main_module) -> None:
                     source=source,
                     reason=f"browser:{str(reason)[:64]}",
                 )
-                # Single authoritative cancel: ts.release_lease already executed
-                # hard_cancel atomically if (was_present and remaining == 0).
-                # Do NOT call hard_cancel again here!
                 return {
                     "ok": True,
                     "was_present": was_present,
@@ -622,13 +664,30 @@ def install(app, main_module) -> None:
                     "video_id": clean_id,
                 }
             except Exception:
-                pass
+                return {
+                    "ok": False,
+                    "was_present": False,
+                    "remaining_consumers": 0,
+                    "cancelled": 0,
+                    "video_id": clean_id,
+                }
 
-        try:
-            import timeline_storyboard as ts
-            ts.remove_lease(clean_id, source=source)
-        except Exception:
-            pass
+        # If consumer_id was NOT provided:
+        if clean_id:
+            try:
+                import timeline_storyboard as ts
+                if ts.has_live_lease(clean_id, source=source):
+                    # Active consumers exist! Do NOT perform global cancellation!
+                    active_count = ts.get_active_consumers_count(clean_id, source=source)
+                    return {
+                        "ok": True,
+                        "cancelled": 0,
+                        "video_id": clean_id,
+                        "remaining_consumers": active_count,
+                    }
+                ts.remove_lease(clean_id, source=source)
+            except Exception:
+                pass
         count = hard_cancel(clean_id or None, source=source, reason=f"browser:{str(reason)[:64]}", clear_lease=False)
         return {"ok": True, "cancelled": int(count), "video_id": clean_id, "remaining_consumers": 0}
 

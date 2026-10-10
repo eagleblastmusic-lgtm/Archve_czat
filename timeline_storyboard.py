@@ -119,15 +119,30 @@ class AcquireResult(tuple):
         return inst
 
 
+def _extract_session_seq(session_id: Optional[str]) -> Optional[int]:
+    if not session_id:
+        return None
+    import re
+    m = re.search(r"_s(\d+)$", str(session_id).strip())
+    if m:
+        try:
+            return int(m.group(1))
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
 class ConsumerLeaseManager:
     """Manages active consumers, heartbeats, session generations, and automatic pruning per VideoKey."""
 
     def __init__(self, default_duration: float = LEASE_DURATION_SECONDS, max_tracked_keys: int = 1000):
         self._lock = threading.Lock()
-        # key_str -> {consumer_id: {"expires": float, "session_id": str, "epoch": int}}
+        # key_str -> {consumer_id: {"expires": float, "session_id": str, "epoch": int, "seq": Optional[int]}}
         self._leases: Dict[str, Dict[str, dict]] = {}
         # key_str -> epoch counter
         self._epochs: Dict[str, int] = {}
+        # key_str -> {consumer_id: list[str]} (recent retired session_ids)
+        self._retired_sessions: Dict[str, Dict[str, list[str]]] = {}
         self.default_duration = max(5.0, float(default_duration))
         self.max_tracked_keys = max_tracked_keys
         self._last_prune = time.monotonic()
@@ -146,15 +161,7 @@ class ConsumerLeaseManager:
         for k in expired_keys:
             self._leases.pop(k, None)
             self._epochs.pop(k, None)
-
-        if len(self._leases) > self.max_tracked_keys:
-            sorted_keys = sorted(
-                self._leases.keys(),
-                key=lambda k: max((rec.get("expires", 0.0) for rec in self._leases[k].values()), default=0.0)
-            )
-            for k in sorted_keys[: len(self._leases) - self.max_tracked_keys]:
-                self._leases.pop(k, None)
-                self._epochs.pop(k, None)
+            self._retired_sessions.pop(k, None)
 
     def acquire(
         self,
@@ -169,6 +176,7 @@ class ConsumerLeaseManager:
             import secrets
             cid = f"c_{secrets.token_hex(6)}_{int(now * 1000)}"
 
+        has_explicit_sid = bool(session_id and str(session_id).strip())
         sid = str(session_id or "").strip()
         if not sid:
             sid = f"{cid}_s1"
@@ -179,21 +187,59 @@ class ConsumerLeaseManager:
 
         with self._lock:
             self._prune_expired_locked(now)
-            if key_str not in self._leases or not any(r.get("expires", 0.0) > now for r in self._leases[key_str].values()):
-                if key_str not in self._leases:
-                    self._leases[key_str] = {}
+
+            # Capacity overload check: do NOT evict active leases!
+            if key_str not in self._leases and len(self._leases) >= self.max_tracked_keys:
+                return AcquireResult(False, 0, 0, cid, sid)
+
+            if key_str not in self._leases:
+                self._leases[key_str] = {}
+            if key_str not in self._retired_sessions:
+                self._retired_sessions[key_str] = {}
+
+            retired_for_cid = self._retired_sessions[key_str].setdefault(cid, [])
+            rec = self._leases[key_str].get(cid)
+
+            new_seq = _extract_session_seq(sid)
+            existing_seq = _extract_session_seq(rec.get("session_id")) if rec else None
+
+            # 1. Stale check: is this session_id already retired?
+            if sid in retired_for_cid:
+                epoch = self._epochs.get(key_str, 1)
+                active_count = sum(1 for r in self._leases[key_str].values() if r.get("expires", 0.0) > now)
+                return AcquireResult(False, epoch, active_count, cid, rec.get("session_id", sid) if rec else sid)
+
+            # 2. Monotonic sequence check if both have _s(\d+)
+            if new_seq is not None and existing_seq is not None and new_seq < existing_seq:
+                epoch = self._epochs.get(key_str, 1)
+                active_count = sum(1 for r in self._leases[key_str].values() if r.get("expires", 0.0) > now)
+                return AcquireResult(False, epoch, active_count, cid, rec.get("session_id", sid) if rec else sid)
+
+            # 3. Transition to new session for the same consumer
+            if rec is not None and rec.get("session_id") != sid:
+                old_sid = rec.get("session_id")
+                if old_sid:
+                    retired_for_cid.append(old_sid)
+                    if len(retired_for_cid) > 20:
+                        retired_for_cid.pop(0)
+
+            has_live = any(r.get("expires", 0.0) > now for r in self._leases[key_str].values())
+            if not has_live or (rec is not None and rec.get("session_id") != sid):
                 self._epochs[key_str] = self._epochs.get(key_str, 0) + 1
-            epoch = self._epochs[key_str]
+            epoch = self._epochs.setdefault(key_str, 1)
+
             self._leases[key_str][cid] = {
                 "expires": expires,
                 "session_id": sid,
+                "is_explicit": has_explicit_sid,
                 "epoch": epoch,
+                "seq": new_seq,
             }
             active_count = sum(1 for rec in self._leases[key_str].values() if rec.get("expires", 0.0) > now)
 
         try:
             import player_qos_runtime as qos
-            qos.clear_cancel_state(key.provider_id, source=key.source)
+            qos.clear_cancel_state(key.provider_id, source=key.source, generation=epoch)
         except Exception:
             pass
 
@@ -229,8 +275,15 @@ class ConsumerLeaseManager:
                     self._leases.pop(key_str, None)
                 return False, 0
 
-            # 2. Reject if wrong session generation
-            if session_id and rec.get("session_id") != str(session_id).strip():
+            # 2. Reject if wrong session generation or retired
+            if session_id:
+                clean_sid = str(session_id).strip()
+                if rec.get("session_id") != clean_sid:
+                    return False, 0
+                retired = self._retired_sessions.get(key_str, {}).get(cid, [])
+                if clean_sid in retired:
+                    return False, 0
+            elif rec.get("is_explicit"):
                 return False, 0
 
             # 3. Reject if stale epoch
@@ -254,6 +307,7 @@ class ConsumerLeaseManager:
         cid = str(consumer_id or "").strip() if consumer_id else None
         sid = str(session_id or "").strip() if session_id else None
         should_cancel = False
+        cancel_generation = None
 
         with self._lock:
             consumers = self._leases.get(key_str)
@@ -266,17 +320,26 @@ class ConsumerLeaseManager:
                 self._leases.pop(key_str, None)
                 remaining = 0
                 should_cancel = was_present
+                cancel_generation = self._epochs.get(key_str, 0)
             else:
                 rec = consumers.get(cid)
                 if rec is not None:
-                    # Verify session_id and epoch if supplied
-                    if sid and rec.get("session_id") != sid:
+                    # Protection against unscoped or stale releases:
+                    # If the lease has an explicit session_id, an unscoped release (sid is None) MUST NOT delete it!
+                    if rec.get("is_explicit") and not sid:
+                        was_present = False
+                    elif sid and rec.get("session_id") != sid:
                         was_present = False
                     elif epoch is not None and rec.get("epoch", 0) > int(epoch):
                         was_present = False
                     else:
                         consumers.pop(cid, None)
                         was_present = True
+                        if sid:
+                            retired = self._retired_sessions.setdefault(key_str, {}).setdefault(cid, [])
+                            retired.append(sid)
+                            if len(retired) > 20:
+                                retired.pop(0)
 
                 active = {c: r for c, r in consumers.items() if r.get("expires", 0.0) > now}
                 if active:
@@ -286,15 +349,15 @@ class ConsumerLeaseManager:
                     self._leases.pop(key_str, None)
                     remaining = 0
 
-                # Single authoritative cancellation:
-                # Cancel ONLY when an actual registered consumer was removed AND remaining drops to 0!
                 should_cancel = was_present and (remaining == 0)
+                if should_cancel:
+                    cancel_generation = self._epochs.get(key_str, 0)
 
-        # Trigger hard_cancel outside self._lock to avoid lock inversion or deadlocks
+        # Trigger generation-fenced hard_cancel outside self._lock to avoid lock inversion or deadlocks
         if should_cancel:
             try:
                 import player_qos_runtime as qos
-                qos.hard_cancel(key.provider_id, source=key.source, reason=reason, clear_lease=False)
+                qos.hard_cancel(key.provider_id, source=key.source, reason=reason, clear_lease=False, generation=cancel_generation)
             except Exception:
                 pass
 
@@ -529,6 +592,8 @@ def _default_extract_frame(
     headers: Optional[Dict[str, str]] = None,
     process_key: Optional[str] = None,
     video_id: Optional[str] = None,
+    source: Optional[str] = None,
+    generation: Optional[int] = None,
 ) -> bool:
     """Extract a single frame to out_path using imageio-ffmpeg with QoS process lifecycle."""
     if not is_safe_ffmpeg_input_url(source_url):
@@ -587,7 +652,7 @@ def _default_extract_frame(
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             import player_qos_runtime as qos
-            qos.register_v2_process(p_key, proc, video_id)
+            qos.register_v2_process(p_key, proc, video_id, source=source, generation=generation)
         except Exception:
             pass
 
@@ -805,7 +870,10 @@ class ProgressiveStoryboardService:
         session_id: Optional[str] = None,
     ) -> dict:
         key = resolve_video_key(video_id, source=source)
-        acquire_lease(key.as_string(), consumer_id=consumer_id, duration=LEASE_DURATION_SECONDS, source=source, session_id=session_id)
+        res = acquire_lease(key.as_string(), consumer_id=consumer_id, duration=LEASE_DURATION_SECONDS, source=source, session_id=session_id)
+        if not res.ok:
+            # Stale build request or capacity limit: return existing manifest without scheduling job or overwriting ownership
+            return self.get_manifest(video_id, duration, source=source)
         manifest = self.get_manifest(
             video_id,
             duration,
@@ -955,11 +1023,12 @@ class ProgressiveStoryboardService:
 
                 # Acquire QoS budget for preview extraction
                 budget = None
+                job_epoch = lease_manager._epochs.get(key.as_string(), 1)
                 try:
                     import player_qos_runtime as qos
                     def cancel_check():
                         return _worker_stop.is_set() or not has_live_lease(key.as_string(), source=key.source)
-                    budget = qos.wait_for_ffmpeg_budget("v2_prev", 1, key.provider_id, cancel_check)
+                    budget = qos.wait_for_ffmpeg_budget("v2_prev", 1, key.provider_id, cancel_check, source=key.source)
                 except Exception:
                     budget = None
 
@@ -978,12 +1047,25 @@ class ProgressiveStoryboardService:
                             fast=True,
                             process_key=p_key,
                             video_id=key.provider_id,
+                            source=key.source,
+                            generation=job_epoch,
                         )
                     except TypeError:
                         try:
-                            ok = _frame_extractor(preview_url, p_pts, p_out, timeout=5.0, fast=True)
+                            ok = _frame_extractor(
+                                preview_url,
+                                p_pts,
+                                p_out,
+                                timeout=5.0,
+                                fast=True,
+                                process_key=p_key,
+                                video_id=key.provider_id,
+                            )
                         except TypeError:
-                            ok = _frame_extractor(preview_url, p_pts, p_out)
+                            try:
+                                ok = _frame_extractor(preview_url, p_pts, p_out, timeout=5.0, fast=True)
+                            except TypeError:
+                                ok = _frame_extractor(preview_url, p_pts, p_out)
                     if ok and p_out.exists() and p_out.stat().st_size > 350:
                         extracted_preview.append((p_idx, p_out))
                 finally:
@@ -1028,9 +1110,10 @@ class ProgressiveStoryboardService:
             def extract_slot(s_idx: int) -> Tuple[int, float, Optional[Path]]:
                 if _worker_stop.is_set():
                     return s_idx, 0.0, None
+                job_epoch = lease_manager._epochs.get(key.as_string(), 1)
                 try:
                     import player_qos_runtime as qos
-                    if qos.is_hard_cancelled(key.provider_id):
+                    if qos.is_hard_cancelled(key.provider_id, source=key.source, generation=job_epoch):
                         return s_idx, 0.0, None
                 except Exception:
                     pass
@@ -1048,7 +1131,7 @@ class ProgressiveStoryboardService:
                     import player_qos_runtime as qos
                     def cancel_check():
                         return _worker_stop.is_set() or not has_live_lease(key.as_string(), source=key.source)
-                    budget = qos.wait_for_ffmpeg_budget("v2", 1, key.provider_id, cancel_check)
+                    budget = qos.wait_for_ffmpeg_budget("v2", 1, key.provider_id, cancel_check, source=key.source)
                 except Exception:
                     budget = None
 
@@ -1058,31 +1141,46 @@ class ProgressiveStoryboardService:
                 try:
                     if direct_url and direct_headers:
                         try:
-                            ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True, headers=direct_headers, process_key=p_key, video_id=key.provider_id)
+                            ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True, headers=direct_headers, process_key=p_key, video_id=key.provider_id, source=key.source, generation=job_epoch)
                         except TypeError:
                             try:
-                                ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True, headers=direct_headers)
+                                ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True, headers=direct_headers, process_key=p_key, video_id=key.provider_id)
                             except TypeError:
-                                ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True)
+                                try:
+                                    ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True, headers=direct_headers)
+                                except TypeError:
+                                    ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True)
                         if not ok and not _worker_stop.is_set():
                             # Fallback to accurate seek to avoid dropped/black keyframe seek failures
                             try:
-                                ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False, headers=direct_headers, process_key=p_key, video_id=key.provider_id)
+                                ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False, headers=direct_headers, process_key=p_key, video_id=key.provider_id, source=key.source, generation=job_epoch)
                             except TypeError:
                                 try:
-                                    ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False, headers=direct_headers)
+                                    ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False, headers=direct_headers, process_key=p_key, video_id=key.provider_id)
                                 except TypeError:
-                                    ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False)
+                                    try:
+                                        ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False, headers=direct_headers)
+                                    except TypeError:
+                                        ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False)
                     elif source_url:
                         try:
-                            ok = _frame_extractor(source_url, pts, f_out, timeout=8.0, fast=True, process_key=p_key, video_id=key.provider_id)
+                            ok = _frame_extractor(source_url, pts, f_out, timeout=8.0, fast=True, process_key=p_key, video_id=key.provider_id, source=key.source, generation=job_epoch)
                         except TypeError:
-                            ok = _frame_extractor(source_url, pts, f_out, timeout=8.0, fast=True)
+                            try:
+                                ok = _frame_extractor(source_url, pts, f_out, timeout=8.0, fast=True, process_key=p_key, video_id=key.provider_id)
+                            except TypeError:
+                                try:
+                                    ok = _frame_extractor(source_url, pts, f_out, timeout=8.0, fast=True)
+                                except TypeError:
+                                    ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False)
                         if not ok and not _worker_stop.is_set():
                             try:
-                                ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False, process_key=p_key, video_id=key.provider_id)
+                                ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False, process_key=p_key, video_id=key.provider_id, source=key.source, generation=job_epoch)
                             except TypeError:
-                                ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False)
+                                try:
+                                    ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False, process_key=p_key, video_id=key.provider_id)
+                                except TypeError:
+                                    ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False)
                 finally:
                     if budget is not None:
                         try:
