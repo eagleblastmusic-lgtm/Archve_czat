@@ -157,9 +157,13 @@ Zaimplementowano deterministyczny zestaw testów wyścigów w `audit/reproduce_f
 
 ## 8. Status GitHub Actions i Pull Request
 
-- **Pull Request:** [GitHub PR #7](https://github.com/eagleblastmusic-lgtm/Archve_czat/pull/7)
-- **Workflow:** `.github/workflows/ci.yml` (uruchomienie powiązane z PR #7, Run ID: `38049834568`)
-- **Status integracji:** Automatycznie weryfikowany w CI na platformach Linux i Windows.
+- **Pull Request:** [GitHub PR #7: fix(storyboard): final concurrency hardening, generation-safe cancellation, and lease protection](https://github.com/eagleblastmusic-lgtm/Archve_czat/pull/7)
+- **Workflow:** `.github/workflows/ci.yml` (uruchomienie powiązane z PR #7, Run ID: [38049874139](https://github.com/eagleblastmusic-lgtm/Archve_czat/actions/runs/38049874139))
+- **Status integracji:** **SUCCESS / ALL 4 JOBS PASSED (100% GREEN)**:
+  - `windows-python314` (ID 114206677096) — **SUCCESS** (1m25s)
+  - `windows-contracts` (ID 114206677179) — **SUCCESS** (1m25s)
+  - `browser-acceptance` (ID 114206677269) — **SUCCESS** (1m27s)
+  - `offline-regression` (ID 114206677281) — **SUCCESS** (1m10s)
 
 ---
 
