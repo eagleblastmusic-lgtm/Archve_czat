@@ -110,8 +110,8 @@ with fixture_directory("primary") as td:
     catalog.close()
 
 
-# Progressed profiles must be continued before fresh shallow profiles of the same
-# priority, otherwise a continuously growing discovery queue starves page 2+ forever.
+# Fair scheduling must alternate profiles of equal priority rather than
+# letting page 4, 5, 6... repeatedly starve a freshly discovered profile.
 class SelectionScraper:
     def __init__(self):
         self._cache = {}
@@ -147,7 +147,8 @@ with fixture_directory("selection") as td:
     )
     fake = SelectionScraper()
     assert deep.crawl_step(fake) is True
-    assert fake.profile_calls[0] == ('deep_model', 4), fake.profile_calls
+    assert deep.crawl_step(fake) is True
+    assert fake.profile_calls[:2] == [('shallow_model', 1), ('deep_model', 4)], fake.profile_calls
     deep.close()
     catalog.close()
 
