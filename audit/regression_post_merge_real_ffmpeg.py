@@ -3,10 +3,13 @@
 This covers real subprocess lifecycle in CI. End-user hover-to-frame latency
 on Windows with remote sources still requires manual/field measurements.
 """
+import sys
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import imageio_ffmpeg
 
