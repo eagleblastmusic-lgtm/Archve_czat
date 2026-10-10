@@ -438,6 +438,29 @@ class ConsumerLeaseManager:
 
 lease_manager = ConsumerLeaseManager()
 
+def prune_storyboard_cache_safely(max_bytes: int = 500 * 1024 * 1024) -> dict:
+    """Evict idle V2 video directories atomically while protecting live work.
+
+    Lock ordering: lease-manager lock -> storyboard build lock. No FFmpeg work
+    is performed while either lock is held. Existing root-level QUICK files
+    are also accounted for by the unified byte budget.
+    """
+    from cache_store import trim_storyboard_cache_directory
+
+    now = time.monotonic()
+    with lease_manager._lock:
+        with _lock:
+            active_keys = {
+                key for key, consumers in lease_manager._leases.items()
+                if any(rec.get("expires", 0.0) > now for rec in consumers.values())
+            }
+            active_keys.update(_active_builds.keys())
+            protected_dirs = {safe_cache_key(key) for key in active_keys}
+            return trim_storyboard_cache_directory(
+                STORYBOARD_CACHE_DIR, max_bytes=max_bytes, protected_dirs=protected_dirs
+            )
+
+
 
 def compute_bisection_order(num_slots: int) -> List[int]:
     """Return slot indices [0 .. num_slots-1] in van der Corput bisection order.
@@ -958,6 +981,11 @@ class ProgressiveStoryboardService:
                 with _lock:
                     _active_builds.pop(key_str, None)
                 _jobs_queue.task_done()
+                try:
+                    prune_storyboard_cache_safely()
+                except OSError:
+                    # Cache cleanup must never crash the worker.
+                    pass
 
     def _execute_build_job(self, job: dict) -> None:
         key: VideoKey = job["key"]
