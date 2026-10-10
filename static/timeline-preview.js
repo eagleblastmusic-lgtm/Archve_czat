@@ -91,6 +91,8 @@
       this.activeVideoKey = null;
       this.activeInstances = new Set();
       this.consumerId = 'tab_' + Math.random().toString(36).slice(2, 9) + '_' + Date.now().toString(36);
+      this.noProgressTimeoutMs = 90000;
+      this.maxBuildFailures = 3;
     }
 
     getOrCreateEntry(videoKey, source) {
@@ -105,6 +107,8 @@
           activeRev: 0,
           generation: 0,
           sessionId: null,
+          terminalFailure: false,
+          errorMessage: '',
           fetching: false,
           fetchPromise: null,
           controller: null,
@@ -168,6 +172,8 @@
         entry.fetching = false;
         entry.fetchPromise = null;
         entry.lifecycle = LIFECYCLE.CANCELLED;
+        entry.terminalFailure = false; // Explicit reopen is allowed to retry.
+        entry.errorMessage = '';
         if (entry.rafScheduled) {
           if (typeof cancelAnimationFrame === 'function') {
             cancelAnimationFrame(entry.rafScheduled);
@@ -387,6 +393,7 @@
       }
 
       // Exponential backoff check on error
+      if (entry.terminalFailure) return entry.manifest;
       if (entry.lifecycle === LIFECYCLE.ERROR) {
         const now = Date.now();
         const minWait = Math.min(30000, 2000 * Math.pow(2, entry.retryCount || 0));
@@ -410,18 +417,50 @@
       entry.fetchPromise = (async () => {
         let sinceRev = entry.manifest ? (entry.manifest.rev || 0) : 0;
         let failureCount = 0;
+        let buildFailures = 0;
+        let nextBuildAt = 0;
+        let lastProgressAt = Date.now();
+        let lastFrameCount = Number(entry.manifest?.frames?.length || 0)
+          + Number(entry.manifest?.native?.frames?.length || 0);
 
         try {
           const token = getMutationToken();
           const buildHeaders = token ? { 'X-Archivebate-Mutation-Token': token } : {};
-          fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}&consumer_id=${encodeURIComponent(this.consumerId)}&session_id=${encodeURIComponent(sessionId)}`, {
-            method: 'POST',
-            headers: buildHeaders,
-            signal: controller.signal,
-          }).catch(() => {});
+          const requestBuild = async () => {
+            try {
+              const response = await fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}&consumer_id=${encodeURIComponent(this.consumerId)}&session_id=${encodeURIComponent(sessionId)}`, {
+                method: 'POST', headers: buildHeaders, signal: controller.signal,
+              });
+              if (!response.ok) throw new Error('build_http_error');
+              const result = await response.json();
+              if (result?.build_status === 'terminal_error') {
+                entry.terminalFailure = true;
+                entry.errorMessage = 'Nie udało się rozpocząć generowania podglądu.';
+              } else if (result?.build_status === 'retryable_error') {
+                throw new Error(result.error_code || 'build_busy');
+              } else {
+                buildFailures = 0;
+              }
+            } catch (_) {
+              if (!controller.signal.aborted) {
+                buildFailures += 1;
+                nextBuildAt = Date.now() + Math.min(30000, 2000 * 2 ** Math.min(4, buildFailures));
+              }
+            }
+          };
+          void requestBuild();
 
           let loopIter = 0;
           while (!controller.signal.aborted && entry.generation === targetGeneration) {
+            if (entry.terminalFailure || buildFailures >= this.maxBuildFailures
+                || Date.now() - lastProgressAt > this.noProgressTimeoutMs) {
+              entry.lifecycle = LIFECYCLE.ERROR;
+              entry.terminalFailure = true;
+              entry.errorMessage ||= 'Podgląd niedostępny — generowanie nie zrobiło postępu.';
+              entry.lastErrorTime = Date.now();
+              entry.retryCount = 5;
+              break;
+            }
             loopIter++;
             if (loopIter % 4 === 0 && (!entry.manifest || !entry.manifest.complete)) {
               fetch(`/api/storyboard/v2/lease/renew?id=${encodeURIComponent(videoId)}&consumer_id=${encodeURIComponent(this.consumerId)}&session_id=${encodeURIComponent(sessionId)}&source=${encodeURIComponent(source || '')}`, {
@@ -430,12 +469,9 @@
                 signal: controller.signal,
               }).catch(() => {});
             }
-            if (loopIter % 8 === 0 && (!entry.manifest || !entry.manifest.complete)) {
-              fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}&consumer_id=${encodeURIComponent(this.consumerId)}&session_id=${encodeURIComponent(sessionId)}`, {
-                method: 'POST',
-                headers: buildHeaders,
-                signal: controller.signal,
-              }).catch(() => {});
+            if (loopIter % 8 === 0 && Date.now() >= nextBuildAt
+                && (!entry.manifest || !entry.manifest.complete)) {
+              void requestBuild();
             }
             const waitMs = sinceRev > 0 ? 1500 : 0;
             const url = `/api/storyboard/v2?id=${encodeURIComponent(videoId)}&duration=${duration}&since_rev=${sinceRev}&wait_ms=${waitMs}&source=${encodeURIComponent(source || '')}`;
@@ -456,6 +492,12 @@
               failureCount = 0;
               entry.retryCount = 0;
               const manifest = await resp.json();
+              const newFrameCount = Number(manifest?.frames?.length || 0)
+                + Number(manifest?.native?.frames?.length || 0);
+              if (newFrameCount > lastFrameCount) {
+                lastFrameCount = newFrameCount;
+                lastProgressAt = Date.now();
+              }
               if (manifest && (manifest.version === 11 || manifest.version === 12) && entry.generation === targetGeneration) {
                 const manifestRev = Number(manifest.rev || 0);
                 if (manifestRev >= (entry.activeRev || 0)) {
@@ -487,6 +529,12 @@
                   entry.lifecycle = LIFECYCLE.COMPLETE;
                   break;
                 }
+              }
+              // Bound empty-manifest polling even when the server responds 200
+              // immediately (rev 1 > since_rev 0).
+              if (sinceRev === 0) {
+                await new Promise(resolve => setTimeout(resolve, 250));
+              }
               }
             } catch (err) {
               if (controller.signal.aborted || entry.generation !== targetGeneration) {
@@ -662,6 +710,10 @@
         }
       }
 
+      if (statusEl && entry?.terminalFailure) {
+        statusEl.textContent = entry.errorMessage || 'Podgląd chwilowo niedostępny.';
+        statusEl.style.display = 'block';
+      }
       return false;
     }
 
