@@ -38,6 +38,12 @@ def main():
         return
 
     db = ROOT / "audit" / f"isolated_grouped_fast_{os.getpid()}.db"
+    for p in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
     svc = CatalogService(db_path=db, page_size=20)
     try:
         now = time.time()
@@ -150,6 +156,12 @@ def main():
             svc.close()
         except Exception:
             pass
+        for p in (db, db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+            if p.exists():
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
 
     print("PASS V4.3 GROUPED FEED V2")
 

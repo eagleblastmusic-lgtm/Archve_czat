@@ -2559,9 +2559,8 @@ def storyboard_v2_manifest(
     source: Optional[str] = Query(None),
 ):
     """Manifest v2 dla progresywnego storyboardu w siatce 10x10."""
-    from timeline_storyboard import progressive_storyboard_service, record_lease
+    from timeline_storyboard import progressive_storyboard_service
     clean_id = _resolve_clean_video_id(id)
-    record_lease(clean_id, duration=120.0, source=source)
     if wait_ms > 0:
         return progressive_storyboard_service.wait_manifest(
             clean_id,
@@ -2582,6 +2581,8 @@ def storyboard_v2_build(
     id: str = Query(..., min_length=1),
     duration: float = Query(..., gt=0, le=43200),
     source: Optional[str] = Query(None),
+    consumer_id: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
     request: Request = None,
 ):
     """Uruchamia lub wznawia generowanie arkuszy 10x10 v2 z bisekcją van der Corputa."""
@@ -2609,17 +2610,88 @@ def storyboard_v2_build(
     else:
         source_url = f"{base}/api/video/stream?id={requests.utils.quote(clean_id)}&owner=storyboard&priority=low&reason=storyboard"
 
+    preview_url = (
+        f"{base}/api/video/stream?url={requests.utils.quote(preview, safe='')}&owner=storyboard&priority=low&reason=storyboard"
+        if preview else None
+    )
+
     return progressive_storyboard_service.request_build(
         clean_id,
         duration,
         source_url=source_url,
         source=source,
-        preview_url=preview or None,
+        preview_url=preview_url,
         native_prefix=native_prefix,
         native_count=native_count,
         direct_url=direct or None,
         embed_url=embed or None,
+        consumer_id=consumer_id,
+        session_id=session_id,
     )
+
+
+@app.post("/api/storyboard/v2/lease/acquire")
+def storyboard_v2_lease_acquire(
+    id: str = Query(..., min_length=1),
+    consumer_id: Optional[str] = Query(None),
+    duration: float = Query(30.0, gt=0, le=3600),
+    source: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+):
+    from timeline_storyboard import acquire_lease
+    clean_id = _resolve_clean_video_id(id)
+    res = acquire_lease(clean_id, consumer_id=consumer_id, duration=duration, source=source, session_id=session_id)
+    return {
+        "ok": res.ok,
+        "epoch": res.epoch,
+        "active_consumers": res.active_count,
+        "consumer_id": res.consumer_id,
+        "session_id": res.session_id,
+    }
+
+
+@app.post("/api/storyboard/v2/lease/renew")
+def storyboard_v2_lease_renew(
+    id: str = Query(..., min_length=1),
+    consumer_id: str = Query(..., min_length=1),
+    duration: float = Query(30.0, gt=0, le=3600),
+    source: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+    epoch: Optional[int] = Query(None),
+):
+    from timeline_storyboard import renew_lease
+    clean_id = _resolve_clean_video_id(id)
+    ok, count = renew_lease(clean_id, consumer_id=consumer_id, duration=duration, source=source, session_id=session_id, epoch=epoch)
+    return {"ok": ok, "active_consumers": count}
+
+
+@app.post("/api/storyboard/v2/lease/release")
+def storyboard_v2_lease_release(
+    id: str = Query(..., min_length=1),
+    consumer_id: str = Query(..., min_length=1),
+    source: Optional[str] = Query(None),
+    reason: str = Query("release"),
+    session_id: Optional[str] = Query(None),
+    epoch: Optional[int] = Query(None),
+):
+    from timeline_storyboard import release_lease
+    clean_id = _resolve_clean_video_id(id)
+    was_present, remaining = release_lease(
+        clean_id,
+        consumer_id=consumer_id,
+        source=source,
+        reason=reason,
+        session_id=session_id,
+        epoch=epoch,
+    )
+    return {"ok": True, "was_present": was_present, "remaining_consumers": remaining}
+
+
+@app.get("/api/storyboard/v2/lease/diagnostics")
+def storyboard_v2_lease_diagnostics(id: Optional[str] = Query(None), source: Optional[str] = Query(None)):
+    from timeline_storyboard import lease_manager, resolve_video_key
+    key = resolve_video_key(_resolve_clean_video_id(id), source=source) if id else None
+    return {"ok": True, "diagnostics": lease_manager.diagnostic_snapshot(key)}
 
 
 @app.get("/api/storyboard/v2/sheet")
@@ -2633,13 +2705,58 @@ def storyboard_v2_sheet(
     from timeline_storyboard import resolve_video_key, get_sheet_path
     clean_id = _resolve_clean_video_id(id)
     key = resolve_video_key(clean_id, source=source)
-    path = get_sheet_path(key, sheet)
+
+    rev_int = None
+    if v is not None:
+        try:
+            rev_int = int(v)
+        except (ValueError, TypeError):
+            rev_int = None
+
+    path = None
+    if rev_int is not None and rev_int > 0:
+        rev_path = get_sheet_path(key, sheet, rev=rev_int)
+        if rev_path.exists():
+            path = rev_path
+        else:
+            raise HTTPException(status_code=404, detail="Żądana rewizja arkusza storyboardu v2 nie istnieje")
+    else:
+        path = get_sheet_path(key, sheet)
+
     if not path or not path.exists():
         raise HTTPException(status_code=404, detail="Arkusz storyboardu v2 nie jest jeszcze gotowy")
+
+    # Gdy żądana jest konkretna wersja v, plik rewizji jest niezmienny (immutable).
+    # Dla odwołań bez wersji stosujemy walidację cache.
+    cache_control = (
+        "public, max-age=31536000, immutable"
+        if (rev_int is not None and path.name.endswith(f"_r{rev_int}.jpg"))
+        else "no-cache, must-revalidate"
+    )
     return FileResponse(
         str(path),
         media_type="image/jpeg",
-        headers={"Cache-Control": "public, max-age=31536000, immutable", "Access-Control-Allow-Origin": "*"},
+        headers={"Cache-Control": cache_control},
+    )
+
+
+@app.get("/api/storyboard/v2/preview")
+def storyboard_v2_preview(
+    id: str = Query(..., min_length=1),
+    idx: int = Query(0, ge=0),
+    source: Optional[str] = Query(None),
+):
+    """Zwraca klatkę wyekstrahowaną z lekkiego preview video (Layer 0)."""
+    from timeline_storyboard import resolve_video_key, get_preview_frame_path
+    clean_id = _resolve_clean_video_id(id)
+    key = resolve_video_key(clean_id, source=source)
+    path = get_preview_frame_path(key, idx)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Klatka preview nie istnieje")
+    return FileResponse(
+        str(path),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 

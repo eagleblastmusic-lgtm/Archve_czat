@@ -537,7 +537,9 @@
 
         // Cached/local presentation stays immediate. Uncached EXACT is only the
         // latest idle target; pointer churn never directly starts backend work.
-        ensureInteractiveCoarse(videoId, duration);
+        if (!globalThis.ArchivebateTimelinePreview) {
+          ensureInteractiveCoarse(videoId, duration);
+        }
         return scheduleIdleExact(normalized, mainVideo);
       };
       storyboard.__v452PlayerQoSCoordinator = true;
@@ -615,7 +617,9 @@
         }
       }
 
-      ensureInteractiveCoarse(videoId, duration);
+      if (!globalThis.ArchivebateTimelinePreview) {
+        ensureInteractiveCoarse(videoId, duration);
+      }
       showPosterFallback(state);
     }
 
@@ -630,6 +634,7 @@
     }
 
     function schedulePrewarm(delay = PREWARM_DELAY_MS) {
+      if (globalThis.ArchivebateTimelinePreview) return;
       if (storyboard.SAMPLE_INTERVAL >= 10) return;
       if (prewarmTimer) clearTimeout(prewarmTimer);
       prewarmTimer = setTimeout(() => {

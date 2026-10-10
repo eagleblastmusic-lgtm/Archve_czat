@@ -33,10 +33,11 @@ from cache_store import (
     read_json_cache,
     safe_cache_key,
 )
+from urllib.parse import urlparse
 from video_identity import VideoKey
 
 # Architecture constants
-STORYBOARD_V2_VERSION = 11
+STORYBOARD_V2_VERSION = 12
 FRAME_WIDTH = 160
 FRAME_HEIGHT = 90
 COLUMNS_PER_SHEET = 10
@@ -49,14 +50,393 @@ MILESTONES = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 80, 100)
 V2_CACHE_DIR = Path(STORYBOARD_CACHE_DIR) / "v2"
 V2_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def is_safe_ffmpeg_input_url(url: Optional[str]) -> bool:
+    """Validate that input URL for FFmpeg is safe against SSRF, internal network scanning,
+    file:// access, loopback bypass, and header/protocol smuggling.
+
+    Direct unproxied remote URLs are rejected because FFmpeg automatically follows HTTP
+    redirects and resolves DNS without peer IP validation, which exposes private networks
+    to SSRF and DNS rebinding. All remote streams must be routed through /api/video/stream.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    clean = url.strip()
+    if "\r" in clean or "\n" in clean or "\0" in clean:
+        return False
+    try:
+        p = Path(clean)
+        if p.is_file() and p.exists() and not clean.startswith("file:"):
+            return True
+    except Exception:
+        pass
+    try:
+        parsed = urlparse(clean)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+        if host in ("127.0.0.1", "localhost"):
+            # Only trusted local video stream endpoint on local server port is permitted on loopback
+            try:
+                server_port = int(os.getenv("PORT", "8000"))
+            except Exception:
+                server_port = 8000
+            url_port = parsed.port or (80 if parsed.scheme == "http" else 443)
+            if url_port != server_port:
+                return False
+            clean_path = parsed.path.rstrip("/")
+            return clean_path == "/api/video/stream"
+        return False
+    except Exception:
+        return False
+
 _lock = threading.RLock()
 _state_condition = threading.Condition(_lock)
 _active_builds: Dict[str, dict] = {}
 _jobs_queue: Queue = Queue(maxsize=128)
 _worker_thread: Optional[threading.Thread] = None
 _worker_stop = threading.Event()
-_live_leases: Dict[str, float] = {}  # key -> expires_monotonic
 LEASE_DURATION_SECONDS = 120.0
+
+
+class AcquireResult(tuple):
+    """Result of lease acquisition, backwards-compatible with 4-tuple while carrying session_id."""
+    def __new__(cls, ok: bool, epoch: int, active_count: int, consumer_id: str, session_id: str = ""):
+        inst = super().__new__(cls, (ok, epoch, active_count, consumer_id))
+        inst.ok = ok
+        inst.epoch = epoch
+        inst.active_count = active_count
+        inst.consumer_id = consumer_id
+        inst.session_id = session_id
+        return inst
+
+
+def _extract_session_seq(session_id: Optional[str]) -> Optional[int]:
+    if not session_id:
+        return None
+    import re
+    m = re.search(r"_s(\d+)$", str(session_id).strip())
+    if m:
+        try:
+            return int(m.group(1))
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+class ConsumerLeaseManager:
+    """Manages active consumers, heartbeats, session generations, and automatic pruning per VideoKey."""
+
+    def __init__(self, default_duration: float = LEASE_DURATION_SECONDS, max_tracked_keys: int = 1000):
+        self._lock = threading.Lock()
+        # key_str -> {consumer_id: {"expires": float, "session_id": str, "epoch": int, "seq": Optional[int]}}
+        self._leases: Dict[str, Dict[str, dict]] = {}
+        # key_str -> epoch counter
+        self._epochs: Dict[str, int] = {}
+        # key_str -> {consumer_id: list[str]} (recent retired session_ids)
+        self._retired_sessions: Dict[str, Dict[str, list[str]]] = {}
+        self.default_duration = max(5.0, float(default_duration))
+        self.max_tracked_keys = max_tracked_keys
+        self._last_prune = time.monotonic()
+
+    def _prune_expired_locked(self, now: float) -> None:
+        if now - self._last_prune < 5.0 and len(self._leases) < self.max_tracked_keys:
+            return
+        self._last_prune = now
+        expired_keys = []
+        for key_str, consumers in list(self._leases.items()):
+            active = {cid: rec for cid, rec in consumers.items() if rec.get("expires", 0.0) > now}
+            if active:
+                self._leases[key_str] = active
+            else:
+                expired_keys.append(key_str)
+        for k in expired_keys:
+            self._leases.pop(k, None)
+            # NOTE: Do NOT pop _epochs[k] or _retired_sessions[k] upon lease expiration!
+            # Doing so resets the monotonic epoch counter back to 1, desynchronizing with
+            # player_qos_runtime and breaking future cancellations / session fencing.
+            # Only prune _epochs / _retired_sessions when capacity limit max_tracked_keys is exceeded!
+
+        # Bounded capacity management: prune inactive epochs/retired_sessions when capacity limit is reached
+        if len(self._epochs) >= self.max_tracked_keys:
+            active_set = set(self._leases.keys())
+            removable = [k for k in self._epochs if k not in active_set]
+            excess = max(1, len(self._epochs) - self.max_tracked_keys + 1)
+            to_remove = removable[:excess]
+            for k in to_remove:
+                self._epochs.pop(k, None)
+                self._retired_sessions.pop(k, None)
+                try:
+                    import player_qos_runtime as qos
+                    qos.evict_video_key(k)
+                except Exception:
+                    pass
+
+    def acquire(
+        self,
+        key: VideoKey,
+        consumer_id: Optional[str] = None,
+        duration: Optional[float] = None,
+        session_id: Optional[str] = None,
+    ) -> AcquireResult:
+        now = time.monotonic()
+        cid = str(consumer_id or "").strip()
+        if not cid:
+            import secrets
+            cid = f"c_{secrets.token_hex(6)}_{int(now * 1000)}"
+
+        has_explicit_sid = bool(session_id and str(session_id).strip())
+        sid = str(session_id or "").strip()
+        if not sid:
+            sid = f"{cid}_s1"
+
+        dur = max(0.05, float(duration if duration is not None else self.default_duration))
+        expires = now + dur
+        key_str = key.as_string()
+
+        with self._lock:
+            self._prune_expired_locked(now)
+
+            # Capacity overload check: do NOT evict active leases!
+            if key_str not in self._leases and len(self._leases) >= self.max_tracked_keys:
+                return AcquireResult(False, 0, 0, cid, sid)
+
+            if key_str not in self._leases:
+                self._leases[key_str] = {}
+            if key_str not in self._retired_sessions:
+                self._retired_sessions[key_str] = {}
+
+            retired_for_cid = self._retired_sessions[key_str].setdefault(cid, [])
+            rec = self._leases[key_str].get(cid)
+
+            new_seq = _extract_session_seq(sid)
+            existing_seq = _extract_session_seq(rec.get("session_id")) if rec else None
+
+            # 1. Stale check: is this session_id already retired?
+            if sid in retired_for_cid:
+                epoch = self._epochs.get(key_str, 1)
+                active_count = sum(1 for r in self._leases[key_str].values() if r.get("expires", 0.0) > now)
+                return AcquireResult(False, epoch, active_count, cid, rec.get("session_id", sid) if rec else sid)
+
+            # 2. Monotonic sequence check if both have _s(\d+)
+            if new_seq is not None and existing_seq is not None and new_seq < existing_seq:
+                epoch = self._epochs.get(key_str, 1)
+                active_count = sum(1 for r in self._leases[key_str].values() if r.get("expires", 0.0) > now)
+                return AcquireResult(False, epoch, active_count, cid, rec.get("session_id", sid) if rec else sid)
+
+            # 3. Transition to new session for the same consumer
+            if rec is not None and rec.get("session_id") != sid:
+                old_sid = rec.get("session_id")
+                if old_sid:
+                    retired_for_cid.append(old_sid)
+                    if len(retired_for_cid) > 20:
+                        retired_for_cid.pop(0)
+
+            has_live = any(r.get("expires", 0.0) > now for r in self._leases[key_str].values())
+            if not has_live or (rec is not None and rec.get("session_id") != sid):
+                qos_gen = 0
+                try:
+                    import player_qos_runtime as qos
+                    qos_gen = qos.get_active_generation(key.provider_id, source=key.source)
+                except Exception:
+                    pass
+                base_gen = max(self._epochs.get(key_str, 0), qos_gen)
+                self._epochs[key_str] = base_gen + 1
+            epoch = self._epochs.setdefault(key_str, 1)
+
+            self._leases[key_str][cid] = {
+                "expires": expires,
+                "session_id": sid,
+                "is_explicit": has_explicit_sid,
+                "epoch": epoch,
+                "seq": new_seq,
+            }
+            active_count = sum(1 for rec in self._leases[key_str].values() if rec.get("expires", 0.0) > now)
+
+        try:
+            import player_qos_runtime as qos
+            qos.clear_cancel_state(key.provider_id, source=key.source, generation=epoch)
+        except Exception:
+            pass
+
+        return AcquireResult(True, epoch, active_count, cid, sid)
+
+    def renew(
+        self,
+        key: VideoKey,
+        consumer_id: str,
+        duration: Optional[float] = None,
+        session_id: Optional[str] = None,
+        epoch: Optional[int] = None,
+    ) -> Tuple[bool, int]:
+        now = time.monotonic()
+        cid = str(consumer_id or "").strip()
+        if not cid:
+            return False, 0
+        dur = max(0.05, float(duration if duration is not None else self.default_duration))
+        key_str = key.as_string()
+
+        with self._lock:
+            consumers = self._leases.get(key_str)
+            if not consumers:
+                return False, 0
+            rec = consumers.get(cid)
+            if not rec:
+                return False, 0
+
+            # 1. Reject if already expired - do NOT resurrect expired leases!
+            if rec.get("expires", 0.0) <= now:
+                consumers.pop(cid, None)
+                if not any(r.get("expires", 0.0) > now for r in consumers.values()):
+                    self._leases.pop(key_str, None)
+                return False, 0
+
+            # 2. Reject if wrong session generation or retired
+            if session_id:
+                clean_sid = str(session_id).strip()
+                if rec.get("session_id") != clean_sid:
+                    return False, 0
+                retired = self._retired_sessions.get(key_str, {}).get(cid, [])
+                if clean_sid in retired:
+                    return False, 0
+            elif rec.get("is_explicit"):
+                return False, 0
+
+            # 3. Reject if stale epoch
+            if epoch is not None and rec.get("epoch", 0) > int(epoch):
+                return False, 0
+
+            rec["expires"] = now + dur
+            active_count = sum(1 for r in consumers.values() if r.get("expires", 0.0) > now)
+            return True, active_count
+
+    def release(
+        self,
+        key: VideoKey,
+        consumer_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        epoch: Optional[int] = None,
+        reason: str = "client_release",
+    ) -> Tuple[bool, int]:
+        now = time.monotonic()
+        key_str = key.as_string()
+        cid = str(consumer_id or "").strip() if consumer_id else None
+        sid = str(session_id or "").strip() if session_id else None
+        should_cancel = False
+        cancel_generation = None
+
+        with self._lock:
+            consumers = self._leases.get(key_str)
+            if consumers is None:
+                return False, 0
+
+            was_present = False
+            if cid is None:
+                was_present = bool(consumers)
+                self._leases.pop(key_str, None)
+                remaining = 0
+                should_cancel = was_present
+                cancel_generation = self._epochs.get(key_str, 0)
+            else:
+                rec = consumers.get(cid)
+                if rec is not None:
+                    # Protection against unscoped or stale releases:
+                    # If the lease has an explicit session_id, an unscoped release (sid is None) MUST NOT delete it!
+                    if rec.get("is_explicit") and not sid:
+                        was_present = False
+                    elif sid and rec.get("session_id") != sid:
+                        was_present = False
+                    elif epoch is not None and rec.get("epoch", 0) > int(epoch):
+                        was_present = False
+                    else:
+                        consumers.pop(cid, None)
+                        was_present = True
+                        if sid:
+                            retired = self._retired_sessions.setdefault(key_str, {}).setdefault(cid, [])
+                            retired.append(sid)
+                            if len(retired) > 20:
+                                retired.pop(0)
+
+                active = {c: r for c, r in consumers.items() if r.get("expires", 0.0) > now}
+                if active:
+                    self._leases[key_str] = active
+                    remaining = len(active)
+                else:
+                    self._leases.pop(key_str, None)
+                    remaining = 0
+
+                should_cancel = was_present and (remaining == 0)
+                if should_cancel:
+                    cancel_generation = self._epochs.get(key_str, 0)
+
+        # Trigger generation-fenced hard_cancel outside self._lock to avoid lock inversion or deadlocks
+        if should_cancel:
+            try:
+                import player_qos_runtime as qos
+                qos.hard_cancel(key.provider_id, source=key.source, reason=reason, clear_lease=False, generation=cancel_generation)
+            except Exception:
+                pass
+
+        return was_present, remaining
+
+    def has_live_lease(self, key: VideoKey | str, source: str | None = None) -> bool:
+        if isinstance(key, str):
+            key = resolve_video_key(key, source=source)
+        now = time.monotonic()
+        key_str = key.as_string()
+        with self._lock:
+            consumers = self._leases.get(key_str)
+            if not consumers:
+                return False
+            return any(rec.get("expires", 0.0) > now for rec in consumers.values())
+
+    def get_active_consumers_count(self, key: VideoKey | str, source: str | None = None) -> int:
+        if isinstance(key, str):
+            key = resolve_video_key(key, source=source)
+        now = time.monotonic()
+        key_str = key.as_string()
+        with self._lock:
+            consumers = self._leases.get(key_str)
+            if not consumers:
+                return 0
+            return sum(1 for rec in consumers.values() if rec.get("expires", 0.0) > now)
+
+    def diagnostic_snapshot(self, key: Optional[VideoKey] = None) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            if key is not None:
+                key_str = key.as_string()
+                consumers = self._leases.get(key_str, {})
+                active = {
+                    cid: {
+                        "ttl": round(max(0.0, rec.get("expires", 0.0) - now), 2),
+                        "session_id": rec.get("session_id"),
+                        "epoch": rec.get("epoch"),
+                    }
+                    for cid, rec in consumers.items()
+                    if rec.get("expires", 0.0) > now
+                }
+                return {
+                    "key": key_str,
+                    "active_consumers_count": len(active),
+                    "epoch": self._epochs.get(key_str, 0),
+                    "consumers": list(active.keys()),
+                    "details": active,
+                }
+            result = {}
+            for k, consumers in list(self._leases.items()):
+                active_count = sum(1 for rec in consumers.values() if rec.get("expires", 0.0) > now)
+                if active_count > 0:
+                    result[k] = {
+                        "active_consumers": active_count,
+                        "epoch": self._epochs.get(k, 0),
+                    }
+            return result
+
+
+lease_manager = ConsumerLeaseManager()
 
 
 def compute_bisection_order(num_slots: int) -> List[int]:
@@ -91,56 +471,29 @@ def compute_bisection_order(num_slots: int) -> List[int]:
 
 
 def compute_progressive_schedule(duration: float, total_slots: int) -> List[int]:
-    """Compute extraction slot sequence: Layer 0 (1 frame / 1 min) first, then densification."""
+    """Compute extraction slot sequence in van der Corput bisection order across entire duration."""
     if total_slots <= 0:
         return []
-    if total_slots <= 2 or duration < 60.0:
-        return compute_bisection_order(total_slots)
-
-    # Layer 0: 1-minute milestones arranged in bisection order so initial batches
-    # immediately span the whole duration (e.g., minute 0, last minute, middle minute...)
-    num_minutes = min(total_slots, max(1, int(math.ceil(duration / 60.0))))
-    bisect_indices = compute_bisection_order(num_minutes)
-    layer_0_order = [bisect_indices[i] for i in range(len(bisect_indices))]
-
-    # Layer 1 (Densification): remaining slots in bisection order
-    remaining_sorted = [s for s in range(num_minutes, total_slots)]
-    if remaining_sorted:
-        rem_indices = compute_bisection_order(len(remaining_sorted))
-        remaining_order = [remaining_sorted[i] for i in rem_indices]
-    else:
-        remaining_order = []
-
-    return layer_0_order + remaining_order
+    return compute_bisection_order(total_slots)
 
 
 def get_slot_pts_mapping(duration: float, total_slots: int) -> Dict[int, float]:
-    """Return map of slot index -> exact target PTS seconds."""
+    """Return map of slot index -> exact target PTS seconds spanning 100% of duration."""
     mapping: Dict[int, float] = {}
-    if duration < 60.0:
-        step = duration / max(1, total_slots)
-        for s in range(total_slots):
-            mapping[s] = round(s * step, 3)
+    if total_slots <= 0:
+        return mapping
+    if total_slots == 1:
+        mapping[0] = 0.0
         return mapping
 
-    num_minutes = min(total_slots, max(1, int(math.ceil(duration / 60.0))))
-    for m in range(num_minutes):
-        pts = 0.0 if m == 0 else min(duration - 0.5, float(m * 60.0))
-        mapping[m] = round(pts, 3)
+    clean_dur = max(0.1, float(duration))
+    # Margines bezpieczeństwa od końca pliku chroniący przed błędami dekodera EOF
+    end_margin = min(1.0, clean_dur * 0.01) if clean_dur > 2.0 else 0.0
+    end_pts = max(0.0, clean_dur - end_margin)
 
-    # Remaining slots (if any) used for densification:
-    remaining_count = total_slots - num_minutes
-    if remaining_count > 0:
-        half_minutes = []
-        for m in range(num_minutes):
-            t = m * 60.0 + 30.0
-            if t < duration - 10.0:
-                half_minutes.append(round(t, 3))
-        for i, s in enumerate(range(num_minutes, total_slots)):
-            if i < len(half_minutes):
-                mapping[s] = half_minutes[i]
-            else:
-                mapping[s] = round((s / max(1, total_slots)) * duration, 3)
+    step = end_pts / max(1, total_slots - 1)
+    for s in range(total_slots):
+        mapping[s] = round(min(end_pts, s * step), 3)
 
     return mapping
 
@@ -173,27 +526,83 @@ def get_manifest_path(key: VideoKey) -> Path:
     return get_cache_dir_for_key(key) / "manifest.json"
 
 
-def get_sheet_path(key: VideoKey, sheet_index: int) -> Path:
+def get_sheet_path(key: VideoKey, sheet_index: int, rev: Optional[int] = None) -> Path:
+    if rev is not None and int(rev) > 0:
+        return get_cache_dir_for_key(key) / f"sheet_{int(sheet_index)}_r{int(rev)}.jpg"
     return get_cache_dir_for_key(key) / f"sheet_{int(sheet_index)}.jpg"
 
 
-def record_lease(video_id: str, duration: float = LEASE_DURATION_SECONDS, source: Optional[str] = None) -> None:
-    key_str = resolve_video_key(video_id, source=source).as_string()
-    with _lock:
-        _live_leases[key_str] = time.monotonic() + max(1.0, float(duration))
+def get_preview_frame_path(key: VideoKey, index: int) -> Path:
+    return get_cache_dir_for_key(key) / "preview" / f"frame_{int(index)}.jpg"
+
+
+def acquire_lease(
+    video_id: str,
+    consumer_id: Optional[str] = None,
+    duration: float = LEASE_DURATION_SECONDS,
+    source: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> AcquireResult:
+    key = resolve_video_key(video_id, source=source)
+    return lease_manager.acquire(key, consumer_id=consumer_id, duration=duration, session_id=session_id)
+
+
+def renew_lease(
+    video_id: str,
+    consumer_id: str,
+    duration: float = LEASE_DURATION_SECONDS,
+    source: Optional[str] = None,
+    session_id: Optional[str] = None,
+    epoch: Optional[int] = None,
+) -> Tuple[bool, int]:
+    key = resolve_video_key(video_id, source=source)
+    return lease_manager.renew(key, consumer_id=consumer_id, duration=duration, session_id=session_id, epoch=epoch)
+
+
+def release_lease(
+    video_id: str,
+    consumer_id: Optional[str] = None,
+    source: Optional[str] = None,
+    reason: str = "client_release",
+    session_id: Optional[str] = None,
+    epoch: Optional[int] = None,
+) -> Tuple[bool, int]:
+    key = resolve_video_key(video_id, source=source)
+    return lease_manager.release(key, consumer_id=consumer_id, session_id=session_id, epoch=epoch, reason=reason)
+
+
+def record_lease(
+    video_id: str,
+    duration: float = LEASE_DURATION_SECONDS,
+    source: Optional[str] = None,
+    clear_cancel: bool = True,
+    consumer_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> None:
+    key = resolve_video_key(video_id, source=source)
+    try:
+        import player_qos_runtime as qos
+        if qos.is_hard_cancelled(key.provider_id, source=key.source):
+            if not clear_cancel:
+                return  # Do not resurrect or renew lease on passive/stale request for hard-cancelled video
+    except Exception:
+        pass
+    lease_manager.acquire(key, consumer_id=consumer_id or "legacy_default", duration=duration, session_id=session_id)
 
 
 def has_live_lease(video_id: str, source: Optional[str] = None) -> bool:
-    key_str = resolve_video_key(video_id, source=source).as_string()
-    with _lock:
-        expiry = _live_leases.get(key_str, 0.0)
-        return expiry > time.monotonic()
+    key = resolve_video_key(video_id, source=source)
+    return lease_manager.has_live_lease(key)
+
+
+def get_active_consumers_count(video_id: Any, source: Optional[str] = None) -> int:
+    key = resolve_video_key(video_id, source=source)
+    return lease_manager.get_active_consumers_count(key)
 
 
 def remove_lease(video_id: str, source: Optional[str] = None) -> None:
-    key_str = resolve_video_key(video_id, source=source).as_string()
-    with _lock:
-        _live_leases.pop(key_str, None)
+    key = resolve_video_key(video_id, source=source)
+    lease_manager.release(key, consumer_id=None, reason="remove_lease")
 
 
 def _default_extract_frame(
@@ -204,8 +613,15 @@ def _default_extract_frame(
     timeout: float = 8.0,
     fast: bool = True,
     headers: Optional[Dict[str, str]] = None,
+    process_key: Optional[str] = None,
+    video_id: Optional[str] = None,
+    source: Optional[str] = None,
+    generation: Optional[int] = None,
 ) -> bool:
-    """Extract a single frame to out_path using imageio-ffmpeg."""
+    """Extract a single frame to out_path using imageio-ffmpeg with QoS process lifecycle."""
+    if not is_safe_ffmpeg_input_url(source_url):
+        return False
+
     try:
         ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
@@ -218,8 +634,14 @@ def _default_extract_frame(
         "-nostdin",
     ]
     if headers:
-        header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-        cmd += ["-headers", header_str]
+        clean_headers = {
+            str(k).strip(): str(v).strip()
+            for k, v in headers.items()
+            if "\r" not in str(k) and "\n" not in str(k) and "\r" not in str(v) and "\n" not in str(v)
+        }
+        if clean_headers:
+            header_str = "".join(f"{k}: {v}\r\n" for k, v in clean_headers.items())
+            cmd += ["-headers", header_str]
 
     cmd += ["-ss", f"{target_time:.3f}"]
     if fast:
@@ -232,6 +654,7 @@ def _default_extract_frame(
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "2",
+            "-protocol_whitelist", "http,https,tcp,tls",
         ]
     cmd += [
         "-i", source_url,
@@ -246,9 +669,34 @@ def _default_extract_frame(
         "-y", str(out_path),
     ]
 
+    p_key = process_key or f"v2_{video_id or 'anon'}_{target_time}_{time.monotonic()}"
+    proc = None
     try:
-        res = subprocess.run(cmd, timeout=timeout, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        if res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 350:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            import player_qos_runtime as qos
+            qos.register_v2_process(p_key, proc, video_id, source=source, generation=generation)
+        except Exception:
+            pass
+
+        try:
+            _, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if proc is not None and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            return False
+
+        if proc.returncode == 0 and out_path.exists() and out_path.stat().st_size > 350:
             if fast:
                 try:
                     with Image.open(out_path) as im:
@@ -262,6 +710,23 @@ def _default_extract_frame(
         return False
     except Exception:
         return False
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        pass
+            try:
+                import player_qos_runtime as qos
+                qos.unregister_v2_process(p_key)
+            except Exception:
+                pass
 
 
 # Extractor hook replaceable in tests
@@ -309,8 +774,24 @@ class ProgressiveStoryboardService:
         key = resolve_video_key(video_id, source=source)
         manifest_path = get_manifest_path(key)
         data, _ = read_json_cache(manifest_path)
-        if isinstance(data, dict) and data.get("version") == STORYBOARD_V2_VERSION:
-            return data
+        if isinstance(data, dict):
+            if data.get("version") == STORYBOARD_V2_VERSION:
+                return data
+            elif data.get("version") == 11:
+                clean_duration = max(1.0, float(duration or data.get("duration") or 0.0))
+                is_safe_migration = (
+                    clean_duration <= 6000.0
+                    and len(data.get("frames", [])) >= 10
+                    and data.get("complete") is True
+                )
+                if is_safe_migration:
+                    data["version"] = STORYBOARD_V2_VERSION
+                    atomic_write_json(manifest_path, data)
+                    return data
+                data["version"] = STORYBOARD_V2_VERSION
+                data["complete"] = False
+                atomic_write_json(manifest_path, data)
+                return data
 
         # Generate provisional initial Layer 0 manifest
         clean_duration = max(1.0, float(duration or 0.0))
@@ -328,10 +809,29 @@ class ProgressiveStoryboardService:
                 ] if prefix else [],
             }
         elif preview_video:
+            preview_dir = get_cache_dir_for_key(key) / "preview"
+            preview_frames = []
+            if preview_dir.exists():
+                existing_p_files = sorted(preview_dir.glob("frame_*.jpg"))
+                parsed_entries = []
+                for p_file in existing_p_files:
+                    try:
+                        num = int(p_file.stem.split("_")[1])
+                        parsed_entries.append((num, p_file))
+                    except Exception:
+                        continue
+                parsed_entries.sort(key=lambda x: x[0])
+                p_count = len(parsed_entries)
+                for rank, (act_idx, p_file) in enumerate(parsed_entries):
+                    preview_frames.append([
+                        round(rank * (clean_duration / max(1, p_count)), 3),
+                        f"/api/storyboard/v2/preview?id={key.provider_id}&idx={act_idx}&source={key.source}",
+                    ])
             native_info = {
                 "kind": "preview_video",
                 "url": preview_video,
-                "frames": [],
+                "count": len(preview_frames),
+                "frames": preview_frames,
             }
 
         provisional = {
@@ -389,9 +889,14 @@ class ProgressiveStoryboardService:
         native_count: Optional[int] = None,
         direct_url: Optional[str] = None,
         embed_url: Optional[str] = None,
+        consumer_id: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> dict:
         key = resolve_video_key(video_id, source=source)
-        record_lease(key.as_string())
+        res = acquire_lease(key.as_string(), consumer_id=consumer_id, duration=LEASE_DURATION_SECONDS, source=source, session_id=session_id)
+        if not res.ok:
+            # Stale build request or capacity limit: return existing manifest without scheduling job or overwriting ownership
+            return self.get_manifest(video_id, duration, source=source)
         manifest = self.get_manifest(
             video_id,
             duration,
@@ -418,10 +923,11 @@ class ProgressiveStoryboardService:
         with _lock:
             key_str = key.as_string()
             if key_str not in _active_builds:
-                _active_builds[key_str] = job
                 try:
                     _jobs_queue.put_nowait(job)
+                    _active_builds[key_str] = job
                 except Exception:
+                    # Queue full: do NOT register in _active_builds to prevent permanent lockout
                     pass
 
         self._ensure_worker()
@@ -434,12 +940,21 @@ class ProgressiveStoryboardService:
             except Empty:
                 continue
 
+            key_str = job["key"].as_string()
             try:
-                self._execute_build_job(job)
+                if not _worker_stop.is_set():
+                    try:
+                        import player_qos_runtime as qos
+                        if qos.is_hard_cancelled(job["key"].provider_id, source=job["key"].source):
+                            continue
+                    except Exception:
+                        pass
+                    if not has_live_lease(key_str, source=job["key"].source):
+                        continue
+                    self._execute_build_job(job)
             except Exception as exc:
                 print(f"[Storyboard V2] Error executing job: {exc}")
             finally:
-                key_str = job["key"].as_string()
                 with _lock:
                     _active_builds.pop(key_str, None)
                 _jobs_queue.task_done()
@@ -453,6 +968,16 @@ class ProgressiveStoryboardService:
         native_count: Optional[int] = job.get("native_count")
         direct_url: Optional[str] = job.get("direct_url")
         embed_url: Optional[str] = job.get("embed_url")
+
+        if preview_url and not is_safe_ffmpeg_input_url(preview_url):
+            preview_url = None
+        if direct_url and not is_safe_ffmpeg_input_url(direct_url):
+            direct_url = None
+        if source_url and not is_safe_ffmpeg_input_url(source_url):
+            source_url = None
+
+        if not direct_url and not source_url:
+            return
 
         direct_headers = None
         if direct_url and (direct_url.startswith("http://") or direct_url.startswith("https://")):
@@ -475,7 +1000,7 @@ class ProgressiveStoryboardService:
         manifest_path = get_manifest_path(key)
         sheet_path = get_sheet_path(key, 0)
 
-        # Number of slots: 100 slots for sheet 0
+        # Number of slots: up to 100 slots for sheet 0 spanning full duration
         total_slots = min(MAX_SLOTS_DEFAULT, max(10, int(duration // 2)))
         total_slots = min(total_slots, FRAMES_PER_SHEET)
         bisection_order = compute_progressive_schedule(duration, total_slots)
@@ -504,6 +1029,98 @@ class ProgressiveStoryboardService:
             if len(entry) >= 3:
                 existing_frames_map[entry[2]] = entry[0]
 
+        # Layer 0: Extract lightweight preview frames if preview_url is available
+        preview_frames_exist = bool(manifest.get("native", {}).get("frames"))
+        if preview_url and not preview_frames_exist and not _worker_stop.is_set():
+            preview_dir = cache_dir / "preview"
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            extracted_preview: List[Tuple[int, Path]] = []
+            target_preview_count = 8
+            for p_idx in range(target_preview_count):
+                if _worker_stop.is_set() or not has_live_lease(key.as_string(), source=key.source):
+                    break
+                p_out = preview_dir / f"frame_{p_idx}.jpg"
+                if p_out.exists() and p_out.stat().st_size > 350:
+                    extracted_preview.append((p_idx, p_out))
+                    continue
+
+                # Acquire QoS budget for preview extraction
+                budget = None
+                job_epoch = lease_manager._epochs.get(key.as_string(), 1)
+                try:
+                    import player_qos_runtime as qos
+                    def cancel_check():
+                        return _worker_stop.is_set() or not has_live_lease(key.as_string(), source=key.source)
+                    budget = qos.wait_for_ffmpeg_budget("v2_prev", 1, key.provider_id, cancel_check, source=key.source)
+                except Exception:
+                    budget = None
+
+                if budget is None:
+                    break
+
+                try:
+                    p_pts = round(0.3 + p_idx * 0.5, 2)
+                    p_key = f"v2_prev_{key.provider_id}_{p_idx}"
+                    try:
+                        ok = _frame_extractor(
+                            preview_url,
+                            p_pts,
+                            p_out,
+                            timeout=5.0,
+                            fast=True,
+                            process_key=p_key,
+                            video_id=key.provider_id,
+                            source=key.source,
+                            generation=job_epoch,
+                        )
+                    except TypeError:
+                        try:
+                            ok = _frame_extractor(
+                                preview_url,
+                                p_pts,
+                                p_out,
+                                timeout=5.0,
+                                fast=True,
+                                process_key=p_key,
+                                video_id=key.provider_id,
+                            )
+                        except TypeError:
+                            try:
+                                ok = _frame_extractor(preview_url, p_pts, p_out, timeout=5.0, fast=True)
+                            except TypeError:
+                                ok = _frame_extractor(preview_url, p_pts, p_out)
+                    if ok and p_out.exists() and p_out.stat().st_size > 350:
+                        extracted_preview.append((p_idx, p_out))
+                finally:
+                    if budget is not None:
+                        try:
+                            import player_qos_runtime as qos
+                            qos.release_ffmpeg_budget(budget)
+                        except Exception:
+                            pass
+
+            if extracted_preview and not _worker_stop.is_set():
+                extracted_preview.sort(key=lambda x: x[0])
+                p_count = len(extracted_preview)
+                native_frames = [
+                    [
+                        round(rank * (duration / max(1, p_count)), 3),
+                        f"/api/storyboard/v2/preview?id={key.provider_id}&idx={act_idx}&source={key.source}",
+                    ]
+                    for rank, (act_idx, p_out) in enumerate(extracted_preview)
+                ]
+                manifest["native"] = {
+                    "kind": "preview_video",
+                    "url": preview_url,
+                    "count": p_count,
+                    "frames": native_frames,
+                }
+                current_rev = int(manifest.get("rev", 1)) + 1
+                manifest["rev"] = current_rev
+                atomic_write_json(manifest_path, manifest)
+                with _state_condition:
+                    _state_condition.notify_all()
+
         step = duration / max(1, total_slots)
         with tempfile.TemporaryDirectory(prefix="sb_v2_") as tmp_dir_str:
             tmp_dir = Path(tmp_dir_str)
@@ -514,38 +1131,110 @@ class ProgressiveStoryboardService:
             slots_to_do = [s for s in bisection_order if s not in existing_frames_map]
 
             def extract_slot(s_idx: int) -> Tuple[int, float, Optional[Path]]:
+                if _worker_stop.is_set():
+                    return s_idx, 0.0, None
+                job_epoch = lease_manager._epochs.get(key.as_string(), 1)
+                try:
+                    import player_qos_runtime as qos
+                    if qos.is_hard_cancelled(key.provider_id, source=key.source, generation=job_epoch):
+                        return s_idx, 0.0, None
+                except Exception:
+                    pass
+                if not has_live_lease(key.as_string(), source=key.source):
+                    return s_idx, 0.0, None
+
                 pts = slot_pts_map.get(s_idx, round(s_idx * step, 3))
                 f_out = tmp_dir / f"slot_{s_idx:03d}.jpg"
                 ok = False
-                if direct_url and direct_headers:
-                    try:
-                        ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True, headers=direct_headers)
-                    except TypeError:
-                        ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True)
-                    if not ok:
-                        # Fallback to accurate seek to avoid dropped/black keyframe seek failures
+                p_key = f"v2_{key.provider_id}_{s_idx}_{time.monotonic()}"
+
+                # QoS resource arbiter budget acquisition
+                budget = None
+                try:
+                    import player_qos_runtime as qos
+                    def cancel_check():
+                        return _worker_stop.is_set() or not has_live_lease(key.as_string(), source=key.source)
+                    budget = qos.wait_for_ffmpeg_budget("v2", 1, key.provider_id, cancel_check, source=key.source)
+                except Exception:
+                    budget = None
+
+                if budget is None:
+                    return s_idx, pts, None
+
+                try:
+                    if direct_url and direct_headers:
                         try:
-                            ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False, headers=direct_headers)
+                            ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True, headers=direct_headers, process_key=p_key, video_id=key.provider_id, source=key.source, generation=job_epoch)
                         except TypeError:
-                            ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False)
-                elif source_url:
-                    ok = _frame_extractor(source_url, pts, f_out, timeout=8.0, fast=True)
-                    if not ok:
-                        ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False)
+                            try:
+                                ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True, headers=direct_headers, process_key=p_key, video_id=key.provider_id)
+                            except TypeError:
+                                try:
+                                    ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True, headers=direct_headers)
+                                except TypeError:
+                                    ok = _frame_extractor(direct_url, pts, f_out, timeout=10.0, fast=True)
+                        if not ok and not _worker_stop.is_set():
+                            # Fallback to accurate seek to avoid dropped/black keyframe seek failures
+                            try:
+                                ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False, headers=direct_headers, process_key=p_key, video_id=key.provider_id, source=key.source, generation=job_epoch)
+                            except TypeError:
+                                try:
+                                    ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False, headers=direct_headers, process_key=p_key, video_id=key.provider_id)
+                                except TypeError:
+                                    try:
+                                        ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False, headers=direct_headers)
+                                    except TypeError:
+                                        ok = _frame_extractor(direct_url, pts, f_out, timeout=12.0, fast=False)
+                    elif source_url:
+                        try:
+                            ok = _frame_extractor(source_url, pts, f_out, timeout=8.0, fast=True, process_key=p_key, video_id=key.provider_id, source=key.source, generation=job_epoch)
+                        except TypeError:
+                            try:
+                                ok = _frame_extractor(source_url, pts, f_out, timeout=8.0, fast=True, process_key=p_key, video_id=key.provider_id)
+                            except TypeError:
+                                try:
+                                    ok = _frame_extractor(source_url, pts, f_out, timeout=8.0, fast=True)
+                                except TypeError:
+                                    ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False)
+                        if not ok and not _worker_stop.is_set():
+                            try:
+                                ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False, process_key=p_key, video_id=key.provider_id, source=key.source, generation=job_epoch)
+                            except TypeError:
+                                try:
+                                    ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False, process_key=p_key, video_id=key.provider_id)
+                                except TypeError:
+                                    ok = _frame_extractor(source_url, pts, f_out, timeout=12.0, fast=False)
+                finally:
+                    if budget is not None:
+                        try:
+                            import player_qos_runtime as qos
+                            qos.release_ffmpeg_budget(budget)
+                        except Exception:
+                            pass
+
                 if ok and f_out.exists():
                     return s_idx, pts, f_out
                 return s_idx, pts, None
 
-            batch_size = 5
+            batch_size = 4
+            max_parallel = 2  # Respect global FFMPEG_MAX_CONCURRENT
             for b_start in range(0, len(slots_to_do), batch_size):
                 if _worker_stop.is_set():
                     break
+                try:
+                    import player_qos_runtime as qos
+                    if qos.is_hard_cancelled(key.provider_id, source=key.source):
+                        break
+                except Exception:
+                    pass
+                if not has_live_lease(key.as_string(), source=key.source):
+                    break
 
-                self._wait_for_playback_qos(key.provider_id)
+                self._wait_for_playback_qos(key.provider_id, source=key.source)
 
                 batch = slots_to_do[b_start:b_start + batch_size]
                 batch_added = 0
-                with ThreadPoolExecutor(max_workers=len(batch), thread_name_prefix="sb_v2_batch") as pool:
+                with ThreadPoolExecutor(max_workers=min(max_parallel, len(batch)), thread_name_prefix="sb_v2_batch") as pool:
                     futures = [pool.submit(extract_slot, s) for s in batch]
                     for fut in as_completed(futures):
                         try:
@@ -568,7 +1257,6 @@ class ProgressiveStoryboardService:
 
                 if batch_added > 0:
                     current_rev += 1
-                    record_lease(key.as_string(), duration=LEASE_DURATION_SECONDS)
                     self._publish_manifest(
                         key=key,
                         manifest_path=manifest_path,
@@ -594,11 +1282,15 @@ class ProgressiveStoryboardService:
         complete: bool,
         native_info: dict,
     ) -> None:
-        """Atomically persist sheet image and manifest JSON."""
-        # 1. Save sheet
+        """Atomically persist revisioned sheet image and manifest JSON."""
+        # 1. Save sheet to revisioned file sheet_0_r{rev}.jpg AND current sheet_0.jpg
+        rev_sheet_path = get_sheet_path(key, 0, rev=rev)
         tmp_sheet = sheet_path.with_suffix(f".tmp.{rev}.jpg")
         try:
             sheet_img.save(tmp_sheet, format="JPEG", quality=72, optimize=True)
+            # Atomically publish revisioned sheet
+            shutil.copyfile(tmp_sheet, rev_sheet_path)
+            # Atomically publish primary/unversioned sheet
             os.replace(tmp_sheet, sheet_path)
         finally:
             if tmp_sheet.exists():
@@ -606,6 +1298,18 @@ class ProgressiveStoryboardService:
                     tmp_sheet.unlink()
                 except OSError:
                     pass
+
+        # Cleanup older revisions (keep latest 2 revisions for active client transitions)
+        try:
+            for old_rev in range(1, max(1, rev - 2)):
+                old_file = get_sheet_path(key, 0, rev=old_rev)
+                if old_file.exists():
+                    try:
+                        old_file.unlink()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
 
         # 2. Build sorted frames list: [[pts, sheet_idx, cell_idx], ...]
         sorted_frames = sorted(
@@ -644,8 +1348,8 @@ class ProgressiveStoryboardService:
         with _state_condition:
             _state_condition.notify_all()
 
-    def _wait_for_playback_qos(self, video_id: str) -> None:
-        """Cooperate with player QoS: yield gently if playback is actively seeking or stalled."""
+    def _wait_for_playback_qos(self, video_id: str, source: Optional[str] = None) -> None:
+        """Cooperate with player QoS: yield gently if playback is actively seeking, stalled or critical."""
         try:
             import player_qos_runtime as qos
             snap = qos._qos_snapshot()
@@ -653,11 +1357,12 @@ class ProgressiveStoryboardService:
             while not _worker_stop.is_set() and snap.get("active") and not snap.get("paused") and (
                 snap.get("seeking")
                 or snap.get("ready_state", 4) < 2
+                or snap.get("buffered_seconds", 10.0) < 2.0
             ):
-                if waited >= 2.0:
+                if waited >= 5.0 or qos.is_hard_cancelled(video_id, source=source):
                     break
-                time.sleep(0.25)
-                waited += 0.25
+                time.sleep(0.1)
+                waited += 0.1
                 snap = qos._qos_snapshot()
         except Exception:
             pass

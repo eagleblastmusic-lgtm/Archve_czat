@@ -4,7 +4,14 @@
   const REPORT_INTERVAL_MS = 700;
   const statsByVideo = new WeakMap();
   const lastVideoIds = new WeakMap();
+  const lastSessionIds = new WeakMap();
   const lastReports = new WeakMap();
+
+  function resolveVideoSource(video, videoId) {
+    if (String(videoId || '').startsWith('cw_')) return 'camwhores';
+    const state = globalThis.ArchivebateAppContext?.state || globalThis.state || null;
+    return state?.currentVideoDetails?.source || 'archivebate';
+  }
 
   function mutationHeaders() {
     const token = document.querySelector?.('meta[name="archivebate-mutation-token"]')?.content || '';
@@ -149,7 +156,21 @@
   function hardCancel(video, reason) {
     const videoId = lastVideoIds.get(video) || resolveVideoId(video);
     if (!videoId) return;
-    postJSON(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}&reason=${encodeURIComponent(reason)}`, {});
+    const source = resolveVideoSource(video, videoId);
+    if (reason !== 'pagehide' && reason !== 'beforeunload' && globalThis.ArchivebateTimelinePreview?.manager?.hasSubscribers?.(videoId, source)) {
+      return;
+    }
+    const mgr = globalThis.ArchivebateTimelinePreview?.manager;
+    const consumerId = mgr?.consumerId || '';
+    const sessionId = (mgr?.getSessionId ? mgr.getSessionId(videoId, source, true) : null) || lastSessionIds.get(video) || (consumerId ? `${consumerId}_s1` : '');
+    // Must NOT send unscoped cancel without both consumer_id and session_id
+    if (!consumerId || !sessionId) {
+      return;
+    }
+    const consumerParam = `&consumer_id=${encodeURIComponent(consumerId)}`;
+    const sessionParam = `&session_id=${encodeURIComponent(sessionId)}`;
+    const sourceParam = source ? `&source=${encodeURIComponent(source)}` : '';
+    postJSON(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}${consumerParam}${sessionParam}${sourceParam}&reason=${encodeURIComponent(reason)}`, {});
   }
 
   function onEvent(event) {
@@ -157,7 +178,15 @@
     if (!video || (video.id !== 'modalVideo' && video.id !== 'mainPlayer')) return;
     const reason = String(event.type || 'event');
     const videoId = resolveVideoId(video);
-    if (videoId) lastVideoIds.set(video, videoId);
+    if (videoId) {
+      lastVideoIds.set(video, videoId);
+      const src = resolveVideoSource(video, videoId);
+      const mgr = globalThis.ArchivebateTimelinePreview?.manager;
+      if (mgr?.getSessionId) {
+        const sid = mgr.getSessionId(videoId, src);
+        if (sid) lastSessionIds.set(video, sid);
+      }
+    }
 
     if (reason === 'waiting' || reason === 'stalled') beginStall(video, reason);
     if (reason === 'playing' || reason === 'canplay') endStall(video);
@@ -175,12 +204,18 @@
   const EVENTS = ['loadedmetadata', 'playing', 'pause', 'waiting', 'stalled', 'seeking', 'seeked', 'canplay', 'progress', 'timeupdate', 'emptied'];
   for (const name of EVENTS) document.addEventListener(name, onEvent, true);
 
-  addEventListener('pagehide', () => {
+  let unloaded = false;
+  function handleTeardown(reason) {
+    if (unloaded) return;
+    unloaded = true;
     for (const id of ['modalVideo', 'mainPlayer']) {
       const video = document.getElementById?.(id);
-      if (video) hardCancel(video, 'pagehide');
+      if (video) hardCancel(video, reason);
     }
-  }, { capture: true });
+  }
+
+  addEventListener('pagehide', () => handleTeardown('pagehide'), { capture: true });
+  addEventListener('beforeunload', () => handleTeardown('beforeunload'), { capture: true });
 
   const api = {
     getPlaybackMediaStats: mediaStats,

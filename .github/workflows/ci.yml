@@ -89,6 +89,24 @@ jobs:
         run: python audit/regression_timeline_storyboard_v2.py
       - name: V2 timeline preview frontend regression
         run: node audit/regression_timeline_preview.cjs
+      - name: V2 timeline audit repair backend regression
+        run: python audit/regression_audit_repair_p1_p2.py
+      - name: V2 timeline audit repair frontend regression
+        run: node audit/regression_audit_repair_frontend.cjs
+      - name: V2 timeline P0 recursion and polling regression
+        run: node audit/reproduce_p0_recursion_and_polling.cjs
+      - name: V2 timeline P1 remediation backend regression
+        run: python audit/regression_final_p1_remediation.py
+      - name: V2 timeline P1 remediation frontend regression
+        run: node audit/regression_final_p1_frontend.cjs
+      - name: Cross-session storyboard lifecycle regression
+        run: python audit/regression_cross_session_lifecycle.py
+      - name: Cross-session storyboard frontend regression
+        run: node audit/regression_cross_session_frontend.cjs
+      - name: Deterministic cross-session safety regression
+        run: python audit/reproduce_final_session_safety.py
+      - name: Epoch monotonicity and source isolation regression
+        run: python audit/reproduce_epoch_and_source_isolation.py
       - name: Catalog partial frontend regression
         run: node audit/regression_catalog_partial_frontend.cjs
       - name: Feed regression
@@ -201,6 +219,24 @@ jobs:
         run: python audit/regression_timeline_storyboard_v2.py
       - name: V2 timeline preview frontend regression
         run: node audit/regression_timeline_preview.cjs
+      - name: V2 timeline audit repair backend regression
+        run: python audit/regression_audit_repair_p1_p2.py
+      - name: V2 timeline audit repair frontend regression
+        run: node audit/regression_audit_repair_frontend.cjs
+      - name: V2 timeline P0 recursion and polling regression
+        run: node audit/reproduce_p0_recursion_and_polling.cjs
+      - name: V2 timeline P1 remediation backend regression
+        run: python audit/regression_final_p1_remediation.py
+      - name: V2 timeline P1 remediation frontend regression
+        run: node audit/regression_final_p1_frontend.cjs
+      - name: Cross-session storyboard lifecycle regression
+        run: python audit/regression_cross_session_lifecycle.py
+      - name: Cross-session storyboard frontend regression
+        run: node audit/regression_cross_session_frontend.cjs
+      - name: Deterministic cross-session safety regression
+        run: python audit/reproduce_final_session_safety.py
+      - name: Epoch monotonicity and source isolation regression
+        run: python audit/reproduce_epoch_and_source_isolation.py
       - name: Pagination frontend regression
         run: node audit/regression_package_b_frontend.cjs
       - name: Catalog projection frontend regression
@@ -272,6 +308,24 @@ jobs:
         run: python audit/regression_timeline_storyboard_v2.py
       - name: V2 timeline preview frontend regression
         run: node audit/regression_timeline_preview.cjs
+      - name: V2 timeline audit repair backend regression
+        run: python audit/regression_audit_repair_p1_p2.py
+      - name: V2 timeline audit repair frontend regression
+        run: node audit/regression_audit_repair_frontend.cjs
+      - name: V2 timeline P0 recursion and polling regression
+        run: node audit/reproduce_p0_recursion_and_polling.cjs
+      - name: V2 timeline P1 remediation backend regression
+        run: python audit/regression_final_p1_remediation.py
+      - name: V2 timeline P1 remediation frontend regression
+        run: node audit/regression_final_p1_frontend.cjs
+      - name: Cross-session storyboard lifecycle regression
+        run: python audit/regression_cross_session_lifecycle.py
+      - name: Cross-session storyboard frontend regression
+        run: node audit/regression_cross_session_frontend.cjs
+      - name: Deterministic cross-session safety regression
+        run: python audit/reproduce_final_session_safety.py
+      - name: Epoch monotonicity and source isolation regression
+        run: python audit/reproduce_epoch_and_source_isolation.py
       - name: Unit tests
         run: python -m unittest -v test_suite.py
 
@@ -292,6 +346,10 @@ jobs:
         env:
           ARCHIVEBATE_AUDIT_ISOLATED: "1"
         run: python audit/regression_timeline_browser.py
+      - name: Timeline E2E lifecycle acceptance
+        run: python audit/regression_timeline_e2e_lifecycle.py
+      - name: Cross-session multi-tab and player lifecycle acceptance
+        run: python audit/regression_cross_session_playwright.py
       - name: Upload browser evidence
         if: always()
         uses: actions/upload-artifact@v4

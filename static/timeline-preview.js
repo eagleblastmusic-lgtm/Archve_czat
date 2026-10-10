@@ -75,28 +75,79 @@
     return meta ? meta.getAttribute('content') || '' : '';
   }
 
+  const LIFECYCLE = {
+    UNINITIALIZED: 'UNINITIALIZED',
+    LOADING: 'LOADING',
+    PARTIAL: 'PARTIAL',
+    COMPLETE: 'COMPLETE',
+    ERROR: 'ERROR',
+    CANCELLED: 'CANCELLED',
+  };
+
   class TimelinePreviewManager {
     constructor() {
-      this.cache = new Map(); // videoKey -> { manifest, sheets: Map(idx -> HTMLImageElement), listeners: Set }
+      this.cache = new Map(); // videoKey -> { manifest, sheets: Map, sheetUrls: Map, sheetRevs: Map, activeRev, generation, fetching, fetchPromise, controller, subscribers: Map, listeners: Set, lastAccessed, lifecycle }
+      this.maxCachedEntries = 12;
+      this.activeVideoKey = null;
       this.activeInstances = new Set();
+      this.consumerId = 'tab_' + Math.random().toString(36).slice(2, 9) + '_' + Date.now().toString(36);
     }
 
     getOrCreateEntry(videoKey, source) {
       const key = canonicalKey(videoKey, source);
       if (!this.cache.has(key)) {
         this.cache.set(key, {
+          lifecycle: LIFECYCLE.UNINITIALIZED,
           manifest: null,
           sheets: new Map(),
           sheetUrls: new Map(),
+          sheetRevs: new Map(),
+          activeRev: 0,
+          generation: 0,
+          sessionId: null,
           fetching: false,
+          fetchPromise: null,
           controller: null,
-          listeners: new Set(),
+          subscribers: new Map(), // subscriberId -> onUpdate callback
+          listeners: new Set(),   // backwards compat
+          rafScheduled: 0,
+          retryCount: 0,
+          lastErrorTime: 0,
+          lastAccessed: Date.now(),
         });
+        this.evictLru(key);
       }
       const entry = this.cache.get(key);
       if (!entry.sheetUrls) entry.sheetUrls = new Map();
+      if (!entry.sheetRevs) entry.sheetRevs = new Map();
+      if (!entry.subscribers) entry.subscribers = new Map();
       if (!entry.listeners) entry.listeners = new Set();
+      if (!entry.lifecycle) entry.lifecycle = LIFECYCLE.UNINITIALIZED;
+      entry.lastAccessed = Date.now();
       return entry;
+    }
+
+    evictLru(protectedKey) {
+      if (this.cache.size <= this.maxCachedEntries) return;
+      const candidates = [];
+      for (const [k, e] of this.cache.entries()) {
+        if (k === protectedKey || k === this.activeVideoKey) continue;
+        if (e.fetching || (e.subscribers && e.subscribers.size > 0) || (e.listeners && e.listeners.size > 0)) continue;
+        candidates.push({ key: k, entry: e, time: e.lastAccessed || 0 });
+      }
+      candidates.sort((a, b) => a.time - b.time);
+      while (this.cache.size > this.maxCachedEntries && candidates.length > 0) {
+        const victim = candidates.shift();
+        if (victim && victim.entry) {
+          if (victim.entry.controller) {
+            try { victim.entry.controller.abort(); } catch (_) {}
+          }
+          if (victim.entry.sheets) victim.entry.sheets.clear();
+          if (victim.entry.sheetUrls) victim.entry.sheetUrls.clear();
+          if (victim.entry.sheetRevs) victim.entry.sheetRevs.clear();
+          this.cache.delete(victim.key);
+        }
+      }
     }
 
     hasEntry(videoKey, source) {
@@ -108,12 +159,24 @@
     stopPolling(videoKey, source) {
       const key = canonicalKey(videoKey, source);
       const entry = this.cache.get(key);
-      if (entry && entry.controller) {
-        try { entry.controller.abort(); } catch (_) {}
-        entry.controller = null;
-      }
       if (entry) {
+        entry.generation = (entry.generation || 0) + 1;
+        if (entry.controller) {
+          try { entry.controller.abort(); } catch (_) {}
+          entry.controller = null;
+        }
         entry.fetching = false;
+        entry.fetchPromise = null;
+        entry.lifecycle = LIFECYCLE.CANCELLED;
+        if (entry.rafScheduled) {
+          if (typeof cancelAnimationFrame === 'function') {
+            cancelAnimationFrame(entry.rafScheduled);
+          } else {
+            clearTimeout(entry.rafScheduled);
+          }
+          entry.rafScheduled = 0;
+        }
+        if (entry.subscribers) entry.subscribers.clear();
         if (entry.listeners) entry.listeners.clear();
       }
     }
@@ -126,7 +189,7 @@
         if (direct.manifest && Array.isArray(direct.manifest.frames) && direct.manifest.frames.length > 0 && direct.sheets.size > 0) {
           return true;
         }
-        if (direct.manifest?.native?.kind === 'prefix') {
+        if (direct.manifest?.native?.kind === 'prefix' || (direct.manifest?.native?.frames && direct.manifest.native.frames.length > 0)) {
           return true;
         }
       }
@@ -136,7 +199,7 @@
           if (entry.manifest && Array.isArray(entry.manifest.frames) && entry.manifest.frames.length > 0 && entry.sheets.size > 0) {
             return true;
           }
-          if (entry.manifest?.native?.kind === 'prefix') {
+          if (entry.manifest?.native?.kind === 'prefix' || (entry.manifest?.native?.frames && entry.manifest.native.frames.length > 0)) {
             return true;
           }
         }
@@ -144,18 +207,48 @@
       return false;
     }
 
-    preloadSheet(sheetUrl) {
+    preloadSheet(sheetUrl, targetRev, sheetIndex, targetGeneration, entry) {
       return new Promise((resolve) => {
         if (typeof Image === 'undefined') {
           resolve(null);
           return;
         }
         const img = new Image();
+        const finish = (loaded) => {
+          if (!loaded) {
+            resolve(null);
+            return;
+          }
+          // Race-condition guard: check generation, active controller, and revision monotonicity
+          if (entry) {
+            if (entry.generation !== targetGeneration) {
+              resolve(null);
+              return;
+            }
+            if (entry.controller && entry.controller.signal.aborted) {
+              resolve(null);
+              return;
+            }
+            const currentSheetRev = entry.sheetRevs ? (entry.sheetRevs.get(sheetIndex) || 0) : 0;
+            if (targetRev !== undefined && targetRev < currentSheetRev) {
+              // Obsolete older revision finished decoding after newer revision; reject to prevent rollback
+              resolve(null);
+              return;
+            }
+            if (entry.sheets && entry.sheetUrls) {
+              entry.sheets.set(sheetIndex, loaded);
+              entry.sheetUrls.set(sheetIndex, sheetUrl);
+              if (entry.sheetRevs) entry.sheetRevs.set(sheetIndex, targetRev || 0);
+            }
+          }
+          resolve(loaded);
+        };
+
         img.onload = () => {
           if (img.decode) {
-            img.decode().then(() => resolve(img)).catch(() => resolve(img));
+            img.decode().then(() => finish(img)).catch(() => finish(img));
           } else {
-            resolve(img);
+            finish(img);
           }
         };
         img.onerror = () => resolve(null);
@@ -163,101 +256,274 @@
       });
     }
 
-    async pollManifest(videoKey, videoId, duration, source, onUpdate) {
-      if (typeof document !== 'undefined' && document.hidden) return;
+    subscribe(videoKey, subscriberId, onUpdate, source) {
+      if (!videoKey || !subscriberId || typeof onUpdate !== 'function') return;
+      const key = canonicalKey(videoKey, source);
+      const entry = this.getOrCreateEntry(key, source);
+      entry.subscribers.set(String(subscriberId), onUpdate);
+      this.activeVideoKey = key;
+      // Dispatch ready state asynchronously to prevent synchronous recursion
+      if (entry.manifest && entry.sheets && entry.sheets.size > 0) {
+        Promise.resolve().then(() => {
+          if (entry.subscribers.has(String(subscriberId))) {
+            try { onUpdate(entry.manifest); } catch (_) {}
+          }
+        });
+      }
+    }
+
+    unsubscribe(videoKey, subscriberId, source) {
+      if (!videoKey || !subscriberId) return;
+      const key = canonicalKey(videoKey, source);
+      const entry = this.cache.get(key);
+      if (entry && entry.subscribers) {
+        entry.subscribers.delete(String(subscriberId));
+        if (this.activeVideoKey === key && entry.subscribers.size === 0) {
+          this.activeVideoKey = null;
+        }
+        if (entry.subscribers.size === 0 && (!entry.listeners || entry.listeners.size === 0)) {
+          this.stopPolling(videoKey, source);
+          this.releaseLease(videoKey, source);
+        }
+      }
+    }
+
+    getSessionId(videoKey, source, createIfMissing = false) {
+      if (!videoKey) return null;
+      const key = canonicalKey(videoKey, source);
+      if (createIfMissing) {
+        const entry = this.getOrCreateEntry(key, source);
+        if (!entry.sessionId) {
+          entry.generation = (entry.generation || 0) + 1;
+          entry.sessionId = `${this.consumerId}_s${entry.generation}`;
+        }
+        return entry.sessionId;
+      }
+      const entry = this.cache.get(key);
+      return entry ? entry.sessionId : null;
+    }
+
+    releaseLease(videoKey, source) {
+      if (!videoKey) return;
+      const key = canonicalKey(videoKey, source);
+      const entry = this.cache.get(key);
+      const sessionId = entry ? entry.sessionId : null;
+      if (entry) {
+        entry.sessionId = null;
+      }
+      const parts = String(videoKey).split(':');
+      const videoId = parts.length >= 3 ? parts.slice(2).join(':') : parts[parts.length - 1];
+      const parsedSource = parts.length >= 3 ? parts[0] : (source || (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate'));
+      const token = getMutationToken();
+      const headers = {
+        'Content-Type': 'application/json',
+        ...(token ? { 'X-Archivebate-Mutation-Token': token } : {}),
+      };
+      const sessionParam = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
+      fetch(`/api/runtime/v452/storyboard/cancel?id=${encodeURIComponent(videoId)}&consumer_id=${encodeURIComponent(this.consumerId)}${sessionParam}&source=${encodeURIComponent(parsedSource || '')}&reason=unsubscribe`, {
+        method: 'POST',
+        headers,
+        keepalive: true,
+      }).catch(() => {});
+    }
+
+    releaseAllLeases() {
+      for (const [key, entry] of this.cache.entries()) {
+        if (entry && (entry.subscribers?.size > 0 || entry.listeners?.size > 0)) {
+          this.stopPolling(key, entry.source);
+          this.releaseLease(key, entry.source);
+          entry.subscribers?.clear();
+          entry.listeners?.clear();
+        }
+      }
+      this.activeVideoKey = null;
+    }
+
+    hasSubscribers(videoKey, source) {
+      if (!videoKey) return false;
+      const key = canonicalKey(videoKey, source);
+      const entry = this.cache.get(key);
+      return !!(entry && ((entry.subscribers && entry.subscribers.size > 0) || (entry.listeners && entry.listeners.size > 0)));
+    }
+
+    notifySubscribers(entry, manifest) {
+      if (!entry) return;
+      const subs = Array.from(entry.subscribers?.values() || []);
+      const legacy = Array.from(entry.listeners || []);
+      const allCallbacks = subs.concat(legacy);
+      if (allCallbacks.length === 0) return;
+
+      for (const cb of allCallbacks) {
+        try {
+          cb(manifest);
+        } catch (err) {
+          console.error('[TimelinePreview] subscriber error:', err);
+        }
+      }
+    }
+
+    notifyListeners(entry, manifest) {
+      this.notifySubscribers(entry, manifest);
+    }
+
+    async ensureStoryboard(videoKey, videoId, duration, source) {
+      if (typeof document !== 'undefined' && document.hidden) return null;
       duration = Number(duration) || 0;
-      if ((!videoKey && !videoId) || duration <= 0) return;
+      if ((!videoKey && !videoId) || duration <= 0) return null;
 
       const key = canonicalKey(videoKey || videoId, source);
-      const entry = this.getOrCreateEntry(key);
-      if (onUpdate && typeof onUpdate === 'function') {
-        entry.listener = onUpdate;
+      const entry = this.getOrCreateEntry(key, source);
+      entry.lastAccessed = Date.now();
+
+      // Short-circuit: already complete (0 network calls)
+      if (entry.lifecycle === LIFECYCLE.COMPLETE || (entry.manifest && entry.manifest.complete)) {
+        entry.lifecycle = LIFECYCLE.COMPLETE;
+        return entry.manifest;
       }
-      if (entry.fetching) return;
+
+      // Single-flight deduplication: return existing promise if already loading
+      if (entry.fetching && entry.fetchPromise) {
+        return entry.fetchPromise;
+      }
+
+      // Exponential backoff check on error
+      if (entry.lifecycle === LIFECYCLE.ERROR) {
+        const now = Date.now();
+        const minWait = Math.min(30000, 2000 * Math.pow(2, entry.retryCount || 0));
+        if (now - (entry.lastErrorTime || 0) < minWait) {
+          return entry.manifest;
+        }
+      }
+
+      if (!entry.sessionId) {
+        entry.generation = (entry.generation || 0) + 1;
+        entry.sessionId = `${this.consumerId}_s${entry.generation}`;
+      }
+      const sessionId = entry.sessionId;
+      const targetGeneration = entry.generation || 0;
+
       entry.fetching = true;
+      entry.lifecycle = LIFECYCLE.LOADING;
       const controller = new AbortController();
       entry.controller = controller;
 
-      const notifyAll = (m) => {
-        if (typeof entry.listener === 'function') {
-          try { entry.listener(m); } catch (_) {}
-        }
-      };
+      entry.fetchPromise = (async () => {
+        let sinceRev = entry.manifest ? (entry.manifest.rev || 0) : 0;
+        let failureCount = 0;
 
-      let sinceRev = entry.manifest ? (entry.manifest.rev || 0) : 0;
-      let failureCount = 0;
+        try {
+          const token = getMutationToken();
+          const buildHeaders = token ? { 'X-Archivebate-Mutation-Token': token } : {};
+          fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}&consumer_id=${encodeURIComponent(this.consumerId)}&session_id=${encodeURIComponent(sessionId)}`, {
+            method: 'POST',
+            headers: buildHeaders,
+            signal: controller.signal,
+          }).catch(() => {});
 
-      try {
-        // Trigger background build if needed
-        const token = getMutationToken();
-        const buildHeaders = token ? { 'X-Archivebate-Mutation-Token': token } : {};
-        fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}`, {
-          method: 'POST',
-          headers: buildHeaders,
-          signal: controller.signal,
-        }).catch(() => {});
-
-        let loopIter = 0;
-        while (!controller.signal.aborted) {
-          loopIter++;
-          if (loopIter % 8 === 0 && (!entry.manifest || !entry.manifest.complete)) {
-            fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}`, {
-              method: 'POST',
-              headers: buildHeaders,
-              signal: controller.signal,
-            }).catch(() => {});
-          }
-          const waitMs = sinceRev > 0 ? 1500 : 0;
-          const url = `/api/storyboard/v2?id=${encodeURIComponent(videoId)}&duration=${duration}&since_rev=${sinceRev}&wait_ms=${waitMs}&source=${encodeURIComponent(source || '')}`;
-          
-          try {
-            const resp = await fetch(url, { signal: controller.signal });
-            if (!resp.ok) {
-              failureCount++;
-              if (failureCount > 5) break;
-              await new Promise(r => setTimeout(r, 1000));
-              continue;
+          let loopIter = 0;
+          while (!controller.signal.aborted && entry.generation === targetGeneration) {
+            loopIter++;
+            if (loopIter % 4 === 0 && (!entry.manifest || !entry.manifest.complete)) {
+              fetch(`/api/storyboard/v2/lease/renew?id=${encodeURIComponent(videoId)}&consumer_id=${encodeURIComponent(this.consumerId)}&session_id=${encodeURIComponent(sessionId)}&source=${encodeURIComponent(source || '')}`, {
+                method: 'POST',
+                headers: buildHeaders,
+                signal: controller.signal,
+              }).catch(() => {});
             }
-            failureCount = 0;
-            const manifest = await resp.json();
-            if (manifest && manifest.version === 11) {
-              entry.manifest = manifest;
-              sinceRev = manifest.rev || sinceRev;
+            if (loopIter % 8 === 0 && (!entry.manifest || !entry.manifest.complete)) {
+              fetch(`/api/storyboard/v2/build?id=${encodeURIComponent(videoId)}&duration=${duration}&source=${encodeURIComponent(source || '')}&consumer_id=${encodeURIComponent(this.consumerId)}&session_id=${encodeURIComponent(sessionId)}`, {
+                method: 'POST',
+                headers: buildHeaders,
+                signal: controller.signal,
+              }).catch(() => {});
+            }
+            const waitMs = sinceRev > 0 ? 1500 : 0;
+            const url = `/api/storyboard/v2?id=${encodeURIComponent(videoId)}&duration=${duration}&since_rev=${sinceRev}&wait_ms=${waitMs}&source=${encodeURIComponent(source || '')}`;
 
-              // Preload new sheets or updated revisions
-              if (Array.isArray(manifest.sheets)) {
-                for (const s of manifest.sheets) {
-                  if (s && s.url) {
-                    const currentUrl = entry.sheetUrls.get(s.index);
-                    if (currentUrl !== s.url) {
-                      this.preloadSheet(s.url).then(loadedImg => {
-                        if (loadedImg) {
-                          entry.sheets.set(s.index, loadedImg);
-                          entry.sheetUrls.set(s.index, s.url);
-                          notifyAll(entry.manifest);
+            try {
+              const resp = await fetch(url, { signal: controller.signal });
+              if (!resp.ok) {
+                failureCount++;
+                if (failureCount > 5) {
+                  entry.lifecycle = LIFECYCLE.ERROR;
+                  entry.lastErrorTime = Date.now();
+                  entry.retryCount = (entry.retryCount || 0) + 1;
+                  break;
+                }
+                await new Promise(r => setTimeout(r, 1000));
+                continue;
+              }
+              failureCount = 0;
+              entry.retryCount = 0;
+              const manifest = await resp.json();
+              if (manifest && (manifest.version === 11 || manifest.version === 12) && entry.generation === targetGeneration) {
+                const manifestRev = Number(manifest.rev || 0);
+                if (manifestRev >= (entry.activeRev || 0)) {
+                  entry.manifest = manifest;
+                  entry.activeRev = manifestRev;
+                  sinceRev = manifestRev || sinceRev;
+                  entry.lifecycle = manifest.complete ? LIFECYCLE.COMPLETE : LIFECYCLE.PARTIAL;
+
+                  // Preload new sheets or updated revisions without race conditions
+                  if (Array.isArray(manifest.sheets)) {
+                    for (const s of manifest.sheets) {
+                      if (s && s.url) {
+                        const currentUrl = entry.sheetUrls.get(s.index);
+                        const currentRev = entry.sheetRevs.get(s.index) || 0;
+                        if (currentUrl !== s.url || manifestRev > currentRev) {
+                          this.preloadSheet(s.url, manifestRev, s.index, targetGeneration, entry).then(loadedImg => {
+                            if (loadedImg && entry.generation === targetGeneration) {
+                              this.notifySubscribers(entry, entry.manifest);
+                            }
+                          });
                         }
-                      });
+                      }
                     }
                   }
+
+                  this.notifySubscribers(entry, manifest);
+                }
+                if (manifest.complete) {
+                  entry.lifecycle = LIFECYCLE.COMPLETE;
+                  break;
                 }
               }
-
-              notifyAll(manifest);
-              if (manifest.complete) break;
+            } catch (err) {
+              if (controller.signal.aborted || entry.generation !== targetGeneration) {
+                entry.lifecycle = LIFECYCLE.CANCELLED;
+                break;
+              }
+              failureCount++;
+              if (failureCount > 5) {
+                entry.lifecycle = LIFECYCLE.ERROR;
+                entry.lastErrorTime = Date.now();
+                entry.retryCount = (entry.retryCount || 0) + 1;
+                break;
+              }
+              await new Promise(r => setTimeout(r, 1000));
             }
-          } catch (err) {
-            if (controller.signal.aborted) break;
-            failureCount++;
-            if (failureCount > 5) break;
-            await new Promise(r => setTimeout(r, 1000));
+          }
+        } finally {
+          if (entry.generation === targetGeneration) {
+            entry.fetching = false;
+            entry.fetchPromise = null;
+            if (entry.controller === controller) {
+              entry.controller = null;
+            }
           }
         }
-      } finally {
-        entry.fetching = false;
-        if (entry.controller === controller) {
-          entry.controller = null;
-        }
+        return entry.manifest;
+      })();
+
+      return entry.fetchPromise;
+    }
+
+    async pollManifest(videoKey, videoId, duration, source, onUpdate) {
+      if (onUpdate && typeof onUpdate === 'function') {
+        const subId = 'legacy_' + canonicalKey(videoKey || videoId, source);
+        this.subscribe(videoKey || videoId, subId, onUpdate, source);
       }
+      return this.ensureStoryboard(videoKey, videoId, duration, source);
     }
 
     render(options) {
@@ -347,7 +613,7 @@
         }
       }
 
-      // 2. Layer 0: Camwhores native prefix (15 images)
+      // 2. Layer 0: Native CDN prefix (Camwhores) or preview video frames (Archivebate)
       const prefix = nativePrefix || (manifest?.native?.kind === 'prefix' ? manifest.native.prefix : null);
       if (prefix) {
         const count = nativeCount || manifest?.native?.count || 15;
@@ -372,6 +638,30 @@
         return true;
       }
 
+      if (manifest?.native?.frames && Array.isArray(manifest.native.frames) && manifest.native.frames.length > 0) {
+        const nFrames = manifest.native.frames;
+        const frameIdx = Math.min(nFrames.length - 1, Math.max(0, Math.round(pos * (nFrames.length - 1))));
+        const frameEntry = nFrames[frameIdx];
+        const src = Array.isArray(frameEntry) ? frameEntry[1] : frameEntry;
+        if (src) {
+          if (imgEl) {
+            if (imgEl.src !== src) imgEl.src = src;
+            imgEl.style.display = 'block';
+          }
+          if (spriteEl) spriteEl.style.display = 'none';
+          if (timeTextEl) timeTextEl.innerText = formatTime(targetTime);
+          if (statusEl) {
+            if (statusText && statusText.includes('bufor')) {
+              statusEl.textContent = statusText;
+            } else {
+              statusEl.textContent = 'Podgląd przybliżony';
+            }
+            statusEl.style.display = 'block';
+          }
+          return true;
+        }
+      }
+
       return false;
     }
 
@@ -393,51 +683,58 @@
 
       let rafId = 0;
       let lastClientX = 0;
+      let isHovering = false;
+
+      const triggerRepaint = () => {
+        if (!isHovering || !timeline) return;
+        const rect = timeline.getBoundingClientRect();
+        if (!rect.width) return;
+
+        const rawX = lastClientX - rect.left;
+        const pos = Math.max(0, Math.min(1, rawX / rect.width));
+        const duration = getDuration ? getDuration() : 0;
+        if (duration <= 0) return;
+        const targetTime = pos * duration;
+
+        if (tooltip) {
+          const tooltipX = rect.width <= 168 ? rect.width / 2 : Math.max(84, Math.min(rect.width - 84, rawX));
+          tooltip.style.setProperty('--timeline-preview-x', `${tooltipX}px`);
+          tooltip.style.display = 'flex';
+        }
+
+        const videoId = getVideoId ? getVideoId() : '';
+        const source = getSource ? getSource() : (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate');
+        const videoKey = `${source}:id:${videoId}`;
+
+        this.render({
+          videoKey,
+          videoId,
+          targetTime,
+          duration,
+          pos,
+          spriteEl,
+          imgEl,
+          timeTextEl,
+          statusEl,
+          nativePrefix: getNativePrefix ? getNativePrefix() : null,
+          nativeCount: getNativeCount ? getNativeCount() : null,
+          poster: getPoster ? getPoster() : null,
+        });
+      };
 
       const onPointerMove = (e) => {
         lastClientX = e.clientX;
+        isHovering = true;
         if (rafId) return;
 
         rafId = requestAnimationFrame(() => {
           rafId = 0;
-          if (!timeline) return;
-          const rect = timeline.getBoundingClientRect();
-          if (!rect.width) return;
-
-          const rawX = lastClientX - rect.left;
-          const pos = Math.max(0, Math.min(1, rawX / rect.width));
-          const duration = getDuration ? getDuration() : 0;
-          if (duration <= 0) return;
-          const targetTime = pos * duration;
-
-          if (tooltip) {
-            const tooltipX = rect.width <= 168 ? rect.width / 2 : Math.max(84, Math.min(rect.width - 84, rawX));
-            tooltip.style.setProperty('--timeline-preview-x', `${tooltipX}px`);
-            tooltip.style.display = 'flex';
-          }
-
-          const videoId = getVideoId ? getVideoId() : '';
-          const source = getSource ? getSource() : (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate');
-          const videoKey = `${source}:id:${videoId}`;
-
-          this.render({
-            videoKey,
-            videoId,
-            targetTime,
-            duration,
-            pos,
-            spriteEl,
-            imgEl,
-            timeTextEl,
-            statusEl,
-            nativePrefix: getNativePrefix ? getNativePrefix() : null,
-            nativeCount: getNativeCount ? getNativeCount() : null,
-            poster: getPoster ? getPoster() : null,
-          });
+          triggerRepaint();
         });
       };
 
       const onPointerLeave = () => {
+        isHovering = false;
         if (rafId) {
           cancelAnimationFrame(rafId);
           rafId = 0;
@@ -450,17 +747,22 @@
         timeline.addEventListener('pointerleave', onPointerLeave, { passive: true });
       }
 
-      // Prewarm manifest on attach
+      // Prewarm manifest on attach with automatic repaint subscription
       const videoId = getVideoId ? getVideoId() : '';
       const duration = getDuration ? getDuration() : 0;
       const source = getSource ? getSource() : (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate');
       if (videoId && duration > 0) {
         const videoKey = `${source}:id:${videoId}`;
-        this.pollManifest(videoKey, videoId, duration, source);
+        this.pollManifest(videoKey, videoId, duration, source, () => {
+          if (isHovering) {
+            triggerRepaint();
+          }
+        });
       }
 
       return {
         dispose: () => {
+          isHovering = false;
           if (timeline) {
             timeline.removeEventListener('pointermove', onPointerMove);
             timeline.removeEventListener('pointerleave', onPointerLeave);
@@ -469,10 +771,10 @@
             cancelAnimationFrame(rafId);
             rafId = 0;
           }
-          const videoId = getVideoId ? getVideoId() : '';
-          const source = getSource ? getSource() : (videoId.startsWith('cw_') ? 'camwhores' : 'archivebate');
-          if (videoId) {
-            this.stopPolling(videoId, source);
+          const vid = getVideoId ? getVideoId() : '';
+          const src = getSource ? getSource() : (vid.startsWith('cw_') ? 'camwhores' : 'archivebate');
+          if (vid) {
+            this.stopPolling(vid, src);
           }
         },
       };
@@ -486,8 +788,22 @@
     render: (opts) => manager.render(opts),
     attach: (cfg) => manager.attach(cfg),
     hasFrames: (vid, src) => manager.hasFrames(vid, src),
+    subscribe: (key, subId, cb, src) => manager.subscribe(key, subId, cb, src),
+    unsubscribe: (key, subId, src) => manager.unsubscribe(key, subId, src),
     stopPolling: (key, src) => manager.stopPolling(key, src),
+    getSessionId: (key, src) => manager.getSessionId(key, src),
     binarySearchNearest,
   };
+
+  if (typeof global !== 'undefined' && global.addEventListener) {
+    let leasesReleased = false;
+    const handleTeardown = () => {
+      if (leasesReleased) return;
+      leasesReleased = true;
+      manager.releaseAllLeases();
+    };
+    global.addEventListener('pagehide', handleTeardown, { capture: true });
+    global.addEventListener('beforeunload', handleTeardown, { capture: true });
+  }
 
 })(typeof window !== 'undefined' ? window : (typeof global !== 'undefined' ? global : this));
