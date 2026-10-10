@@ -43,15 +43,17 @@ def test_unscoped_cancel_cannot_touch_new_lease():
     key = VideoKey("archivebate", "audit4_cancel_scope")
     lease = ts.lease_manager.acquire(key, consumer_id="audit4_c", session_id="audit4_c_s1")
     assert lease.ok
-    with TestClient(app) as client:
-        response = client.post(
-            "/api/runtime/v452/storyboard/cancel?id=audit4_cancel_scope&source=archivebate",
-            headers={"X-Archivebate-Mutation-Token": main.LOCAL_MUTATION_TOKEN},
-        )
-        assert response.status_code == 200, response.text
-        assert response.json()["cancelled"] == 0, response.json()
-        assert not response.json()["ok"], response.json()
-        assert ts.lease_manager.has_live_lease(key)
+    # Avoid running the application's real startup/indexing lifespan in this
+    # isolated route test (TestClient context-manager would start it).
+    client = TestClient(app)
+    response = client.post(
+        "/api/runtime/v452/storyboard/cancel?id=audit4_cancel_scope&source=archivebate",
+        headers={"X-Archivebate-Mutation-Token": main.LOCAL_MUTATION_TOKEN},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] == 0, response.json()
+    assert not response.json()["ok"], response.json()
+    assert ts.lease_manager.has_live_lease(key)
     ts.lease_manager.release(key, consumer_id="audit4_c", session_id="audit4_c_s1")
 
 
