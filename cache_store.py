@@ -127,9 +127,90 @@ def response_peer_is_global(response) -> bool:
         return False
 
 
+def trim_storyboard_cache_directory(directory: os.PathLike, max_bytes: int, protected_dirs=()) -> dict:
+    """Bound legacy files + nested V2 video directories by total bytes.
+
+    A V2 directory is evicted as a single unit, never one JPEG/manifest at a
+    time. Callers must hold the storyboard lease/build locks while pruning so
+    new consumers cannot acquire a folder being evicted.
+    """
+    import shutil
+
+    root = Path(directory)
+    if not root.is_dir():
+        return {"total_bytes": 0, "removed_bytes": 0, "remaining_bytes": 0}
+    protected = set(protected_dirs)
+    entries = []
+    total = 0
+
+    # Root-level legacy files; retain the existing metadata-pair cleanup rule.
+    try:
+        root_files = [p for p in root.iterdir() if p.is_file() and not p.is_symlink() and not p.name.endswith(".tmp")]
+    except OSError:
+        root_files = []
+    for path in root_files:
+        try:
+            stat = path.stat()
+            total += stat.st_size
+            if path.suffix != ".meta":
+                entries.append((stat.st_mtime, stat.st_size, path, False))
+        except OSError:
+            continue
+
+    v2 = root / "v2"
+    if v2.is_dir() and not v2.is_symlink():
+        for folder in v2.iterdir():
+            if not folder.is_dir() or folder.is_symlink():
+                continue
+            size = 0
+            newest = 0.0
+            for path in folder.rglob("*"):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                size += stat.st_size
+                newest = max(newest, stat.st_mtime)
+            total += size
+            if folder.name not in protected:
+                entries.append((newest, size, folder, True))
+
+    removed = 0
+    target = int(max_bytes * 0.9)
+    if total > max_bytes:
+        for _, size, path, is_folder in sorted(entries, key=lambda item: item[0]):
+            if total <= target:
+                break
+            try:
+                if is_folder:
+                    # Preserve the whole manifest/sprite unit during cleanup.
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+                    meta = path.with_suffix(".meta") if path.suffix == ".bin" else None
+                    if meta and meta.exists():
+                        meta_size = meta.stat().st_size
+                        meta.unlink(missing_ok=True)
+                        size += meta_size
+                total -= size
+                removed += size
+            except OSError:
+                continue
+
+    return {"total_bytes": total + removed, "removed_bytes": removed,
+            "remaining_bytes": total}
+
+
 def trim_cache_directory(directory: os.PathLike, max_bytes: int, preserve_suffixes=(".meta",)) -> None:
     """Przybliżony LRU po mtime; usuwa najstarsze pliki po przekroczeniu limitu."""
     root = Path(directory)
+    if root.resolve() == STORYBOARD_CACHE_DIR.resolve():
+        # Single authoritative cleanup policy for legacy + nested V2.
+        from timeline_storyboard import prune_storyboard_cache_safely
+        prune_storyboard_cache_safely(max_bytes=max_bytes)
+        return
     try:
         files = [p for p in root.iterdir() if p.is_file() and not p.name.endswith(".tmp")]
     except OSError:
