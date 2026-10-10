@@ -107,6 +107,10 @@ jobs:
         run: python audit/reproduce_final_session_safety.py
       - name: Epoch monotonicity and source isolation regression
         run: python audit/reproduce_epoch_and_source_isolation.py
+      - name: Post-merge cache, QUICK, Camwhores and queue regression
+        run: python audit/regression_post_merge_fixes.py
+      - name: Post-merge V2 no-progress frontend regression
+        run: node audit/regression_post_merge_frontend.cjs
       - name: Catalog partial frontend regression
         run: node audit/regression_catalog_partial_frontend.cjs
       - name: Feed regression
