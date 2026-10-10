@@ -109,6 +109,8 @@ jobs:
         run: python audit/reproduce_epoch_and_source_isolation.py
       - name: Post-merge cache, QUICK, Camwhores and queue regression
         run: python audit/regression_post_merge_fixes.py
+      - name: Audit-4 Deep auth, legacy fencing and cache regression
+        run: python audit/regression_audit4_hardening.py
       - name: Post-merge real FFmpeg lifecycle
         run: python audit/regression_post_merge_real_ffmpeg.py
       - name: Post-merge V2 no-progress frontend regression
