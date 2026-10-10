@@ -853,7 +853,12 @@ class DeepArchivebateService:
                 return False
             if self._thread and self._thread.is_alive():
                 return False
-            self._scraper = scraper
+            if bool(getattr(getattr(scraper, "session", None), "is_logged_in", False)):
+                # Also recover durable auth blocks after a process restart;
+                # the explicit /api/relogin route is not the only login path.
+                self.resume_authenticated(scraper)
+            else:
+                self._scraper = scraper
             self._stop.clear()
             self._thread = threading.Thread(target=self._worker, name="archivebate-deep-crawler", daemon=True)
             self._thread.start()
