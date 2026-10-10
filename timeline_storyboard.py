@@ -438,6 +438,29 @@ class ConsumerLeaseManager:
 
 lease_manager = ConsumerLeaseManager()
 
+def prune_storyboard_cache_safely(max_bytes: int = 500 * 1024 * 1024) -> dict:
+    """Evict idle V2 video directories atomically while protecting live work.
+
+    Lock ordering: lease-manager lock -> storyboard build lock. No FFmpeg work
+    is performed while either lock is held. Existing root-level QUICK files
+    are also accounted for by the unified byte budget.
+    """
+    from cache_store import trim_storyboard_cache_directory
+
+    now = time.monotonic()
+    with lease_manager._lock:
+        with _lock:
+            active_keys = {
+                key for key, consumers in lease_manager._leases.items()
+                if any(rec.get("expires", 0.0) > now for rec in consumers.values())
+            }
+            active_keys.update(_active_builds.keys())
+            protected_dirs = {safe_cache_key(key) for key in active_keys}
+            return trim_storyboard_cache_directory(
+                STORYBOARD_CACHE_DIR, max_bytes=max_bytes, protected_dirs=protected_dirs
+            )
+
+
 
 def compute_bisection_order(num_slots: int) -> List[int]:
     """Return slot indices [0 .. num_slots-1] in van der Corput bisection order.
@@ -895,8 +918,9 @@ class ProgressiveStoryboardService:
         key = resolve_video_key(video_id, source=source)
         res = acquire_lease(key.as_string(), consumer_id=consumer_id, duration=LEASE_DURATION_SECONDS, source=source, session_id=session_id)
         if not res.ok:
-            # Stale build request or capacity limit: return existing manifest without scheduling job or overwriting ownership
-            return self.get_manifest(video_id, duration, source=source)
+            # A stale session or capacity rejection must be visible to the client.
+            return {**self.get_manifest(video_id, duration, source=source),
+                    "build_status": "retryable_error", "error_code": "lease_unavailable"}
         manifest = self.get_manifest(
             video_id,
             duration,
@@ -920,6 +944,7 @@ class ProgressiveStoryboardService:
             "embed_url": embed_url,
         }
 
+        build_status = "queued"
         with _lock:
             key_str = key.as_string()
             if key_str not in _active_builds:
@@ -927,11 +952,15 @@ class ProgressiveStoryboardService:
                     _jobs_queue.put_nowait(job)
                     _active_builds[key_str] = job
                 except Exception:
-                    # Queue full: do NOT register in _active_builds to prevent permanent lockout
-                    pass
+                    # Queue full is retryable and must not be hidden behind HTTP 200.
+                    build_status = "retryable_error"
+            else:
+                build_status = "running"
 
-        self._ensure_worker()
-        return manifest
+        if build_status != "retryable_error":
+            self._ensure_worker()
+        return {**manifest, "build_status": build_status,
+                **({"error_code": "queue_full"} if build_status == "retryable_error" else {})}
 
     def _worker_loop(self) -> None:
         while not _worker_stop.is_set():
@@ -958,6 +987,11 @@ class ProgressiveStoryboardService:
                 with _lock:
                     _active_builds.pop(key_str, None)
                 _jobs_queue.task_done()
+                try:
+                    prune_storyboard_cache_safely()
+                except OSError:
+                    # Cache cleanup must never crash the worker.
+                    pass
 
     def _execute_build_job(self, job: dict) -> None:
         key: VideoKey = job["key"]

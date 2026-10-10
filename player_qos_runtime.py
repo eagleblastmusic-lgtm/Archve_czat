@@ -201,12 +201,18 @@ def _mark_processes_preempted(
     """Mark + terminate matching storyboard subprocesses, including QUICK and V2."""
     global _qos_preemptions, _hard_cancel_count
     video_key = _key(video_id, source=source) if video_id else None
+    # Legacy QUICK/exact processes use the historical SHA-256 ID, while V2
+    # processes use canonical VideoKey. Compare each registry in its own format.
+    legacy_id = str(video_id or "")
+    if source == "camwhores" and legacy_id and not legacy_id.startswith("cw_"):
+        legacy_id = "cw_" + legacy_id
+    legacy_key = _storyboard._key(legacy_id) if video_id else None
     victims = []
     keys = set()
     with _storyboard._active_process_lock:
         for process_key, info in list(_storyboard._active_processes.items()):
             current_key = str(info.get("video_key") or "")
-            if video_key is not None and current_key != video_key:
+            if legacy_key is not None and current_key != legacy_key:
                 continue
             proc = info.get("proc")
             if proc is None or proc.poll() is not None:
