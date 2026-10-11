@@ -294,6 +294,10 @@ def _run_cancellable_process(
             "qos_generation": qos_generation,
             "proc": proc,
             "video_key": _key(video_id or process_key),
+            # Keep the unhashed identity solely for canonical QoS state. The
+            # legacy video_key is a SHA-256 file/process lookup identifier.
+            "provider_id": str(video_id) if video_id else None,
+            "source": "camwhores" if str(video_id or "").startswith("cw_") else "archivebate",
             "kind": kind,
             "segment": segment_index,
             "priority": int(priority),
