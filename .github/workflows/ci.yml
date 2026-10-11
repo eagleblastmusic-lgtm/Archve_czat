@@ -39,6 +39,8 @@ jobs:
         run: python audit/regression_security_v42.py
       - name: Audit-6 stream MIME and QoS isolation regression
         run: python audit/regression_audit6_stream_security.py
+      - name: Storyboard real FFmpeg through mislabelled CDN proxy
+        run: python audit/regression_storyboard_real_proxy_media.py
       - name: V4.2 full hardening regression
         run: python audit/regression_v42_full.py
       - name: V4.3 storyboard scheduler regression
@@ -197,6 +199,8 @@ jobs:
         run: python audit/regression_security_v42.py
       - name: Audit-6 stream MIME and QoS isolation regression
         run: python audit/regression_audit6_stream_security.py
+      - name: Storyboard real FFmpeg through mislabelled CDN proxy
+        run: python audit/regression_storyboard_real_proxy_media.py
       - name: V4.2 full hardening regression
         run: python audit/regression_v42_full.py
       - name: V4.3 storyboard scheduler regression
@@ -290,6 +294,8 @@ jobs:
         run: python audit/regression_security_v42.py
       - name: Audit-6 stream MIME and QoS isolation regression
         run: python audit/regression_audit6_stream_security.py
+      - name: Storyboard real FFmpeg through mislabelled CDN proxy
+        run: python audit/regression_storyboard_real_proxy_media.py
       - name: V4.2 full hardening regression
         run: python audit/regression_v42_full.py
       - name: V4.3 storyboard scheduler regression
