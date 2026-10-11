@@ -65,9 +65,9 @@ def make_movie(out_path):
 
 
 def test_magic_detection():
-    assert main._sniff_video_magic(b"\\x00\\x00\\x00\\x14ftypisom0000") == "video/mp4"
+    assert main._sniff_video_magic(b"\x00\x00\x00\x14ftypisom0000") == "video/mp4"
     assert main._sniff_video_magic(bytes.fromhex("1a45dfa3") + b"other") == "video/webm"
-    assert main._sniff_video_magic(b"FLV\\x01" + b"\\x00" * 16) == "video/x-flv"
+    assert main._sniff_video_magic(b"FLV\x01" + b"\x00" * 16) == "video/x-flv"
     for payload in (b"<html><script>alert(1)</script>", b"console.log(1)", b"hello", b""):
         assert main._sniff_video_magic(payload) is None
 
@@ -96,8 +96,8 @@ def test_local_ffmpeg_decodes_mislabelled_video():
         server = uvicorn.Server(config)
         thread = threading.Thread(target=server.run, daemon=True)
         try:
-            with patch.object(main, "is_safe_remote_url", return_value=True), \\
-                 patch.object(main, "_validated_session_get", side_effect=upstream_get), \\
+            with patch.object(main, "is_safe_remote_url", return_value=True), \
+                 patch.object(main, "_validated_session_get", side_effect=upstream_get), \
                  patch.object(main, "_is_host_failed", return_value=(False, "")):
                 thread.start()
                 for _ in range(150):
