@@ -2208,6 +2208,7 @@ def _safe_video_stream_type(raw_content_type: str) -> Optional[str]:
 
 
 @app.get("/api/video/stream")
+@app.head("/api/video/stream")
 def stream_video_proxy(
     url: str = Query(None),
     id: str = Query(None),
