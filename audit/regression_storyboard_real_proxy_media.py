@@ -86,8 +86,33 @@ def test_local_ffmpeg_decodes_mislabelled_video():
 
         def upstream_get(http_session, url, **kwargs):
             assert url == VIDEO_URL, url
-            item = Upstream(blob, content_type=mime["value"],
-                            extra={"Content-Length": str(len(blob))})
+            # FFmpeg needs byte-range seeking to find an MP4's moov atom.
+            # Return real RFC 9110 byte ranges, not a broken 200 full body
+            # in response to every Range request.
+            import re
+            headers = kwargs.get("headers") or {}
+            header = headers.get("Range") or headers.get("range") or ""
+            match = re.fullmatch(r"bytes=(\d+)-(\d*)", header)
+            code = 200
+            data = blob
+            extra = {"Content-Length": str(len(blob)), "Accept-Ranges": "bytes"}
+            if match:
+                start = int(match.group(1))
+                end = min(len(blob) - 1, int(match.group(2))) if match.group(2) else len(blob) - 1
+                if start >= len(blob):
+                    code = 416
+                    data = b""
+                    extra = {"Content-Range": f"bytes */{len(blob)}"}
+                else:
+                    code = 206
+                    data = blob[start:end + 1]
+                    extra = {
+                        "Content-Length": str(len(data)),
+                        "Content-Range": f"bytes {start}-{end}/{len(blob)}",
+                        "Accept-Ranges": "bytes",
+                    }
+            item = Upstream(data, content_type=mime["value"], status_code=code,
+                            extra=extra)
             served.append(item)
             return item
 
