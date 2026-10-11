@@ -2221,9 +2221,9 @@ def _sniff_video_magic(data: bytes) -> Optional[str]:
         return None
     if len(data) >= 12 and data[4:8] in (b"ftyp", b"styp"):
         return "video/mp4"
-    if data.startswith(b"\\x1a\\x45\\xdf\\xa3"):
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
         return "video/webm"
-    if data.startswith(b"FLV\\x01"):
+    if data.startswith(b"FLV\x01"):
         return "video/x-flv"
     if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"AVI ":
         return "video/x-msvideo"
@@ -2454,7 +2454,7 @@ def stream_video_proxy(
             observed = _media_sniff_cache_get(url)
             if observed is None and request is not None and request.method != "HEAD":
                 content_range = req.headers.get("Content-Range", "")
-                start_match = re.match(r"bytes\\s+(\\d+)-", content_range, re.I)
+                start_match = re.match(r"bytes\s+(\d+)-", content_range, re.I)
                 nonzero_offset = bool(start_match and int(start_match.group(1)) != 0)
                 if nonzero_offset:
                     # An upstream range beginning mid-file does not contain
