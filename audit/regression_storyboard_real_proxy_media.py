@@ -116,6 +116,35 @@ def test_local_ffmpeg_decodes_mislabelled_video():
                         0.4, jpg, timeout=12, fast=False,
                         video_id="audit_proxy_fixture", source="archivebate"
                     )
+                    if not ok:
+                        import requests
+                        url = f"http://127.0.0.1:{port}/api/video/stream?url={VIDEO_URL}&owner=storyboard"
+                        try:
+                            check = requests.get(url, timeout=10)
+                            print("DEBUG proxy:", check.status_code,
+                                  check.headers.get("content-type"),
+                                  check.headers.get("content-length"),
+                                  len(check.content), check.content[:24].hex(),
+                                  flush=True)
+                        except Exception as exc:
+                            print("DEBUG proxy error:", repr(exc), flush=True)
+                        cmd = [
+                            imageio_ffmpeg.get_ffmpeg_exe(),
+                            "-hide_banner", "-loglevel", "error", "-nostdin",
+                            "-ss", "0.400", "-seekable", "1",
+                            "-probesize", "262144", "-analyzeduration", "1000000",
+                            "-reconnect", "1", "-reconnect_streamed", "1",
+                            "-reconnect_delay_max", "2",
+                            "-protocol_whitelist", "http,https,tcp,tls",
+                            "-i", url, "-map", "0:v:0", "-frames:v", "1",
+                            "-an", "-sn", "-dn", "-threads", "1",
+                            "-vf", "scale=160:90:force_original_aspect_ratio=increase,crop=160:90",
+                            "-q:v", "8", "-y", str(root / "debug.jpg")
+                        ]
+                        diag = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE, timeout=12)
+                        print("DEBUG FFmpeg:", diag.returncode,
+                              diag.stderr.decode("utf-8", "replace")[-2000:], flush=True)
                     assert ok and jpg.is_file() and jpg.stat().st_size > 350, (
                         f"Storyboard FFmpeg failed with Content-Type {content_type!r}")
                 assert served and all(item.closed for item in served)
