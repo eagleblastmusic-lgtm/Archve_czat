@@ -2207,6 +2207,51 @@ def _safe_video_stream_type(raw_content_type: str) -> Optional[str]:
     return None
 
 
+# CDN providers sometimes serve real MP4/WebM as application/octet-stream,
+# application/force-download, text/plain, or no Content-Type at all.
+# Security stays fail-closed: only recognizable media bytes can override MIME.
+_MEDIA_SNIFF_LOCK = threading.Lock()
+_MEDIA_SNIFF_CACHE = {}  # SHA-256 URL digest -> (video MIME, monotonic timestamp)
+_MEDIA_SNIFF_TTL = 180.0
+
+
+def _sniff_video_magic(data: bytes) -> Optional[str]:
+    """Recognize inert binary video signatures, never HTML or script text."""
+    if not isinstance(data, bytes):
+        return None
+    if len(data) >= 12 and data[4:8] in (b"ftyp", b"styp"):
+        return "video/mp4"
+    if data.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video/webm"
+    if data.startswith(b"FLV\x01"):
+        return "video/x-flv"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return "video/x-msvideo"
+    if data.startswith(b"OggS"):
+        return "video/ogg"
+    if len(data) >= 377 and all(data[n] == 0x47 for n in (0, 188, 376)):
+        return "video/mp2t"
+    return None
+
+
+def _media_sniff_cache_get(url: str) -> Optional[str]:
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    with _MEDIA_SNIFF_LOCK:
+        item = _MEDIA_SNIFF_CACHE.get(digest)
+        if item and time.monotonic() - item[1] < _MEDIA_SNIFF_TTL:
+            return item[0]
+    return None
+
+
+def _media_sniff_cache_set(url: str, media_type: str) -> None:
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    with _MEDIA_SNIFF_LOCK:
+        _MEDIA_SNIFF_CACHE[digest] = (media_type, time.monotonic())
+        if len(_MEDIA_SNIFF_CACHE) > 256:
+            oldest = min(_MEDIA_SNIFF_CACHE, key=lambda key: _MEDIA_SNIFF_CACHE[key][1])
+            _MEDIA_SNIFF_CACHE.pop(oldest, None)
+
+
 @app.get("/api/video/stream")
 @app.head("/api/video/stream")
 def stream_video_proxy(
@@ -2399,6 +2444,48 @@ def stream_video_proxy(
                 },
             )
         safe_media_type = _safe_video_stream_type(req.headers.get("Content-Type", ""))
+        # Missing or misleading MIME must not break a genuine video. Verify
+        # binary magic instead of trusting extensions or arbitrary HTML.
+        prefetched_chunks = None
+        if safe_media_type is None or safe_media_type == "application/octet-stream":
+            observed = None
+            # Range 206 can begin mid-file, so remember only a positively
+            # verified signature for this exact URL, for a short period.
+            observed = _media_sniff_cache_get(url)
+            if observed is None and request is not None and request.method != "HEAD":
+                content_range = req.headers.get("Content-Range", "")
+                start_match = re.match(r"bytes\s+(\d+)-", content_range, re.I)
+                nonzero_offset = bool(start_match and int(start_match.group(1)) != 0)
+                if nonzero_offset:
+                    # An upstream range beginning mid-file does not contain
+                    # container signatures; do a bounded, SSRF-validated probe.
+                    probe = None
+                    try:
+                        probe_headers = dict(headers)
+                        probe_headers["Range"] = "bytes=0-4095"
+                        probe, _, _ = _execute_upstream_get(url, probe_headers)
+                        if probe.status_code in (200, 206):
+                            iterator = iter(probe.iter_content(chunk_size=4096))
+                            prefix = next(iterator, b"")
+                            observed = _sniff_video_magic(prefix)
+                    except (requests.exceptions.RequestException, HTTPException, OSError):
+                        observed = None
+                    finally:
+                        if probe is not None:
+                            probe.close()
+                else:
+                    try:
+                        stream_iter = iter(req.iter_content(chunk_size=64 * 1024))
+                        first = next(stream_iter, b"")
+                    except Exception:
+                        req.close()
+                        raise HTTPException(status_code=502, detail="Nie udało się odczytać nagłówka strumienia wideo")
+                    observed = _sniff_video_magic(first)
+                    if first:
+                        prefetched_chunks = (first, stream_iter)
+            if observed:
+                safe_media_type = observed
+                _media_sniff_cache_set(url, observed)
         if safe_media_type is None:
             req.close()
             raise HTTPException(status_code=502, detail="Odrzucono nieobsługiwany typ zasobu źródłowego")
@@ -2435,7 +2522,14 @@ def stream_video_proxy(
 
         def iterfile():
             try:
-                for chunk in req.iter_content(chunk_size=1024 * 256):
+                if prefetched_chunks is not None:
+                    first, remainder = prefetched_chunks
+                    if first:
+                        yield first
+                    chunks = remainder
+                else:
+                    chunks = req.iter_content(chunk_size=1024 * 256)
+                for chunk in chunks:
                     if chunk:
                         yield chunk
             except Exception as exc:
