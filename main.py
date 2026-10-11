@@ -642,7 +642,9 @@ def _validated_session_get(http_session, url: str, *, headers=None, timeout=8, s
         location = res.headers.get("Location")
         res.close()
         if not location:
-            return res
+            # A malformed redirect is not a usable response. Never return
+            # a closed requests.Response into the streaming pipeline.
+            raise HTTPException(status_code=502, detail="Przekierowanie bez nagłówka Location")
         current = urljoin(current, location)
     raise HTTPException(status_code=502, detail="Zbyt wiele przekierowań zdalnego zasobu")
 
@@ -2190,7 +2192,23 @@ async def update_playback_status(request: Request):
             _last_playback_active_time = 0.0
     return {"ok": True, "playback_busy": is_playback_active()}
 
+def _safe_video_stream_type(raw_content_type: str) -> Optional[str]:
+    """Allow only inert video payload MIME types through our trusted origin.
+
+    Do not infer types from URLs and never fall back to video/mp4 for an
+    upstream without a trustworthy Content-Type. Disposition + sandbox also
+    protect ambiguous application/octet-stream navigations.
+    """
+    media_type = str(raw_content_type or "").split(";", 1)[0].strip().lower()
+    if media_type.startswith("video/") and media_type not in ("video/svg+xml",):
+        return media_type
+    if media_type == "application/octet-stream":
+        return media_type
+    return None
+
+
 @app.get("/api/video/stream")
+@app.head("/api/video/stream")
 def stream_video_proxy(
     url: str = Query(None),
     id: str = Query(None),
@@ -2206,12 +2224,8 @@ def stream_video_proxy(
     embed_url = embed
     details = None
 
-    # Aktywność odtwarzacza wstrzymuje ciężkie prace w tle (Pakiet C, punkt 6)
-    if owner == "player":
-        with _playback_active_lock:
-            global _last_playback_active_time
-            _last_playback_active_time = time.time()
-
+    # A GET request is not proof that a media player is active. Only the
+    # authenticated POST /api/playback/status heartbeat can pause scanners.
     if not url and clean_id:
         # Najpierw sprawdzamy wiek direct_url z persistent cache
         cached_details, _, cached_stream_mtime = _read_video_caches(clean_id)
@@ -2369,6 +2383,26 @@ def stream_video_proxy(
             req.close()
             raise HTTPException(status_code=502, detail=f"Zdalny serwer wideo zwrócił HTTP {code}")
 
+        # A public HTTPS host can serve HTML/JS. Never expose such content
+        # as a same-origin resource under the authenticated localhost UI.
+        # Handle Range 416 separately; the upstream may omit Content-Type.
+        if req.status_code == 416:
+            requested_range = req.headers.get("Content-Range", "")
+            req.close()
+            return Response(
+                status_code=416,
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Security-Policy": "sandbox; default-src 'none'; script-src 'none'",
+                    "X-Content-Type-Options": "nosniff",
+                    **({"Content-Range": requested_range} if requested_range else {}),
+                },
+            )
+        safe_media_type = _safe_video_stream_type(req.headers.get("Content-Type", ""))
+        if safe_media_type is None:
+            req.close()
+            raise HTTPException(status_code=502, detail="Odrzucono nieobsługiwany typ zasobu źródłowego")
+
         accept_ranges = req.headers.get("Accept-Ranges")
         if not accept_ranges or accept_ranges == "none":
             if req.status_code == 206 or "Content-Range" in req.headers:
@@ -2376,10 +2410,16 @@ def stream_video_proxy(
             else:
                 accept_ranges = "none"
         response_headers = {
-            "Content-Type": req.headers.get("Content-Type", "video/mp4"),
+            "Content-Type": safe_media_type,
             "Accept-Ranges": accept_ranges,
-            "Cache-Control": "public, max-age=86400, stale-while-revalidate=86400",
+            # Upstream URLs expire, and Range 206 must not be kept as a stale
+            # persistent browser/proxy cache under a stable local URL.
+            "Cache-Control": "private, no-store",
+            # If a user navigates to /api/video/stream as a document, scripts
+            # and same-origin privileges are disabled regardless of MIME sniff.
+            "Content-Security-Policy": "sandbox; default-src 'none'; script-src 'none'",
             "X-Content-Type-Options": "nosniff",
+            **({"Content-Disposition": "attachment"} if safe_media_type == "application/octet-stream" else {}),
             "Server-Timing": f"upstream_connect;dur={connect_dur_ms}"
         }
         if "Content-Range" in req.headers:
@@ -2389,8 +2429,7 @@ def stream_video_proxy(
 
         if request is not None and request.method == "HEAD":
             req.close()
-            kind = str(response_headers["Content-Type"]).split(";")[0].lower()
-            if req.status_code not in (200, 206) or not (kind.startswith("video/") or kind == "application/octet-stream"):
+            if req.status_code not in (200, 206):
                 raise HTTPException(status_code=502, detail="Nie potwierdzono pliku wideo")
             return Response(status_code=req.status_code, headers=response_headers)
 

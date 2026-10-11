@@ -222,7 +222,15 @@ def _mark_processes_preempted(
             proc = info.get("proc")
             if proc is None or proc.poll() is not None:
                 continue
-            keys.add(current_key)
+            # current_key is a legacy SHA-256 hash, NOT a canonical VideoKey.
+            # Never insert it into QoS flag dictionaries; those maps are
+            # indexed exclusively by VideoKey.as_string().
+            canonical = video_key or (
+                _key(info.get("provider_id"), source=info.get("source"))
+                if info.get("provider_id") else ""
+            )
+            if canonical:
+                keys.add(canonical)
             _storyboard._preempted_processes.add(process_key)
             victims.append(proc)
         if victims and hasattr(_storyboard, "_preempted_count"):
